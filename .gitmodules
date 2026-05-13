@@ -7,3 +7,6 @@
 [submodule "src/oradar_ros"]
 	path = src/oradar_ros
 	url = git@github.com:David-OC17/oradar_ros.git
+[submodule "src/slam_gmapping"]
+	path = src/slam_gmapping
+	url = git@github.com:GMHadou/slam_gmapping_Humble.git
