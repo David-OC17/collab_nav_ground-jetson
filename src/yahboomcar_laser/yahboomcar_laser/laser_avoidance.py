@@ -18,7 +18,18 @@ class laserAvoid(Node):
         self.sub_laser = self.create_subscription(LaserScan, "/scan", self.registerScan, 1)
         self.sub_JoyState = self.create_subscription(Bool, "/JoyState", self.JoyStateCallback, 1)
         #create pub
-        self.pub_vel = self.create_publisher(Twist, "/cmd_vel", 1)
+        #self.pub_vel = self.create_publisher(Twist, "/cmd_vel", 1) # add QoS
+
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        self.pub_vel = self.create_publisher(Twist, "/cmd_vel", qos)
 
         #declare params
         self.right_warning = 0

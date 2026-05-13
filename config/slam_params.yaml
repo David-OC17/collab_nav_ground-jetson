@@ -1,0 +1,56 @@
+slam_toolbox:
+  ros__parameters:
+
+    # --- Frames ---
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan_restamped
+
+    # --- Mode ---
+    mode: mapping              # 'mapping' for SLAM, 'localization' later
+    use_sim_time: false
+
+    # --- Solver ---
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # --- Map parameters ---
+    resolution: 0.05           # 5cm per cell — good starting point
+    max_laser_range: 12.0      # MS200 max range ~12m
+    minimum_time_interval: 0.5 # seconds between scan additions
+    transform_timeout: 1.0
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+
+    # --- Scan matching ---
+    use_scan_matching: true
+    use_scan_barycenter: true
+    minimum_travel_distance: 0.1   # meters before adding new node
+    minimum_travel_heading: 0.261  # ~15 degrees
+
+    # --- Loop closure ---
+    do_loop_closing: true
+    loop_search_distance: 1.5
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # --- Correlation search (scan-to-map matching) ---
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+
+    # --- Loop closure search space ---
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # --- Saving ---
+    map_file_name: /home/$(env USER)/maps/my_map
+    map_start_at_dock: true
