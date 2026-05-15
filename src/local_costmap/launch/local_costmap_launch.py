@@ -26,8 +26,8 @@ def generate_launch_description():
         name='fake_map_publisher',
         output='screen',
         parameters=[{
-            'scenario': 'room',      # room | corridor | lshape | dynamic
-            'move_robot': True,
+            'scenario': 'room2',      # CHOOSE THE SCENARIO HERE 
+            'move_robot': False,
             'publish_rate': 1.0,
         }]
     )
