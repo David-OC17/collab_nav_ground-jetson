@@ -5,7 +5,6 @@ src/yahboomRDK_X3
 src/yahboomRDK_X3/*
 
 src/drone_map_create/src/drone_map_create/out
-src/drone_map_create/src/drone_map_create/data
 
 # Created by https://www.toptal.com/developers/gitignore/api/python,ros2,c++,cmake
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,ros2,c++,cmake
