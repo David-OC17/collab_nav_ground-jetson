@@ -44,6 +44,7 @@ Quick-start
     map_img = rec.get_map(output_shape=(3000, 3000))
 """
 
+import os
 import cv2
 import numpy as np
 import math
@@ -63,22 +64,156 @@ def _make_detector():
         return cv2.ORB_create(nfeatures=8000), cv2.NORM_HAMMING
 
 
-def _kp_des(detector, img: np.ndarray):
+def _kp_des(detector, img: np.ndarray, mask: Optional[np.ndarray] = None):
+    """Detect keypoints + descriptors on `img`, optionally restricted by `mask`.
+
+    `mask` is a uint8 array the same H×W as img where non-zero pixels are
+    eligible for feature detection.  Use it to exclude regions dominated by
+    a repetitive structure (e.g. blue grid tape) from feature detection.
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-    return detector.detectAndCompute(gray, None)
+    return detector.detectAndCompute(gray, mask)
 
 
-def _match(des1, des2, norm, ratio: float = 0.80) -> list:
-    """Lowe ratio-test match between two descriptor sets."""
+def _match(des1, des2, norm, ratio: float = 0.70, mutual: bool = True) -> list:
+    """Lowe ratio-test match with optional mutual best-match cross-check.
+
+    On scenes with repetitive structure (regular grids, periodic textures),
+    the standard ratio test alone is unreliable: the second-best match is
+    often a *different* instance of the same repeated feature at nearly
+    identical descriptor distance, so many ambiguous matches pass.
+
+    Mutual cross-check requires the match to be best in *both* directions
+    AND pass the ratio test in both directions.  This is much stronger
+    than cv2.BFMatcher(crossCheck=True), which omits the ratio test.
+    """
     matcher = cv2.BFMatcher(norm, crossCheck=False)
-    raw = matcher.knnMatch(des1, des2, k=2)
-    return [
+    raw12 = matcher.knnMatch(des1, des2, k=2)
+    good12 = [
         m
-        for pair in raw
+        for pair in raw12
         if len(pair) == 2
         for m, n in [pair]
         if m.distance < ratio * n.distance
     ]
+    if not mutual or not good12:
+        return good12
+
+    raw21 = matcher.knnMatch(des2, des1, k=2)
+    # Map descriptor-2 index → descriptor-1 index for ratio-passing matches.
+    back: dict = {}
+    for pair in raw21:
+        if len(pair) != 2:
+            continue
+        m, n = pair
+        if m.distance < ratio * n.distance:
+            back[m.queryIdx] = m.trainIdx
+
+    return [m for m in good12 if back.get(m.trainIdx) == m.queryIdx]
+
+
+def _median_displacement(
+    kp1, des1, kp2, des2, norm, diag: float
+) -> Optional[float]:
+    """Robust median pixel displacement between two keypoint sets, normalised
+    by `diag` (the frame diagonal).  Returns None if matching is infeasible.
+
+    Used by the movement gate during frame extraction.  Unlike _match() this
+    skips the ratio filter entirely — on repetitive scenes the ratio test
+    discards almost every match, leaving the motion estimate undefined.  The
+    *median* of nearest-neighbour displacements is naturally robust to the
+    ambiguous off-by-one-cell matches that result from repeated structure,
+    so it gives a reliable static/jerk estimate even there.
+    """
+    if des1 is None or des2 is None or len(kp1) < 8 or len(kp2) < 8:
+        return None
+    matcher = cv2.BFMatcher(norm, crossCheck=False)
+    raw = matcher.knnMatch(des1, des2, k=1)
+    matches = [pair[0] for pair in raw if len(pair) == 1]
+    if len(matches) < 8:
+        return None
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+    return float(np.median(np.linalg.norm(pts1 - pts2, axis=1))) / diag
+
+
+def _keypoint_spread_ok(
+    kp: list,
+    frame_w: int,
+    frame_h: int,
+    bins: int = 8,
+    min_filled: int = 12,
+) -> Tuple[bool, str]:
+    """Check that keypoints are spatially well-distributed across the frame.
+
+    On scenes dominated by a single repeated structure (e.g. a grid), feature
+    detectors fire predominantly on that structure, leaving large regions of
+    the frame with no informative features.  Even after RANSAC, such frames
+    produce alignment estimates that are highly anisotropic (well-constrained
+    along one axis, badly under-constrained along the orthogonal).
+
+    Simple spatial-spread test: bin keypoints into a bins×bins grid over the
+    frame and require at least `min_filled` distinct bins non-empty.  With
+    bins=8 (64 cells total) and min_filled=12, the test demands ~19% spatial
+    coverage — generous in the normal case, aggressive only on truly
+    degenerate frames.
+    """
+    if len(kp) < min_filled:
+        return False, f"too_few_kp={len(kp)}"
+
+    xs = np.fromiter((p.pt[0] for p in kp), dtype=np.float32, count=len(kp))
+    ys = np.fromiter((p.pt[1] for p in kp), dtype=np.float32, count=len(kp))
+
+    bx = np.clip((xs * bins / frame_w).astype(np.int32), 0, bins - 1)
+    by = np.clip((ys * bins / frame_h).astype(np.int32), 0, bins - 1)
+    keys = by.astype(np.int64) * bins + bx.astype(np.int64)
+
+    filled = int(np.unique(keys).size)
+    if filled < min_filled:
+        return False, f"spread={filled}<{min_filled}"
+    return True, "ok"
+
+
+def _make_feature_mask(
+    img: np.ndarray,
+    exclude_hsv: list,
+    dilate_px: int = 5,
+) -> Optional[np.ndarray]:
+    """Build a uint8 mask for cv2.detectAndCompute that EXCLUDES pixels
+    matching any of the given HSV ranges (passed as ColorRangeMask objects).
+
+    Use case: in scenes dominated by a repetitive structure (e.g. blue grid
+    tape), feature detectors fire predominantly on that structure, producing
+    keypoints whose descriptors are near-duplicates of each other.  Excluding
+    the dominant structure from feature detection forces the detector onto
+    the unique, informative parts of the scene (object edges, corners,
+    natural texture), yielding fewer but much more discriminative keypoints.
+
+    The exclusion mask is dilated by `dilate_px` so keypoints don't latch
+    onto the *edges* of the excluded structure — those edges still inherit
+    grid-locked positions and would re-introduce the ambiguity problem.
+
+    Returns None if `exclude_hsv` is empty (caller should pass mask=None to
+    detectAndCompute, equivalent to no masking).
+    """
+    if not exclude_hsv:
+        return None
+
+    img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    exclude = np.zeros(img.shape[:2], dtype=np.uint8)
+    for cm in exclude_hsv:
+        lo = np.array([cm.h_lo, cm.s_lo, cm.v_lo], dtype=np.uint8)
+        hi = np.array([cm.h_hi, cm.s_hi, cm.v_hi], dtype=np.uint8)
+        exclude |= cv2.inRange(img_hsv, lo, hi)
+    del img_hsv
+
+    if dilate_px > 0:
+        k = 2 * dilate_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        exclude = cv2.dilate(exclude, kernel)
+
+    # Mask convention for cv2.detectAndCompute: non-zero pixels are eligible.
+    return cv2.bitwise_not(exclude)
 
 def _validate_homography(
     H: np.ndarray,
@@ -136,43 +271,150 @@ def _validate_homography(
 
     return True, "ok"
 
+
+def _validate_composed_H(
+    H: np.ndarray,
+    frame_w: int,
+    frame_h: int,
+    canvas_h: int,
+    canvas_w: int,
+    max_overflow_px: int,
+) -> Tuple[bool, str]:
+    """
+    Validate the COMPOSED homography (ref["H"] @ H_pair) in canvas coordinates.
+
+    Why this is necessary
+    ─────────────────────
+    _validate_homography() and the centre-point check in _pairwise_H() both
+    operate on H_pair alone — the relative transform between the current frame
+    and a reference frame.  That transform can look perfectly healthy while the
+    composed result ref["H"] @ H_pair is wildly degenerate because accumulated
+    numerical drift in ref["H"] amplifies any residual perspective error.
+
+    This function runs AFTER composition so it catches those cases before they
+    reach _expand_canvas() (where a degenerate H would request a 200 GB array).
+
+    Checks
+    ──────
+    1. Positive perspective divide at all four frame corners (no fold-through).
+    2. Warped bounding box stays within canvas + max_overflow_px on every side.
+       Overflows larger than this indicate drift/degeneracy, not a legitimate
+       frame that just clips slightly past the canvas edge.
+    """
+    corners_src = [(0, 0), (frame_w, 0), (frame_w, frame_h), (0, frame_h)]
+
+    # Check 1: perspective divide must be positive at every corner
+    for cx, cy in corners_src:
+        w_prime = H[2, 0] * cx + H[2, 1] * cy + H[2, 2]
+        if w_prime <= 1e-6:
+            return False, f"composed_neg_w={w_prime:.3e}"
+
+    # Project corners into canvas space
+    pts = np.float32(corners_src).reshape(-1, 1, 2)
+    try:
+        wc = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
+    except cv2.error as exc:
+        return False, f"composed_transform_error: {exc}"
+
+    # Check 2: bounding box within canvas + overflow tolerance
+    x_min, x_max = float(wc[:, 0].min()), float(wc[:, 0].max())
+    y_min, y_max = float(wc[:, 1].min()), float(wc[:, 1].max())
+    ov = max_overflow_px
+
+    if x_min < -ov:
+        return False, f"composed_x_min={x_min:.0f}<-{ov}"
+    if y_min < -ov:
+        return False, f"composed_y_min={y_min:.0f}<-{ov}"
+    if x_max > canvas_w + ov:
+        return False, f"composed_x_max={x_max:.0f}>{canvas_w}+{ov}"
+    if y_max > canvas_h + ov:
+        return False, f"composed_y_max={y_max:.0f}>{canvas_h}+{ov}"
+
+    return True, "ok"
+
+
 def _pairwise_H(
     feat_ref: tuple,
     feat_cur: tuple,
     norm: int,
     frame_w: int,
     frame_h: int,
+    match_ratio: float = 0.70,
+    mad_factor: float = 6.0,
 ) -> tuple:
     """
-    Compute H mapping cur → ref coordinate space via RANSAC.
+    Compute H mapping cur → ref coordinate space via similarity-RANSAC.
     Returns (H, n_inliers) or (None, 0) if the homography is unreliable.
+
+    Why a similarity transform, not a full homography
+    ─────────────────────────────────────────────────
+    Top-down drone footage at roughly constant altitude is fundamentally a
+    2D rigid-motion problem (translation + rotation + small uniform scale
+    from altitude variation).  That is 4 degrees of freedom.
+
+    Fitting a full 8-DoF projective homography to it gives RANSAC freedom
+    to "explain" off-by-one-cell mismatches on repetitive structure (grid
+    intersections) with small perspective terms — terms that look locally
+    valid in any single frame (convex quad, positive w', area ratio ≈ 1)
+    but compound across hundreds of frames into the fan/ray artifacts
+    visible in the bad maps.
+
+    cv2.estimateAffinePartial2D gives a 4-DoF similarity (RANSAC variant).
+    The 2x3 result is promoted to 3x3 so downstream warpPerspective /
+    composition / canvas-expansion code is unchanged.
+
+    MAD pre-filter
+    ──────────────
+    Before RANSAC, gross outliers are removed using a median-absolute-
+    deviation gate on per-match displacement.  On a repetitive grid, a
+    wrong "to-different-cell" match has a displacement vector that points
+    to a different cell than the true motion — by definition it lies in a
+    separate cluster from the inlier displacements, and the MAD gate
+    chops it out before RANSAC ever sees it.  This prevents RANSAC from
+    promoting a coherent set of *wrong* matches to a winning hypothesis.
     """
     kp_r, des_r = feat_ref
     kp_c, des_c = feat_cur
     if des_r is None or des_c is None or len(kp_r) < 8 or len(kp_c) < 8:
         return None, 0
 
-    good = _match(des_r, des_c, norm, ratio=0.80)
-    if len(good) < 8:
+    good = _match(des_r, des_c, norm, ratio=match_ratio, mutual=True)
+    if len(good) < 12:
         return None, 0
 
-    pts_r = np.float32([kp_r[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    pts_c = np.float32([kp_c[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    pts_r = np.float32([kp_r[m.queryIdx].pt for m in good])
+    pts_c = np.float32([kp_c[m.trainIdx].pt for m in good])
 
-    H, mask = cv2.findHomography(
-        pts_c,
-        pts_r,
-        cv2.RANSAC,
-        ransacReprojThreshold=5.0,
-        maxIters=3000,
-        confidence=0.995,
+    # ── median/MAD displacement pre-filter ────────────────────────────────
+    disp = pts_r - pts_c
+    med  = np.median(disp, axis=0)
+    dev  = np.linalg.norm(disp - med, axis=1)
+    mad  = float(np.median(dev)) + 1e-3
+    keep = dev < mad_factor * mad
+    if int(keep.sum()) < 12:
+        return None, 0
+    pts_r = pts_r[keep]
+    pts_c = pts_c[keep]
+
+    # ── similarity-RANSAC (4 DoF: tx, ty, rotation, uniform scale) ────────
+    M, mask = cv2.estimateAffinePartial2D(
+        pts_c.reshape(-1, 1, 2),
+        pts_r.reshape(-1, 1, 2),
+        method=cv2.RANSAC,
+        ransacReprojThreshold=3.0,
+        maxIters=5000,
+        confidence=0.999,
+        refineIters=50,
     )
-    if H is None:
+    if M is None:
         return None, 0
 
     n_in = int(mask.sum()) if mask is not None else 0
     if n_in < 8:
         return None, 0
+
+    # Promote 2x3 affine → 3x3 so downstream perspective code is unchanged.
+    H = np.vstack([M, np.array([0.0, 0.0, 1.0], dtype=np.float64)])
 
     ok, reason = _validate_homography(H, frame_w, frame_h)
     if not ok:
@@ -192,33 +434,57 @@ def _pairwise_H(
 
 
 def _blur_score(gray: np.ndarray) -> float:
-    """Laplacian variance – higher = sharper."""
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    """Laplacian variance – higher = sharper.
+    CV_32F uses half the memory of CV_64F with no meaningful change in the
+    variance score used for blurry-frame rejection."""
+    lap = cv2.Laplacian(gray, cv2.CV_32F)
+    score = float(lap.var())
+    del lap
+    return score
 
 
 def _codec_artifact_ratio(gray: np.ndarray) -> float:
     """
     Estimate DCT 8×8 block-artifact severity.
-    Compares mean absolute differences at 8-pixel-spaced column boundaries
-    to the overall mean column-difference.
+    Compares mean absolute differences at 8-pixel-spaced block boundaries
+    (both vertical AND horizontal) to the overall mean neighbour-difference.
+
+    Symmetric in both axes since H.264/H.265 block artifacts appear on both
+    column and row boundaries — checking only columns missed half the cases
+    and gave inconsistent results depending on frame orientation.
     """
-    all_diff = np.abs(np.diff(gray.astype(np.int16), axis=1))
-    mean_all = float(all_diff.mean()) + 1e-6
-    boundary_cols = np.arange(7, gray.shape[1] - 1, 8)
-    if boundary_cols.size == 0:
-        return 1.0
-    return float(all_diff[:, boundary_cols].mean() / mean_all)
+    gi = gray.astype(np.int16)
+
+    # Vertical block boundaries (column-direction differences)
+    diff_col = np.abs(np.diff(gi, axis=1))
+    mean_col = float(diff_col.mean()) + 1e-6
+    cols     = np.arange(7, gray.shape[1] - 1, 8)
+    r_col    = float(diff_col[:, cols].mean() / mean_col) if cols.size else 1.0
+
+    # Horizontal block boundaries (row-direction differences)
+    diff_row = np.abs(np.diff(gi, axis=0))
+    mean_row = float(diff_row.mean()) + 1e-6
+    rows     = np.arange(7, gray.shape[0] - 1, 8)
+    r_row    = float(diff_row[rows, :].mean() / mean_row) if rows.size else 1.0
+
+    return 0.5 * (r_col + r_row)
 
 
 def _assess_frame(
     img: np.ndarray,
     blur_thresh: float,
     artifact_thresh: float,
+    gray: Optional[np.ndarray] = None,
     lo_brightness: float = 15.0,
     hi_brightness: float = 240.0,
 ) -> Tuple[bool, str]:
-    """Return (ok, reason_string). reason is 'ok' when the frame passes."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    """Return (ok, reason_string). reason is 'ok' when the frame passes.
+
+    Pass a pre-computed grayscale image in `gray` to avoid a redundant
+    BGR→gray conversion when the caller already has one (stream_frames does).
+    """
+    if gray is None:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
 
     mean_bright = float(gray.mean())
     if not (lo_brightness < mean_bright < hi_brightness):
@@ -259,6 +525,27 @@ class ExtractionConfig:
     max_movement: float = 0.55
     """Drop if mean feature displacement > this (jerk / tracking failure)."""
 
+    static_pixel_thresh: float = 3.0
+    """
+    Fallback static-frame detector used when feature matching cannot determine
+    movement (fewer than 8 good feature matches — typically over low-texture
+    or featureless floor regions).
+
+    The current frame is downsampled to a thumbnail and compared against the
+    last yielded frame using mean absolute pixel difference (MAD).  If the MAD
+    is below this threshold the frame is considered static and skipped, even
+    though the feature-based movement score could not be computed.
+
+    Value is in [0, 255] grayscale units.
+      2–4  : tight — skips frames with very small lighting flicker (default: 3)
+      5–10 : loose — only skips near-identical frames
+      0    : disables the fallback entirely (restores original bypass behaviour)
+
+    This closes the gap where low-texture sections bypassed the movement gate
+    entirely, causing every sampled frame to be yielded and placed regardless
+    of whether the drone was actually moving.
+    """
+
 
 def stream_frames(
     video_path: str,
@@ -289,7 +576,9 @@ def stream_frames(
         )
 
     detector, norm = _make_detector()
-    prev_kp = prev_des = None
+    prev_kp   = prev_des  = None
+    prev_thumb: Optional[np.ndarray] = None   # thumbnail of last yielded frame
+    _THUMB_W, _THUMB_H = 160, 90              # ~1/12 linear scale, negligible RAM
     stats = dict(sampled=0, kept=0, quality=0, movement=0)
 
     frame_idx = -1
@@ -304,26 +593,35 @@ def stream_frames(
                 continue
             stats["sampled"] += 1
 
+            # ── convert to gray once — reused for quality gate AND keypoints ──
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
             # ── quality gate ───────────────────────────────────────────────
-            ok, reason = _assess_frame(img, cfg.blur_thresh, cfg.artifact_thresh)
+            ok, reason = _assess_frame(img, cfg.blur_thresh, cfg.artifact_thresh,
+                                       gray=gray)
             if not ok:
                 stats["quality"] += 1
+                del gray
                 if verbose:
                     print(f"  [drop:quality]  frame {frame_idx:5d}: {reason}")
                 continue
 
             # ── movement gate ──────────────────────────────────────────────
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             kp, des = detector.detectAndCompute(gray, None)
+            del gray  # done with grayscale; img (BGR) is what gets yielded
+
+            feature_decision_made = False
 
             if prev_des is not None and des is not None and len(kp) >= 8:
-                good = _match(prev_des, des, norm, ratio=0.75)
-                if len(good) >= 8:
-                    pts1 = np.float32([prev_kp[m.queryIdx].pt for m in good])
-                    pts2 = np.float32([kp[m.trainIdx].pt for m in good])
-                    diag = math.hypot(img.shape[1], img.shape[0])
-                    mv = float(np.linalg.norm(pts1 - pts2, axis=1).mean()) / diag
-
+                # Robust median-displacement estimator: skips the ratio test
+                # because on repetitive scenes the ratio filter discards most
+                # matches, leaving the motion estimate undefined.  The median
+                # of nearest-neighbour displacements is naturally robust to
+                # the ambiguous matches that result from grid repetition.
+                diag = math.hypot(img.shape[1], img.shape[0])
+                mv = _median_displacement(prev_kp, prev_des, kp, des, norm, diag)
+                if mv is not None:
+                    feature_decision_made = True
                     if mv < cfg.min_movement:
                         stats["movement"] += 1
                         if verbose:
@@ -341,7 +639,37 @@ def stream_frames(
                             )
                         continue
 
+            # ── pixel-diff fallback (low-texture / feature-match failure) ──
+            # When feature matching cannot determine motion (< 8 good matches),
+            # fall back to a fast thumbnail pixel difference against the last
+            # yielded frame.  This closes the bypass where every frame in a
+            # low-texture hover section was yielded unconditionally.
+            if (not feature_decision_made
+                    and cfg.static_pixel_thresh > 0
+                    and prev_thumb is not None):
+                thumb = cv2.resize(
+                    cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),
+                    (_THUMB_W, _THUMB_H),
+                    interpolation=cv2.INTER_AREA,
+                ).astype(np.float32)
+                mad = float(np.abs(thumb - prev_thumb).mean())
+                del thumb
+                if mad < cfg.static_pixel_thresh:
+                    stats["movement"] += 1
+                    if verbose:
+                        print(
+                            f"  [skip:pixel]    frame {frame_idx:5d}: "
+                            f"mad={mad:.2f}<{cfg.static_pixel_thresh} "
+                            f"(no features)"
+                        )
+                    continue
+
             prev_kp, prev_des = kp, des
+            prev_thumb = cv2.resize(
+                cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),
+                (_THUMB_W, _THUMB_H),
+                interpolation=cv2.INTER_AREA,
+            ).astype(np.float32)
             stats["kept"] += 1
 
             if verbose and stats["kept"] % 30 == 0:
@@ -494,7 +822,7 @@ class ColorRangeMask:
     s_hi:        int
     v_lo:        int
     v_hi:        int
-    replace_bgr: Tuple[int, int, int] = (255, 255, 255)   # white
+    replace_bgr: Tuple[int, int, int] = (255, 0, 255)   # bright pink
 
     # ── convenience factories ────────────────────────────────────────────────
     @staticmethod
@@ -512,26 +840,41 @@ class ColorRangeMask:
         """Orange cones (H 5–18, high S)."""
         return ColorRangeMask("orange", 5, 18, 120, 255, 80, 255, replace_bgr)
 
+    @staticmethod
+    def blue_tape(replace_bgr: Tuple[int, int, int] = (255, 255, 255)) -> "ColorRangeMask":
+        """Blue arena grid tape (H 90–125, medium-high S/V).
+
+        Intended for use with ReconstructConfig.feature_exclude_hsv to
+        suppress feature detection on the repetitive grid structure.
+        Tune the ranges per-arena if your tape colour drifts (lighting,
+        wear, or different tape brand).
+        """
+        return ColorRangeMask("blue_tape", 90, 125, 60, 255, 60, 255, replace_bgr)
+
 
 def _apply_color_masks(img: np.ndarray, masks: List[ColorRangeMask]) -> np.ndarray:
     """
     Replace pixels matching any of the given HSV color ranges with each
     mask's replacement colour (default: white).
 
-    The function converts `img` to HSV once and evaluates all masks in a
-    single pass.  Returns a *copy* of `img` with the matching pixels
-    recoloured; the original array is never modified.
+    Returns a copy of `img` with matching pixels recoloured; the original
+    is never modified (it is still needed for feature detection in add_frame).
 
-    This is called on each frame **before** warping onto the canvas so that
-    the stitched map never contains the masked colours.  Feature detection
-    for homography estimation always runs on the *original* unmasked frame
-    so that keypoints are not degraded by the solid replacement colour.
+    Memory layout:
+      - img       : original frame (caller holds it)
+      - result    : one copy of img (this is what we return)
+      - img_hsv   : one HSV copy, used only while building masks, then freed
+      - per-mask binary mask (uint8, 1 byte/px) — small, freed per iteration
+
+    Peak extra: 2 × frame_size (result + img_hsv).  img_hsv is explicitly
+    deleted before return so it is freed as soon as the caller's reference
+    to result is the only live object.
     """
     if not masks:
         return img
 
-    img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     result  = img.copy()
+    img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
     for cm in masks:
         lo   = np.array([cm.h_lo, cm.s_lo, cm.v_lo], dtype=np.uint8)
@@ -539,7 +882,9 @@ def _apply_color_masks(img: np.ndarray, masks: List[ColorRangeMask]) -> np.ndarr
         mask = cv2.inRange(img_hsv, lo, hi)
         if mask.any():
             result[mask > 0] = cm.replace_bgr
+        del mask  # small but free eagerly inside the loop
 
+    del img_hsv  # release the 6 MB HSV copy before returning
     return result
 
 
@@ -608,6 +953,116 @@ class ReconstructConfig:
         )
     """
 
+    max_keyframes: int = 20
+    """
+    Maximum number of long-range keyframes kept in memory at any time.
+
+    Keyframes are added every keyframe_interval placed frames and act as
+    global re-localisation anchors.  Without a cap they accumulate
+    unboundedly (each holds a full SIFT descriptor array of ~2.5 MB).
+
+    When the cap is reached the buffer is thinned to keep an evenly-spaced
+    subset of the existing keyframes, preserving temporal coverage while
+    bounding memory to max_keyframes × ~2.5 MB ≈ 50 MB at the default.
+
+    Set to 0 to disable the cap (original behaviour, unbounded growth).
+    """
+
+    max_canvas_px: int = 8000
+    """
+    Pre-allocate the canvas at this size (square, in pixels) on the first
+    frame instead of starting small and expanding on overflow.
+
+    Why this matters
+    ────────────────
+    The original _expand_canvas() allocates a brand-new array of the new
+    size, copies the old canvas into it, then releases the old one.  During
+    that copy BOTH canvases are live simultaneously — a 144 MB canvas
+    produces a 288 MB spike every time the drone approaches an edge.
+
+    With pre-allocation the canvas is allocated once at startup and never
+    reallocated.  All homographies are expressed in the coordinate space of
+    this fixed canvas from the first frame onward, so _expand_canvas()
+    becomes a bounds-check only.
+
+    Memory cost: max_canvas_px² × 3 bytes
+        6000 px →  ~103 MB  (conservative, small arena)
+        8000 px →  ~183 MB  (default, typical indoor arena)
+       10000 px →  ~286 MB  (large arena or high-margin scan)
+
+    Set to 0 to disable pre-allocation and revert to the dynamic expansion
+    strategy (original behaviour, with expansion spikes).
+    """
+
+    # ── alignment-quality knobs (see _match, _pairwise_H) ────────────────────
+
+    match_ratio: float = 0.95
+    """Lowe's ratio threshold for inter-frame descriptor matching.
+
+    Lower = stricter (fewer but more reliable matches).  0.70 is a good
+    default for the repetitive blue-grid arena; on richer scenes 0.75
+    works fine.  Pair with mutual=True (always on inside _match) for
+    cross-direction agreement.
+    """
+
+    mad_factor: float = 6.0
+    """Median-Absolute-Deviation gate factor applied to per-match pixel
+    displacement BEFORE RANSAC, inside _pairwise_H.
+
+    Matches whose displacement deviates from the median by more than
+    mad_factor × MAD are rejected as gross outliers.  On a repetitive
+    grid, off-by-one-cell wrong matches form a separate displacement
+    cluster from the true inliers — this filter removes them so RANSAC
+    cannot promote them to a winning hypothesis.
+
+    6.0 ≈ 4 sigma equivalent; raise if too aggressive on noisy frames,
+    lower (e.g. 4.0) for tighter rejection on very clean scenes.
+    """
+
+    feature_exclude_hsv: List[ColorRangeMask] = field(default_factory=list)
+    """HSV ranges to EXCLUDE from feature detection (cv2.detectAndCompute mask).
+
+    For arenas dominated by a repetitive structure (e.g. blue grid tape),
+    feature detectors fire predominantly on that structure, producing
+    keypoints whose descriptors are near-duplicates of each other.
+    Excluding the structure forces the detector onto unique scene content
+    (object edges, corners, natural texture), yielding fewer but much
+    more discriminative keypoints — which is what RANSAC actually needs.
+
+    Different from color_masks: color_masks recolours pixels in the IMAGE
+    before stitching (visual-only); feature_exclude_hsv suppresses
+    KEYPOINT DETECTION in those regions (alignment-only).  You can use
+    both, and they don't have to overlap.
+
+    Example — exclude the blue grid tape from feature detection:
+        ReconstructConfig(
+            feature_exclude_hsv=[ColorRangeMask.blue_tape()],
+        )
+    """
+
+    feature_exclude_dilate_px: int = 5
+    """Dilation (in pixels) applied to the feature-exclusion mask.
+
+    Without dilation, keypoints latch onto the *edges* of the excluded
+    region — but those edges still inherit grid-locked positions and
+    re-introduce the ambiguity problem the exclusion was meant to fix.
+    Dilating the mask by a few pixels pushes feature detection cleanly
+    off the structure.  Tune relative to your line/tape thickness.
+    """
+
+    min_keypoint_bins: int = 10
+    """Minimum number of distinct 8×8 spatial bins (out of 64) that must
+    contain at least one keypoint for a frame to be eligible for placement.
+
+    Catches frames where all keypoints land on a single dominant
+    structure (e.g. blue grid tape that wasn't fully excluded, or a frame
+    that happens to be aimed at a featureless region).  Such frames would
+    yield alignment estimates that are highly anisotropic and prone to
+    drift.
+
+    Set to 0 to disable the check.
+    """
+
 
 class MapReconstructor:
     """
@@ -640,8 +1095,13 @@ class MapReconstructor:
         self.detector, self.norm = _make_detector()
 
         self._canvas: Optional[np.ndarray] = None
-        self._recent: List[dict] = []  # ring buffer  {kp, des, H}
-        self._keyframes: List[dict] = []  # sparse long-range anchors
+        # When pre-allocation is active, the canvas is larger than needed.
+        # _canvas_origin tracks the (x, y) pixel offset of the coordinate
+        # origin used by all stored homographies within the canvas array.
+        self._canvas_origin: Tuple[int, int] = (0, 0)
+
+        self._recent: List[dict] = []    # ring buffer  {kp, des, H}
+        self._keyframes: List[dict] = [] # sparse long-range anchors
 
         self._n_placed = 0
         self._n_failed = 0
@@ -657,11 +1117,35 @@ class MapReconstructor:
         """
         Stream-process an entire video file.
         Never holds more than one decoded frame in memory at a time.
+
+        Periodic GC
+        ───────────
+        Every gc_interval placed frames, gc.collect() is called and the
+        system allocator is asked to return free pages to the OS (via
+        malloc_trim on Linux).  This prevents RSS from inflating
+        unboundedly due to Python/numpy allocator fragmentation even when
+        actual Python-visible memory is flat.
         """
+        import gc
+        import ctypes, sys
+
+        def _trim_allocator():
+            """Ask glibc to return free arena pages to the OS (Linux only)."""
+            if sys.platform.startswith("linux"):
+                try:
+                    ctypes.cdll.LoadLibrary("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
+
+        gc_interval = 50   # trim every N frames processed (placed or not)
+
         for i, frame in enumerate(stream_frames(video_path, extract_cfg, verbose), 1):
             self.add_frame(frame, verbose=verbose)
             if verbose and i % 50 == 0:
                 print(f"  [frame {i}]  {self.stats}")
+            if i % gc_interval == 0:
+                gc.collect()
+                _trim_allocator()
 
     def add_frame(self, img: np.ndarray, verbose: bool = False) -> bool:
         """
@@ -682,16 +1166,57 @@ class MapReconstructor:
         img_stitch = _apply_color_masks(img, self.cfg.color_masks)
 
         h, w = img.shape[:2]
-        kp, des = _kp_des(self.detector, img)
+
+        # ── feature-detection mask (excludes repetitive structures) ──────────
+        # Pixels matching feature_exclude_hsv are NOT eligible for keypoint
+        # detection.  This forces SIFT onto unique scene content (object
+        # edges, corners) rather than the repetitive grid intersections that
+        # produced ambiguous matches and drift in the original pipeline.
+        feat_mask = _make_feature_mask(
+            img,
+            self.cfg.feature_exclude_hsv,
+            dilate_px=self.cfg.feature_exclude_dilate_px,
+        )
+        kp, des = _kp_des(self.detector, img, mask=feat_mask)
+        if feat_mask is not None:
+            del feat_mask
         if des is None or len(kp) < 8:
             self._n_failed += 1
+            if verbose:
+                print(f"  [skip] insufficient keypoints (n={0 if kp is None else len(kp)})")
             return False
+
+        # ── spatial-spread gate (rejects clustered-keypoint frames) ──────────
+        if self.cfg.min_keypoint_bins > 0:
+            ok, reason = _keypoint_spread_ok(
+                kp, w, h, bins=8, min_filled=self.cfg.min_keypoint_bins
+            )
+            if not ok:
+                self._n_failed += 1
+                if verbose:
+                    print(f"  [skip:spread] {reason}")
+                return False
 
         # ── first frame: initialise canvas ──────────────────────────────────
         if self._canvas is None:
             m = self.cfg.canvas_margin
-            H0 = np.array([[1, 0, m], [0, 1, m], [0, 0, 1]], dtype=np.float64)
-            self._canvas = np.zeros((h + 2 * m, w + 2 * m, 3), dtype=np.uint8)
+            if self.cfg.max_canvas_px > 0:
+                # Pre-allocate the full canvas upfront.  The first frame is
+                # placed at the centre so the drone has equal room in all
+                # directions without any reallocation.
+                cap_px = self.cfg.max_canvas_px
+                cx = (cap_px - w) // 2
+                cy = (cap_px - h) // 2
+                H0 = np.array([[1, 0, cx], [0, 1, cy], [0, 0, 1]], dtype=np.float64)
+                self._canvas = np.zeros((cap_px, cap_px, 3), dtype=np.uint8)
+                print(f"  Canvas pre-allocated: {cap_px}×{cap_px} px  "
+                      f"({cap_px*cap_px*3/1_048_576:.0f} MB)  "
+                      f"first frame offset=({cx},{cy})")
+            else:
+                # Dynamic allocation (original behaviour): start small,
+                # expand on overflow (causes double-canvas spikes).
+                H0 = np.array([[1, 0, m], [0, 1, m], [0, 0, 1]], dtype=np.float64)
+                self._canvas = np.zeros((h + 2 * m, w + 2 * m, 3), dtype=np.uint8)
             self._warp_and_blend_roi(img_stitch, H0)
             self._register(kp, des, H0)
             self._n_placed = 1
@@ -701,6 +1226,12 @@ class MapReconstructor:
         lookback = min(self.cfg.lookback, len(self._recent))
         candidates = self._recent[-lookback:] + self._keyframes
 
+        canvas_h_px, canvas_w_px = self._canvas.shape[:2]
+        # Allow overflow up to one frame diagonal on each side.
+        # Larger overflows indicate a degenerate composed H, not a legitimate
+        # slightly-out-of-bounds frame.
+        max_overflow = int(math.hypot(w, h))
+
         best_H, best_n = None, 0
         for ref in candidates:
             H_pair, n_in = _pairwise_H(
@@ -709,10 +1240,26 @@ class MapReconstructor:
                 self.norm,
                 w,
                 h,
+                match_ratio=self.cfg.match_ratio,
+                mad_factor=self.cfg.mad_factor,
             )
-            if H_pair is not None and n_in > best_n:
-                best_H = ref["H"] @ H_pair
-                best_n = n_in
+            if H_pair is None or n_in <= best_n:
+                continue
+
+            # Compose into canvas coordinates and validate the RESULT.
+            # H_pair can look fine individually while ref["H"] @ H_pair is
+            # degenerate due to accumulated drift in ref["H"].
+            composed = ref["H"] @ H_pair
+            ok, reason = _validate_composed_H(
+                composed, w, h, canvas_h_px, canvas_w_px, max_overflow
+            )
+            if not ok:
+                if verbose:
+                    print(f"  [reject_composed] {reason} (n_in={n_in})")
+                continue
+
+            best_H = composed
+            best_n = n_in
 
         if best_H is None or best_n < self.cfg.min_inliers:
             self._n_failed += 1
@@ -724,7 +1271,14 @@ class MapReconstructor:
             return False
 
         # ── grow canvas if frame falls outside ──────────────────────────────
-        best_H = self._expand_canvas(img, best_H)
+        result_H = self._expand_canvas(img, best_H)
+        if result_H is None:
+            # _expand_canvas rejected the frame (degenerate overflow).
+            # Count as failed and do not register the homography so the
+            # corrupt ref["H"] chain is not propagated to future frames.
+            self._n_failed += 1
+            return False
+        best_H = result_H
 
         # ── warp and blend (ROI only — the key memory fix) ──────────────────
         self._warp_and_blend_roi(img_stitch, best_H)
@@ -738,7 +1292,15 @@ class MapReconstructor:
         crop: bool = True,
     ) -> np.ndarray:
         """
-        Return the current reconstructed map.
+        Return the current reconstructed map and release the internal canvas.
+
+        Memory note
+        ───────────
+        After cropping (which produces a view or small copy) the internal
+        canvas reference is cleared so the large pre-allocated array can be
+        garbage-collected before the resize step.  This means only the
+        cropped region + the resized output coexist in memory, rather than
+        the full canvas + the output.
 
         output_shape : (W, H) to resize to; None = natural canvas resolution.
         crop         : trim zero-padding from the content edges first.
@@ -746,18 +1308,25 @@ class MapReconstructor:
         if self._canvas is None:
             raise RuntimeError("No frames placed yet.")
 
-        result = self._canvas
+        canvas = self._canvas
+        self._canvas = None   # drop reference; allows GC during resize below
+
         if crop:
-            gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-            nz = cv2.findNonZero(gray)
+            gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+            nz   = cv2.findNonZero(gray)
+            del gray
             if nz is not None:
                 x, y, cw, ch = cv2.boundingRect(nz)
-                result = result[y : y + ch, x : x + cw]
+                canvas = canvas[y : y + ch, x : x + cw].copy()  # contiguous copy
+                # The slice above is a view into the full canvas array.
+                # The .copy() makes it independent so the canvas can be freed.
 
         if output_shape is not None:
-            result = cv2.resize(result, output_shape, interpolation=cv2.INTER_LANCZOS4)
+            result = cv2.resize(canvas, output_shape, interpolation=cv2.INTER_LANCZOS4)
+            del canvas   # free cropped region before returning resized result
+            return result
 
-        return result
+        return canvas
 
     @property
     def stats(self) -> dict:
@@ -774,32 +1343,103 @@ class MapReconstructor:
 
     def _register(self, kp, des, H: np.ndarray):
         entry = {"kp": kp, "des": des, "H": H.copy()}
+
+        # ── recent ring buffer (bounded by lookback + 2) ─────────────────────
         self._recent.append(entry)
         if len(self._recent) > self.cfg.lookback + 2:
             self._recent.pop(0)
+
+        # ── keyframe archive (bounded by max_keyframes) ──────────────────────
         if self._n_placed % self.cfg.keyframe_interval == 0:
             self._keyframes.append({"kp": kp, "des": des, "H": H.copy()})
 
-    def _expand_canvas(self, img: np.ndarray, H: np.ndarray) -> np.ndarray:
+            cap = self.cfg.max_keyframes
+            if cap > 0 and len(self._keyframes) > cap:
+                # Thin to an evenly-spaced subset so temporal coverage is
+                # preserved rather than simply dropping the oldest entries.
+                # numpy linspace gives cap indices spread across the list.
+                keep = np.linspace(0, len(self._keyframes) - 1, cap, dtype=int)
+                self._keyframes = [self._keyframes[i] for i in keep]
+
+    def _expand_canvas(self, img: np.ndarray, H: np.ndarray) -> Optional[np.ndarray]:
         """
-        Pad the canvas so the warped `img` fits, translating all stored
-        homographies accordingly.  Returns the updated H for `img`.
+        Ensure the warped `img` fits within the canvas.
+
+        Returns the (possibly updated) homography, or None if the frame should
+        be rejected because its footprint is degenerate or exceeds safety limits.
+
+        Pre-allocated canvas (max_canvas_px > 0)
+        ─────────────────────────────────────────
+        Near-misses (overflow < canvas_size): warn, clip, accept — the tail of
+        the flight path strays slightly outside the pre-allocated area.
+        Degenerate overflow (overflow >= canvas_size): reject with [reject_overflow]
+        — the composed homography has drifted and the frame contributes nothing.
+
+        Dynamic canvas (max_canvas_px == 0)
+        ────────────────────────────────────
+        A hard cap of max(canvas_current_size × 4, 20000 px) is enforced before
+        any allocation.  Exceeding it means the composed H is degenerate (not
+        that the arena is genuinely that large) and the frame is rejected.
         """
         fh, fw = img.shape[:2]
         corners = np.float32([[0, 0], [fw, 0], [fw, fh], [0, fh]]).reshape(-1, 1, 2)
         wc = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
-
         ch, cw = self._canvas.shape[:2]
+
+        if self.cfg.max_canvas_px > 0:
+            # Pre-allocated path
+            out_l = float(-wc[:, 0].min())
+            out_t = float(-wc[:, 1].min())
+            out_r = float(wc[:, 0].max() - cw)
+            out_b = float(wc[:, 1].max() - ch)
+            worst = max(out_l, out_t, out_r, out_b)
+
+            if worst <= 10:
+                return H  # fully inside, fast path
+
+            # Overflow larger than the canvas itself → degenerate composed H.
+            # _validate_composed_H should catch this first, but belt-and-suspenders.
+            if worst >= max(cw, ch):
+                print(
+                    f"  [reject_overflow] Footprint overflow={worst:.0f}px "
+                    f">= canvas_size={max(cw, ch)}px — degenerate H rejected."
+                )
+                return None
+
+            # Legitimate slight overshoot (drone near canvas edge): warn and clip.
+            print(
+                f"  [warn] Frame clips canvas edge "
+                f"(l={out_l:.0f} t={out_t:.0f} r={out_r:.0f} b={out_b:.0f} px). "
+                f"Consider increasing max_canvas_px."
+            )
+            return H  # _warp_and_blend_roi clips to canvas bounds
+
+        # Dynamic path: allocate + copy + retranslate.
         pl = max(0, int(-wc[:, 0].min()) + 10)
         pt = max(0, int(-wc[:, 1].min()) + 10)
         pr = max(0, int(wc[:, 0].max()) - cw + 10)
         pb = max(0, int(wc[:, 1].max()) - ch + 10)
 
         if pl == 0 and pt == 0 and pr == 0 and pb == 0:
-            return H
+            return H  # no expansion needed
 
-        new_canvas = np.zeros((ch + pt + pb, cw + pl + pr, 3), dtype=np.uint8)
+        new_w = cw + pl + pr
+        new_h = ch + pt + pb
+
+        # Safety cap: if the required canvas is implausibly large it means the
+        # composed H is degenerate.  Using max(current_size×4, 20000) as the
+        # ceiling is generous for any realistic indoor arena.
+        max_dynamic = max(cw * 4, ch * 4, 20_000)
+        if new_w > max_dynamic or new_h > max_dynamic:
+            print(
+                f"  [reject_overflow] Dynamic expansion would reach "
+                f"{new_w}×{new_h} px (limit={max_dynamic}px) — degenerate H rejected."
+            )
+            return None
+
+        new_canvas = np.zeros((new_h, new_w, 3), dtype=np.uint8)
         new_canvas[pt : pt + ch, pl : pl + cw] = self._canvas
+        del self._canvas        # release old before assigning new
         self._canvas = new_canvas
 
         T = np.array([[1, 0, pl], [0, 1, pt], [0, 0, 1]], dtype=np.float64)
@@ -907,20 +1547,25 @@ def reconstruct_from_video(
     """
     Full pipeline: .mp4 drone video → stitched top-down map image.
 
-    Frames are streamed one at a time; total RAM is approximately:
-        canvas_size  +  2 × one_frame_size
-    regardless of video length.
+    Memory profile (with default max_canvas_px=8000)
+    ─────────────────────────────────────────────────
+    Fixed cost (allocated once, freed when this function returns):
+      canvas          ~183 MB   (8000×8000×3, pre-allocated)
+      _recent buffer   ~20 MB   (8 frames × SIFT descriptors)
+      _keyframes       ~50 MB   (max 20 keyframes × SIFT descriptors)
 
-    Memory-saving knobs
-    -------------------
-    • Lower target_fps (fewer frames → slower canvas growth)
-    • Set processing_scale=0.5 (4× smaller canvas and per-frame buffers)
-    • Both together:
-        reconstruct_from_video(
-            "flight.mp4",
-            extract_cfg=ExtractionConfig(target_fps=3.0),
-            reconstruct_cfg=ReconstructConfig(processing_scale=0.5),
-        )
+    Per-frame transient (freed before next frame):
+      frame BGR        ~6 MB
+      img_stitch copy  ~6 MB    (color-masked copy)
+      img_hsv          ~6 MB    (freed inside _apply_color_masks)
+      gray             ~2 MB    (freed after keypoint detection)
+      Laplacian f32    ~8 MB    (freed inside _blur_score)
+      warped ROI       ~6 MB    (frame-footprint warp only)
+      Total transient ~34 MB
+
+    Peak: canvas + _recent + _keyframes + transient ≈ 287 MB
+
+    No canvas-expansion spikes (dynamic reallocation eliminated).
     """
     _sep = "─" * 60
 
@@ -941,7 +1586,15 @@ def reconstruct_from_video(
     result = rec.get_map(output_shape=output_shape)
 
     if save_path:
-        cv2.imwrite(save_path, result)
+        out_dir = os.path.dirname(os.path.abspath(save_path))
+        os.makedirs(out_dir, exist_ok=True)
+        ok = cv2.imwrite(save_path, result)
+        if not ok:
+            raise IOError(
+                f"cv2.imwrite failed for path: {save_path!r}\n"
+                f"  Directory exists: {os.path.isdir(out_dir)}\n"
+                f"  Check the path is writable and the extension is supported."
+            )
         if verbose:
             print(f"  Saved → {save_path}")
 

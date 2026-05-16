@@ -1,4 +1,7 @@
-from drone_map_gen import (
+
+# python -m drone_map_create.example.drone_map_gen-single
+
+from drone_map_create.drone_map_gen import (
     reconstruct_from_video,
     ExtractionConfig,
     ReconstructConfig,
@@ -55,7 +58,7 @@ color_masks = [
         h_lo=18,  h_hi=38,    # hue  [0, 180]
         s_lo=80,  s_hi=255,   # saturation — high floor rejects pale/grey yellows
         v_lo=80,  v_hi=255,   # value      — excludes very dark yellow-brown
-        replace_bgr=(255, 255, 255),   # → white
+        replace_bgr=(255, 0, 255),   # → bright pink
     ),
 
     # ── brown border / cardboard ─────────────────────────────────────────────
@@ -67,7 +70,7 @@ color_masks = [
         h_lo=5,   h_hi=25,
         s_lo=50,  s_hi=255,
         v_lo=40,  v_hi=180,   # v_hi=180 keeps out very bright reflective patches
-        replace_bgr=(255, 255, 255),
+        replace_bgr=(255, 0, 255),
     ),
 
     # ── orange cones ─────────────────────────────────────────────────────────
@@ -77,7 +80,7 @@ color_masks = [
         h_lo=5,   h_hi=18,
         s_lo=120, s_hi=255,   # high s_lo separates orange from tan/beige
         v_lo=80,  v_hi=255,
-        replace_bgr=(255, 255, 255),
+        replace_bgr=(255, 0, 255),
     ),
 
     # ── example: add more ranges as needed ───────────────────────────────────
@@ -86,7 +89,7 @@ color_masks = [
     #     h_lo=35, h_hi=75,
     #     s_lo=60, s_hi=255,
     #     v_lo=60, v_hi=255,
-    #     replace_bgr=(255, 255, 255),
+    #     replace_bgr=(255, 0, 255),
     # ),
 ]
 
@@ -137,9 +140,9 @@ reconstruct_cfg = ReconstructConfig(
 # Run
 # ══════════════════════════════════════════════════════════════════════════════
 result = reconstruct_from_video(
-    "./data/drone_map_scan_2.mp4",
+    "drone_map_create/data/drone_scans/scan6/scan.mp4",
     output_shape=(2000, 2000),   # (W, H) to resize the final map; None = native
-    save_path="./out/drone_map_2.png",
+    save_path="drone_map_create/out/drone_map-single.png",
     extract_cfg=extract_cfg,
     reconstruct_cfg=reconstruct_cfg,
     verbose=True,
