@@ -67,9 +67,9 @@ reconstruct_cfg = ReconstructConfig(
     grid_hsv_v_lo=50,
 )
 
-result = reconstruct_from_video(
-    "drone_map_create/data/square_cut/manual_scan4-square.mp4",
-    # "drone_map_create/data/drone_scans/scan6/scan.mp4",
+reconstruct_from_video(
+    # "drone_map_create/data/square_cut/manual_scan4-square.mp4",
+    "drone_map_create/data/drone_scans/scan6/scan.mp4",
     output_shape=(2000, 2000),
     save_path="drone_map_create/out/drone_map.png",
     extract_cfg=extract_cfg,
