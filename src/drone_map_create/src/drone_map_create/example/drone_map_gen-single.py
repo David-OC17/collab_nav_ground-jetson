@@ -140,7 +140,7 @@ reconstruct_cfg = ReconstructConfig(
 # Run
 # ══════════════════════════════════════════════════════════════════════════════
 result = reconstruct_from_video(
-    "drone_map_create/data/drone_scans/scan6/scan.mp4",
+    "drone_map_create/data/drone_scans/scan3/scan.mp4",
     output_shape=(2000, 2000),   # (W, H) to resize the final map; None = native
     save_path="drone_map_create/out/drone_map-single.png",
     extract_cfg=extract_cfg,
