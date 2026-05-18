@@ -24,9 +24,26 @@ def generate_launch_description():
         '/yahboomcar_bringup_launch.py'])
     )
 
+    # ── RViz2 ──────────────────────────────────────────────────────────────
+    rviz_config = os.path.join(
+        get_package_share_directory('yahboomcar_laser'),  # or any package you own
+        'rviz',
+        'rover.rviz'   # config file — created below if it doesn't exist yet
+    )
+
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', rviz_config],   # remove this line to start with blank RViz
+        output='screen'
+    )
+    # ───────────────────────────────────────────────────────────────────────
+
     launch_description = LaunchDescription([
         ms200_scan_node,
         laser_tracker_node,
-        bringup_node
+        bringup_node,
+        rviz_node
         ]) 
     return launch_description

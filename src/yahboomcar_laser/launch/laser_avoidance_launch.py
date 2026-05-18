@@ -25,9 +25,17 @@ def generate_launch_description():
         }]
     )
 
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        output='screen'
+    )
+
     launch_description = LaunchDescription([
         ms200_scan_node,
         laser_avoidance_node,
+        rviz_node
     ])
 
     return launch_description
