@@ -1,0 +1,18 @@
+# LocalizeMarkers.srv
+#
+# Request
+#   video_path     : absolute path to the drone video
+#   optitrack_csv  : absolute path to the OptiTrack CSV (one row per video frame)
+#
+# Response
+#   success        : true if the pipeline finished without a hard error
+#   message        : human-readable status / error summary
+#   markers        : one entry per unique ArUco marker detected and accepted
+#                    (markers seen but rejected by outlier filters are absent)
+
+string video_path
+string optitrack_csv
+---
+bool                                  success
+string                                message
+arena_marker_localizer_interfaces/MarkerPose[]   markers

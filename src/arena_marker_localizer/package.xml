@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>arena_marker_localizer</name>
+  <version>0.1.0</version>
+  <description>
+    ROS 2 Humble service that locates ArUco markers in the arena map frame
+    by fusing a drone video, the drone's OptiTrack pose log, a known
+    camera-to-drone static transform, and an OptiTrack-to-map static
+    transform. Per-marker observations are aggregated with a MAD gate
+    plus geometric median.
+  </description>
+  <maintainer email="user@example.com">arena_marker_localizer maintainers</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>arena_marker_localizer_interfaces</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

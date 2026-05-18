@@ -1,0 +1,60 @@
+marker_localizer_service:
+  ros__parameters:
+    # ── REQUIRED: path to the OpenCV-format camera intrinsics YAML ──
+    intrinsics_path: ""
+
+    intrinsics:
+      camera_matrix_key: "camera_matrix"
+      dist_key: "dist_coeff"
+
+    # ── ArUco dictionaries to scan, format "DICT_NAME:size_m" ──
+    dictionaries:
+      - "DICT_4X4_50:0.10"
+
+    # ── Frame quality gates ──
+    quality:
+      blur_thresh: 60.0
+      artifact_thresh: 2.0
+
+    # ── Per-detection quality gate ──
+    max_reproj_err_px: 4.0
+
+    # ── Static transform: drone-body-frame from camera-frame ──
+    #    (camera mounting position + rotation from OpenCV camera to body)
+    T_drone_from_cam:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      roll: 0.0
+      pitch: 0.0
+      yaw: 0.0
+
+    # ── Static transform: map-frame from OptiTrack-frame ──
+    #    (where the OccupancyGrid origin sits in the OptiTrack frame)
+    T_map_from_opti:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      roll: 0.0
+      pitch: 0.0
+      yaw: 0.0
+
+    optitrack:
+      yaw_axis: "z"     # "z" or "y"
+      x_dir: 1          # +1 or -1
+      y_dir: 1
+
+    aggregation:
+      mad_k: 3.5
+      min_observations: 40
+      max_iterations: 100
+      convergence_eps: 1.0e-5
+
+    max_obs_per_marker: 200
+
+    grid:
+      resolution_m_per_cell: 0.05
+      width_cells: 80
+      height_cells: 80
+
+    verbose: false

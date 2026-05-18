@@ -66,3 +66,30 @@ unset ROS_PACKAGE_PATH
 unset ROS_DISTRO
 unset ROS_VERSION
 ```
+
+Execute a test via:
+
+```bash
+# Terminal 1
+
+# Terminal 2
+```
+
+## Arena marker localizer
+
+```bash
+# Terminal 1
+source install/setup.sh
+
+ros2 run arena_marker_localizer marker_localizer_service
+
+# Terminal 2
+source install/setup.sh
+
+ros2 param set /marker_localizer_service intrinsics_path \
+ /absolute/path/to/your/calibration.yaml
+
+ros2 service call /localize_markers arena_marker_localizer_interfaces/srv/LocalizeMarkers \
+  "{video_path: '/absolute/path/to/your/video.mp4',
+    optitrack_csv: '/absolute/path/to/your/optitrack.csv'}"
+```
