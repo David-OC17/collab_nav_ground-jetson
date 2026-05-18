@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+
+"""
+arena_map_builder.build_arena_map_server
+─────────────────────────────────────────────────────────────────────────────
+ROS2 (Humble) action server. One action, ``BuildArenaMap``:
+
+  Goal:     video_path (everything else comes from rclpy parameters)
+  Feedback: stage progress (extracting / stitching / transferring /
+                            consistency / occupancy / done)
+  Result:   nav_msgs/OccupancyGrid + summary fields
+
+Concurrency: a goal arriving while another is running cancels the
+current one (per user spec).
+
+Debug images for every major stage are written to a configurable on-disk
+directory; nothing is published to ROS topics.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+import time
+from dataclasses import replace
+from typing import List, Optional
+
+import cv2
+import numpy as np
+
+import rclpy
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.action.server import ServerGoalHandle
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import QoSProfile
+
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+
+from builtin_interfaces.msg import Time
+from geometry_msgs.msg import Pose, Point, Quaternion
+from nav_msgs.msg import OccupancyGrid, MapMetaData
+
+from arena_map_builder_msgs.action import BuildArenaMap
+
+# Vendored (do-not-modify) processing modules
+from arena_map_builder.processing.transfer_obstacles import TransferConfig
+from arena_map_builder.processing.drone_map_grid_gen import (
+    ExtractionConfig,
+    ReconstructConfig,
+    ColorRangeMask,
+    reconstruct_from_video,
+)
+
+# Wrapper-side modules
+from arena_map_builder.consistency import (
+    ConsistencyConfig,
+    compute_consistency,
+)
+from arena_map_builder.occupancy import (
+    OccupancyConfig,
+    rasterize_occupancy,
+    occupancy_to_grid_array,
+)
+
+
+# ===========================================================================
+# The node
+# ===========================================================================
+
+class BuildArenaMapServer(Node):
+    """Action server for video → OccupancyGrid."""
+
+    def __init__(self):
+        super().__init__("build_arena_map_server")
+
+        # ── Parameters (all configurable at runtime via ros2 param) ────
+        self._declare_parameters()
+
+        # ── Concurrency ────────────────────────────────────────────────
+        self._cb_group = ReentrantCallbackGroup()
+        self._active_goal_handle: Optional[ServerGoalHandle] = None
+        self._active_goal_lock = threading.Lock()
+
+        # ── Action server ──────────────────────────────────────────────
+        self._action_server = ActionServer(
+            self,
+            BuildArenaMap,
+            "build_arena_map",
+            execute_callback=self.execute_callback,
+            goal_callback=self.goal_callback,
+            cancel_callback=self.cancel_callback,
+            callback_group=self._cb_group,
+        )
+
+        self.get_logger().info(
+            "build_arena_map action server ready on /build_arena_map"
+        )
+
+    # -----------------------------------------------------------------------
+    # Parameter declaration
+    # -----------------------------------------------------------------------
+
+    def _declare_parameters(self):
+        """Declare every runtime parameter with a sensible default."""
+        # --- Output / debug --------------------------------------------------
+        self.declare_parameter("debug_dir", "/tmp/arena_map_builder")
+
+        # --- Stitching (drone_map_grid_gen) ---------------------------------
+        # Output / framing
+        self.declare_parameter("stitch.output_width",  3000)
+        self.declare_parameter("stitch.output_height", 3000)
+        self.declare_parameter("stitch.save_intermediate", True)
+
+        # ExtractionConfig
+        self.declare_parameter("stitch.extract.target_fps",          5.0)
+        self.declare_parameter("stitch.extract.blur_thresh",        60.0)
+        self.declare_parameter("stitch.extract.artifact_thresh",     2.0)
+        self.declare_parameter("stitch.extract.min_movement",        0.015)
+        self.declare_parameter("stitch.extract.max_movement",        0.55)
+        self.declare_parameter("stitch.extract.static_pixel_thresh", 3.0)
+
+        # ReconstructConfig (non-mask fields)
+        self.declare_parameter("stitch.reconstruct.canvas_margin",            2000)
+        self.declare_parameter("stitch.reconstruct.min_inliers",                10)
+        self.declare_parameter("stitch.reconstruct.lookback",                    4)
+        self.declare_parameter("stitch.reconstruct.keyframe_interval",          15)
+        self.declare_parameter("stitch.reconstruct.blend_mode",          "feather")
+        self.declare_parameter("stitch.reconstruct.pyramid_levels",              4)
+        self.declare_parameter("stitch.reconstruct.processing_scale",          1.0)
+        self.declare_parameter("stitch.reconstruct.max_keyframes",              20)
+        self.declare_parameter("stitch.reconstruct.max_canvas_px",            8000)
+        self.declare_parameter("stitch.reconstruct.match_ratio",              0.95)
+        self.declare_parameter("stitch.reconstruct.mad_factor",                6.0)
+        self.declare_parameter("stitch.reconstruct.feature_exclude_dilate_px",   5)
+        self.declare_parameter("stitch.reconstruct.min_keypoint_bins",          10)
+
+        # Blue grid intersection alignment
+        self.declare_parameter("stitch.reconstruct.use_grid_intersections",   True)
+        self.declare_parameter("stitch.reconstruct.grid_match_dist",          25.0)
+        self.declare_parameter("stitch.reconstruct.grid_min_intersections",      4)
+        self.declare_parameter("stitch.reconstruct.grid_hsv_h_lo",              90)
+        self.declare_parameter("stitch.reconstruct.grid_hsv_h_hi",             130)
+        self.declare_parameter("stitch.reconstruct.grid_hsv_s_lo",              50)
+        self.declare_parameter("stitch.reconstruct.grid_hsv_v_lo",              50)
+
+        # ColorRangeMask lists — encoded as string arrays where each item is
+        #   "name:h_lo,h_hi,s_lo,s_hi,v_lo,v_hi:B,G,R"
+        # e.g. "yellow:35,45,50,255,80,255:0,255,0"
+        # An empty array means "no masks".
+        self.declare_parameter(
+            "stitch.reconstruct.color_masks",
+            [
+                "yellow:35,45,50,255,80,255:0,255,0",
+                "brown:15,30,50,255,125,255:255,0,255",
+                "orange:10,30,50,255,20,125:0,255,0",
+            ],
+        )
+        # rclpy can't infer the type of an empty list, so declare it
+        # with an explicit STRING_ARRAY descriptor.
+        self.declare_parameter(
+            "stitch.reconstruct.feature_exclude_hsv",
+            [],
+            ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY),
+        )
+
+        # --- Transfer (TransferConfig) --------------------------------------
+        self.declare_parameter("transfer.correct_perspective", True)
+        self.declare_parameter("transfer.close_iterations", 3)
+        self.declare_parameter("transfer.morph_kernel",     5)
+        self.declare_parameter("transfer.min_blob_area_frac", 0.001)
+        self.declare_parameter("transfer.max_blob_area_frac", 0.25)
+        self.declare_parameter("transfer.use_florence2",     False)
+        self.declare_parameter("transfer.florence2_model_id",
+                               "microsoft/Florence-2-base")
+        self.declare_parameter("transfer.florence2_device",  "auto")
+        self.declare_parameter("transfer.drop_unknown",      True)
+        # Background template (path to the clean arena PNG).
+        self.declare_parameter("transfer.background_path", "")
+
+        # --- Consistency (ConsistencyConfig) --------------------------------
+        self.declare_parameter("consistency.w_bbox_grid_position", 0.45)
+        self.declare_parameter("consistency.w_bbox_grid_area",     0.25)
+        self.declare_parameter("consistency.w_perturbation",       0.30)
+        self.declare_parameter("consistency.position_tol_cells",   0.5)
+        self.declare_parameter("consistency.perturb_stab_tol",     0.25)
+
+        # --- Occupancy (OccupancyConfig) ------------------------------------
+        self.declare_parameter("occupancy.resolution_m_per_cell", 0.05)
+        self.declare_parameter("occupancy.arena_width_m",         4.0)
+        self.declare_parameter("occupancy.arena_height_m",        4.0)
+        self.declare_parameter("occupancy.background_occ",   10)
+        self.declare_parameter("occupancy.obstacle_core_occ", 90)
+        self.declare_parameter("occupancy.wall_occ",         100)
+        self.declare_parameter("occupancy.unknown_occ",       -1)
+        self.declare_parameter("occupancy.base_thickness_px", 8)
+        self.declare_parameter("occupancy.decay_rate",        3.0)
+        self.declare_parameter("occupancy.halo_step_px",      2)
+        self.declare_parameter("occupancy.wall_s_hi",         180)
+        self.declare_parameter("occupancy.frame_id",          "map")
+
+    # -----------------------------------------------------------------------
+    # Action server callbacks
+    # -----------------------------------------------------------------------
+
+    def goal_callback(self, _goal_request):
+        """Accept all incoming goals; cancellation of in-flight handled
+        in execute_callback's pre-amble below."""
+        return GoalResponse.ACCEPT
+
+    def cancel_callback(self, _goal_handle):
+        self.get_logger().info("Cancel request received — honouring.")
+        return CancelResponse.ACCEPT
+
+    def execute_callback(self, goal_handle: ServerGoalHandle):
+        """Pre-empt any in-flight goal, then run the pipeline."""
+        with self._active_goal_lock:
+            prev = self._active_goal_handle
+            if prev is not None and prev.is_active and prev != goal_handle:
+                self.get_logger().info(
+                    "Pre-empting in-flight goal; aborting previous run."
+                )
+                prev.abort()
+            self._active_goal_handle = goal_handle
+
+        try:
+            return self._run_pipeline(goal_handle)
+        except Exception as e:
+            self.get_logger().error(f"Pipeline crashed: {e}")
+            goal_handle.abort()
+            result = BuildArenaMap.Result()
+            result.success = False
+            result.message = f"exception: {e}"
+            return result
+        finally:
+            with self._active_goal_lock:
+                if self._active_goal_handle == goal_handle:
+                    self._active_goal_handle = None
+
+    # -----------------------------------------------------------------------
+    # The actual work
+    # -----------------------------------------------------------------------
+
+    def _get(self, name, default=None):
+        return self.get_parameter(name).value if self.has_parameter(name) \
+            else default
+
+    def _emit_feedback(self, goal_handle, stage: str, progress: float,
+                       message: str = ""):
+        fb = BuildArenaMap.Feedback()
+        fb.stage = stage
+        fb.progress = float(np.clip(progress, 0.0, 1.0))
+        fb.message = message
+        goal_handle.publish_feedback(fb)
+
+    def _check_cancel(self, goal_handle) -> bool:
+        return goal_handle.is_cancel_requested or not goal_handle.is_active
+
+    @staticmethod
+    def _parse_color_mask(spec: str) -> Optional[ColorRangeMask]:
+        """Parse one ``"name:h_lo,h_hi,s_lo,s_hi,v_lo,v_hi:B,G,R"`` string
+        into a ColorRangeMask. Returns None (and logs nothing — the caller
+        does) on any parse error so partial lists don't abort the run."""
+        try:
+            name_part, hsv_part, bgr_part = spec.split(":")
+            h_lo, h_hi, s_lo, s_hi, v_lo, v_hi = [
+                int(x.strip()) for x in hsv_part.split(",")
+            ]
+            b, g, r = [int(x.strip()) for x in bgr_part.split(",")]
+            return ColorRangeMask(
+                name=name_part.strip(),
+                h_lo=h_lo, h_hi=h_hi,
+                s_lo=s_lo, s_hi=s_hi,
+                v_lo=v_lo, v_hi=v_hi,
+                replace_bgr=(b, g, r),
+            )
+        except Exception:
+            return None
+
+    def _parse_color_mask_list(self, param_name: str) -> List[ColorRangeMask]:
+        raw = self._get(param_name) or []
+        out: List[ColorRangeMask] = []
+        for spec in raw:
+            m = self._parse_color_mask(spec)
+            if m is None:
+                self.get_logger().warn(
+                    f"Ignoring malformed {param_name} entry: {spec!r}. "
+                    f"Expected 'name:h_lo,h_hi,s_lo,s_hi,v_lo,v_hi:B,G,R'."
+                )
+            else:
+                out.append(m)
+        return out
+
+    def _build_extract_cfg(self) -> ExtractionConfig:
+        return ExtractionConfig(
+            target_fps          = float(self._get("stitch.extract.target_fps")),
+            blur_thresh         = float(self._get("stitch.extract.blur_thresh")),
+            artifact_thresh     = float(self._get("stitch.extract.artifact_thresh")),
+            min_movement        = float(self._get("stitch.extract.min_movement")),
+            max_movement        = float(self._get("stitch.extract.max_movement")),
+            static_pixel_thresh = float(self._get("stitch.extract.static_pixel_thresh")),
+        )
+
+    def _build_reconstruct_cfg(self) -> ReconstructConfig:
+        return ReconstructConfig(
+            canvas_margin             = int(self._get("stitch.reconstruct.canvas_margin")),
+            min_inliers               = int(self._get("stitch.reconstruct.min_inliers")),
+            lookback                  = int(self._get("stitch.reconstruct.lookback")),
+            keyframe_interval         = int(self._get("stitch.reconstruct.keyframe_interval")),
+            blend_mode                = str(self._get("stitch.reconstruct.blend_mode")),
+            pyramid_levels            = int(self._get("stitch.reconstruct.pyramid_levels")),
+            processing_scale          = float(self._get("stitch.reconstruct.processing_scale")),
+            max_keyframes             = int(self._get("stitch.reconstruct.max_keyframes")),
+            max_canvas_px             = int(self._get("stitch.reconstruct.max_canvas_px")),
+            match_ratio               = float(self._get("stitch.reconstruct.match_ratio")),
+            mad_factor                = float(self._get("stitch.reconstruct.mad_factor")),
+            feature_exclude_dilate_px = int(self._get("stitch.reconstruct.feature_exclude_dilate_px")),
+            min_keypoint_bins         = int(self._get("stitch.reconstruct.min_keypoint_bins")),
+            use_grid_intersections    = bool(self._get("stitch.reconstruct.use_grid_intersections")),
+            grid_match_dist           = float(self._get("stitch.reconstruct.grid_match_dist")),
+            grid_min_intersections    = int(self._get("stitch.reconstruct.grid_min_intersections")),
+            grid_hsv_h_lo             = int(self._get("stitch.reconstruct.grid_hsv_h_lo")),
+            grid_hsv_h_hi             = int(self._get("stitch.reconstruct.grid_hsv_h_hi")),
+            grid_hsv_s_lo             = int(self._get("stitch.reconstruct.grid_hsv_s_lo")),
+            grid_hsv_v_lo             = int(self._get("stitch.reconstruct.grid_hsv_v_lo")),
+            color_masks               = self._parse_color_mask_list(
+                "stitch.reconstruct.color_masks"),
+            feature_exclude_hsv       = self._parse_color_mask_list(
+                "stitch.reconstruct.feature_exclude_hsv"),
+        )
+
+    def _build_transfer_cfg(self) -> TransferConfig:
+        return TransferConfig(
+            correct_perspective = self._get("transfer.correct_perspective"),
+            close_iterations    = self._get("transfer.close_iterations"),
+            morph_kernel        = self._get("transfer.morph_kernel"),
+            min_blob_area_frac  = self._get("transfer.min_blob_area_frac"),
+            max_blob_area_frac  = self._get("transfer.max_blob_area_frac"),
+            use_florence2       = self._get("transfer.use_florence2"),
+            florence2_model_id  = self._get("transfer.florence2_model_id"),
+            florence2_device    = self._get("transfer.florence2_device"),
+            drop_unknown        = self._get("transfer.drop_unknown"),
+        )
+
+    def _build_consistency_cfg(self) -> ConsistencyConfig:
+        return ConsistencyConfig(
+            w_bbox_grid_position = self._get("consistency.w_bbox_grid_position"),
+            w_bbox_grid_area     = self._get("consistency.w_bbox_grid_area"),
+            w_perturbation       = self._get("consistency.w_perturbation"),
+            position_tol_cells   = self._get("consistency.position_tol_cells"),
+            perturbation_stability_tol = self._get("consistency.perturb_stab_tol"),
+        )
+
+    def _build_occupancy_cfg(self) -> OccupancyConfig:
+        return OccupancyConfig(
+            resolution_m_per_cell = self._get("occupancy.resolution_m_per_cell"),
+            arena_width_m         = self._get("occupancy.arena_width_m"),
+            arena_height_m        = self._get("occupancy.arena_height_m"),
+            background_occ        = self._get("occupancy.background_occ"),
+            obstacle_core_occ     = self._get("occupancy.obstacle_core_occ"),
+            wall_occ              = self._get("occupancy.wall_occ"),
+            unknown_occ           = self._get("occupancy.unknown_occ"),
+            base_thickness_px     = self._get("occupancy.base_thickness_px"),
+            decay_rate            = self._get("occupancy.decay_rate"),
+            halo_step_px          = self._get("occupancy.halo_step_px"),
+            wall_s_hi             = self._get("occupancy.wall_s_hi"),
+            frame_id              = self._get("occupancy.frame_id"),
+        )
+
+    def _run_pipeline(self, goal_handle: ServerGoalHandle):
+        goal = goal_handle.request
+        video_path = goal.video_path
+        debug_dir  = self._get("debug_dir")
+        os.makedirs(debug_dir, exist_ok=True)
+
+        # ── 1) Validate inputs ─────────────────────────────────────────
+        if not video_path or not os.path.isfile(video_path):
+            return self._abort(goal_handle,
+                               f"video_path does not exist: {video_path!r}")
+        bg_path = self._get("transfer.background_path") or ""
+        if not bg_path or not os.path.isfile(bg_path):
+            return self._abort(goal_handle,
+                               f"transfer.background_path not set or missing: "
+                               f"{bg_path!r}")
+
+        # ── 2) Stitch video → top-down map ─────────────────────────────
+        self._emit_feedback(goal_handle, "stitching", 0.0, "Stitching video")
+        if self._check_cancel(goal_handle):
+            return self._cancelled(goal_handle)
+
+        out_w = int(self._get("stitch.output_width"))
+        out_h = int(self._get("stitch.output_height"))
+        extract_cfg     = self._build_extract_cfg()
+        reconstruct_cfg = self._build_reconstruct_cfg()
+
+        stitched_path = os.path.join(debug_dir, "stitched_map.png") \
+            if self._get("stitch.save_intermediate") else None
+
+        stitched = reconstruct_from_video(
+            video_path,
+            output_shape=(out_w, out_h),
+            extract_cfg=extract_cfg,
+            reconstruct_cfg=reconstruct_cfg,
+            save_path=stitched_path,
+            verbose=False,
+        )
+        if stitched is None:
+            return self._abort(goal_handle, "Stitching returned None.")
+
+        # If saving was disabled but downstream needs a path, write a temp.
+        if stitched_path is None:
+            stitched_path = os.path.join(debug_dir, "stitched_map.png")
+            cv2.imwrite(stitched_path, stitched)
+
+        self._emit_feedback(goal_handle, "stitching", 1.0,
+                            f"Stitched -> {stitched_path}")
+        if self._check_cancel(goal_handle):
+            return self._cancelled(goal_handle)
+
+        # ── 3) Transfer + consistency (3-pass) ─────────────────────────
+        self._emit_feedback(goal_handle, "transferring", 0.0,
+                            "Running transfer + consistency passes")
+        tcfg = self._build_transfer_cfg()
+        ccfg = self._build_consistency_cfg()
+
+        def _cons_progress(stage, frac, msg):
+            # Map sub-progress under the top-level "consistency" stage.
+            self._emit_feedback(goal_handle, "consistency",
+                                float(frac), msg)
+
+        final_bgr, obstacles, stages = compute_consistency(
+            reconstructed_path = stitched_path,
+            background_path    = bg_path,
+            base_cfg           = tcfg,
+            cons_cfg           = ccfg,
+            verbose            = False,
+            progress_cb        = _cons_progress,
+        )
+        if self._check_cancel(goal_handle):
+            return self._cancelled(goal_handle)
+
+        # Persist the bbox-mode debug stages and final.
+        for name, img in stages.items():
+            cv2.imwrite(os.path.join(debug_dir, f"transfer_{name}.png"), img)
+        cv2.imwrite(os.path.join(debug_dir, "transfer_final_bbox.png"),
+                    final_bgr)
+
+        # Per-obstacle confidence table for inspection.
+        with open(os.path.join(debug_dir, "consistency.csv"), "w") as f:
+            f.write("idx,label,bbox_grid_pos,bbox_grid_area,perturbation,overall\n")
+            for o in obstacles:
+                f.write(f"{o.index},{o.label},"
+                        f"{o.bbox_grid_position:.3f},"
+                        f"{o.bbox_grid_area:.3f},"
+                        f"{o.perturbation:.3f},"
+                        f"{o.overall:.3f}\n")
+
+        # ── 4) OccupancyGrid rasterization ─────────────────────────────
+        self._emit_feedback(goal_handle, "occupancy", 0.0,
+                            "Rasterizing occupancy grid")
+        ocfg = self._build_occupancy_cfg()
+        occ_img_frame, arena_bbox_px = rasterize_occupancy(
+            final_bgr, obstacles, ocfg, debug_dir=debug_dir,
+        )
+        if self._check_cancel(goal_handle):
+            return self._cancelled(goal_handle)
+
+        data_flat, width, height, origin_xy_m = occupancy_to_grid_array(
+            occ_img_frame, arena_bbox_px, ocfg,
+        )
+
+        # ── 5) Build the OccupancyGrid msg ─────────────────────────────
+        msg = OccupancyGrid()
+        msg.header.frame_id = ocfg.frame_id
+        msg.header.stamp = self.get_clock().now().to_msg()
+
+        meta = MapMetaData()
+        meta.map_load_time = msg.header.stamp
+        meta.resolution = float(ocfg.resolution_m_per_cell)
+        meta.width  = int(width)
+        meta.height = int(height)
+        meta.origin = Pose(
+            position    = Point(x=float(origin_xy_m[0]),
+                                y=float(origin_xy_m[1]),
+                                z=0.0),
+            orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+        )
+        msg.info = meta
+        # nav2 expects a list of int8 (each [-1, 100]); python signed ints OK.
+        msg.data = data_flat.astype(np.int8).tolist()
+
+        # ── 6) Done ────────────────────────────────────────────────────
+        self._emit_feedback(goal_handle, "done", 1.0,
+                            f"OccupancyGrid ready ({width}x{height} cells)")
+        goal_handle.succeed()
+
+        result = BuildArenaMap.Result()
+        result.map = msg
+        result.success = True
+        result.message = "OK"
+        result.n_obstacles = len(obstacles)
+        result.mean_consistency = float(
+            np.mean([o.overall for o in obstacles]) if obstacles else 0.0
+        )
+        result.debug_dir = debug_dir
+        return result
+
+    # -----------------------------------------------------------------------
+    # Termination helpers
+    # -----------------------------------------------------------------------
+
+    def _abort(self, goal_handle, message: str):
+        self.get_logger().error(message)
+        goal_handle.abort()
+        result = BuildArenaMap.Result()
+        result.success = False
+        result.message = message
+        return result
+
+    def _cancelled(self, goal_handle):
+        self.get_logger().info("Goal cancelled / pre-empted.")
+        goal_handle.canceled()
+        result = BuildArenaMap.Result()
+        result.success = False
+        result.message = "cancelled"
+        return result
+
+
+# ===========================================================================
+# Entry point
+# ===========================================================================
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = BuildArenaMapServer()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

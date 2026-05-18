@@ -114,3 +114,9 @@ cv2.imwrite("result.png", final_img)
 ```
 
 Utilize the ROS2 wrappers implemented as actions for these two tasks.
+
+```bash
+ros2 param set /build_arena_map_server transfer.background_path /home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/src/arena_map_builder/data/background.png
+
+python example_client.py /home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan6/scan.mp4
+```

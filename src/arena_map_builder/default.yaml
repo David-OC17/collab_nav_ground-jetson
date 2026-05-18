@@ -1,0 +1,85 @@
+build_arena_map_server:
+  ros__parameters:
+    debug_dir: /tmp/arena_map_builder
+
+    stitch:
+      output_width: 3000
+      output_height: 3000
+      save_intermediate: true
+
+      extract:
+        target_fps: 5.0
+        blur_thresh: 60.0
+        artifact_thresh: 2.0
+        min_movement: 0.015
+        max_movement: 0.55
+        static_pixel_thresh: 3.0
+
+      reconstruct:
+        canvas_margin: 2000
+        min_inliers: 10
+        lookback: 4
+        keyframe_interval: 15
+        blend_mode: "feather"          # feather | pyramid | flat
+        pyramid_levels: 4
+        processing_scale: 1.0
+        max_keyframes: 20
+        max_canvas_px: 8000
+        match_ratio: 0.95
+        mad_factor: 6.0
+        feature_exclude_dilate_px: 5
+        min_keypoint_bins: 10
+
+        # Blue grid intersection alignment
+        use_grid_intersections: true
+        grid_match_dist: 25.0
+        grid_min_intersections: 4
+        grid_hsv_h_lo: 90
+        grid_hsv_h_hi: 130
+        grid_hsv_s_lo: 50
+        grid_hsv_v_lo: 50
+
+        # ColorRangeMask entries are strings of the form
+        #   "name:h_lo,h_hi,s_lo,s_hi,v_lo,v_hi:B,G,R"
+        color_masks:
+          - "yellow:35,45,50,255,80,255:0,255,0"
+          - "brown:15,30,50,255,125,255:255,0,255"
+          - "orange:10,30,50,255,20,125:0,255,0"
+
+        # HSV ranges excluded from feature detection (alignment only).
+        # Same format as color_masks; the replace_bgr field is ignored.
+        feature_exclude_hsv: []
+
+    transfer:
+      # REQUIRED: path to the clean arena template PNG
+      background_path: ""
+      correct_perspective: true
+      close_iterations: 3
+      morph_kernel: 5
+      min_blob_area_frac: 0.001
+      max_blob_area_frac: 0.25
+      use_florence2: false
+      florence2_model_id: "microsoft/Florence-2-base"
+      florence2_device: "auto"
+      drop_unknown: true
+
+    consistency:
+      w_bbox_grid_position: 0.45
+      w_bbox_grid_area: 0.25
+      w_perturbation: 0.30
+      position_tol_cells: 0.5
+      perturb_stab_tol: 0.25
+
+    occupancy:
+      resolution_m_per_cell: 0.05
+      arena_width_m: 4.0
+      arena_height_m: 4.0
+      background_occ: 10
+      obstacle_core_occ: 90
+      wall_occ: 100
+      unknown_occ: -1
+      base_thickness_px: 8
+      decay_rate: 3.0
+      halo_step_px: 2
+      wall_s_hi: 180
+      frame_id: "map"

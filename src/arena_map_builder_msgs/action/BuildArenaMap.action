@@ -1,0 +1,32 @@
+# BuildArenaMap.action
+#
+# Goal:     path to an aerial video of the arena.
+# Result:   the resulting nav2-style OccupancyGrid plus a small status report.
+# Feedback: per-stage progress for the long-running pipeline.
+
+# ── Goal ───────────────────────────────────────────────────────────────
+# Absolute path to the input video (must be readable by the action server).
+string video_path
+
+---
+
+# ── Result ─────────────────────────────────────────────────────────────
+nav_msgs/OccupancyGrid map      # final probabilistic occupancy grid
+bool                  success
+string                message    # short human-readable status
+uint32                n_obstacles
+float32               mean_consistency   # mean per-obstacle confidence in [0,1]
+string                debug_dir          # where intermediate images were written
+
+---
+
+# ── Feedback ───────────────────────────────────────────────────────────
+# stage is one of:
+#   "stitching"      -> drone_map_grid_gen running
+#   "transferring"   -> bbox-mode transfer running
+#   "consistency"    -> running the extra consistency passes
+#   "occupancy"      -> rasterizing the OccupancyGrid
+#   "done"           -> emitted right before result
+string  stage
+float32 progress          # 0..1 within the current stage (best-effort)
+string  message           # optional human-readable detail

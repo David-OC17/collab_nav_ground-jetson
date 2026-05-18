@@ -83,10 +83,10 @@ from typing import Optional, Tuple, List, Dict
 import cv2
 import numpy as np
 
+
 # ===============================================================================
 # Configuration
 # ===============================================================================
-
 
 @dataclass
 class ExpectedShape:
@@ -94,7 +94,6 @@ class ExpectedShape:
     ('box' / 'cone' have built-in heuristics; other names fall through to
     Florence-2 only). `descriptions` are free-text prompts used by
     Florence-2 verification."""
-
     name: str
     descriptions: List[str]
     draw_color_bgr: Tuple[int, int, int] = (255, 0, 255)  # default magenta
@@ -107,23 +106,19 @@ def _default_shapes() -> List[ExpectedShape]:
             descriptions=[
                 "a cardboard box",
                 "a rectangular box seen from above",
-                "a square crate",
+                "a square box",
             ],
-            draw_color_bgr=(80, 190, 240),  # yellow
+            draw_color_bgr=(200, 120, 40),   # blue-ish (BGR)
         ),
         ExpectedShape(
             name="cone",
             descriptions=[
                 "a traffic cone",
                 "an orange safety cone",
+                "a cone seen from above",
             ],
-            draw_color_bgr=(0, 140, 255),  # orange
+            draw_color_bgr=(0, 140, 255),    # orange (BGR)
         ),
-        # ExpectedShape(
-        #     name="barrel",
-        #     descriptions=["a cylindrical barrel", "an oil drum"],
-        #     draw_color_bgr=(50, 200, 50),  # green (BGR)
-        # ),
     ]
 
 
@@ -205,7 +200,7 @@ class TransferConfig:
     expected_shapes: List[ExpectedShape] = field(default_factory=_default_shapes)
 
     # ── Stage 6: projection onto background ────────────────────────────────
-    project_mode: str = "bbox"  # "bbox" or "grid"
+    project_mode: str = "bbox"   # "bbox" or "grid"
     background_wall_h_lo: int = 5
     background_wall_h_hi: int = 25
     background_wall_s_lo: int = 50
@@ -228,7 +223,6 @@ class TransferConfig:
 # Small helpers
 # ===============================================================================
 
-
 def _hsv(img_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
@@ -242,36 +236,27 @@ def _hsv_mask(hsv, h_lo, h_hi, s_lo, s_hi, v_lo, v_hi) -> np.ndarray:
 def _blue_mask(img_bgr: np.ndarray, cfg: TransferConfig) -> np.ndarray:
     return _hsv_mask(
         _hsv(img_bgr),
-        cfg.blue_h_lo,
-        cfg.blue_h_hi,
-        cfg.blue_s_lo,
-        cfg.blue_s_hi,
-        cfg.blue_v_lo,
-        cfg.blue_v_hi,
+        cfg.blue_h_lo, cfg.blue_h_hi,
+        cfg.blue_s_lo, cfg.blue_s_hi,
+        cfg.blue_v_lo, cfg.blue_v_hi,
     )
 
 
 def _pink_mask(img_bgr: np.ndarray, cfg: TransferConfig) -> np.ndarray:
     return _hsv_mask(
         _hsv(img_bgr),
-        cfg.pink_h_lo,
-        cfg.pink_h_hi,
-        cfg.pink_s_lo,
-        cfg.pink_s_hi,
-        cfg.pink_v_lo,
-        cfg.pink_v_hi,
+        cfg.pink_h_lo, cfg.pink_h_hi,
+        cfg.pink_s_lo, cfg.pink_s_hi,
+        cfg.pink_v_lo, cfg.pink_v_hi,
     )
 
 
 def _green_mask(img_bgr: np.ndarray, cfg: TransferConfig) -> np.ndarray:
     return _hsv_mask(
         _hsv(img_bgr),
-        cfg.green_h_lo,
-        cfg.green_h_hi,
-        cfg.green_s_lo,
-        cfg.green_s_hi,
-        cfg.green_v_lo,
-        cfg.green_v_hi,
+        cfg.green_h_lo, cfg.green_h_hi,
+        cfg.green_s_lo, cfg.green_s_hi,
+        cfg.green_v_lo, cfg.green_v_hi,
     )
 
 
@@ -284,15 +269,13 @@ def _log(msg: str, verbose: bool):
 # Stage 1 — Blue-grid de-warp  (ported from map_to_occupancy.py)
 # ===============================================================================
 
-
 def _detect_blue_lines(img: np.ndarray, cfg: TransferConfig) -> np.ndarray:
     mask = _blue_mask(img, cfg)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    k    = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
     lines = cv2.HoughLinesP(
         mask,
-        rho=1,
-        theta=np.pi / 180,
+        rho=1, theta=np.pi / 180,
         threshold=cfg.hough_threshold,
         minLineLength=cfg.hough_min_length,
         maxLineGap=cfg.hough_max_gap,
@@ -310,9 +293,7 @@ def _split_hv(lines: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return lines[h_mask], lines[~h_mask]
 
 
-def _weighted_direction(
-    lines: np.ndarray, force_positive: str = "x"
-) -> Optional[np.ndarray]:
+def _weighted_direction(lines: np.ndarray, force_positive: str = "x") -> Optional[np.ndarray]:
     if len(lines) == 0:
         return None
 
@@ -325,10 +306,10 @@ def _weighted_direction(
     ux[flip] = -ux[flip]
     uy[flip] = -uy[flip]
 
-    angles = np.arctan2(uy, ux)
-    weights = lengths / lengths.sum()
-    s_idx = np.argsort(angles)
-    cum_w = np.cumsum(weights[s_idx])
+    angles   = np.arctan2(uy, ux)
+    weights  = lengths / lengths.sum()
+    s_idx    = np.argsort(angles)
+    cum_w    = np.cumsum(weights[s_idx])
     med_angle = angles[s_idx[np.searchsorted(cum_w, 0.5)]]
     return np.array([math.cos(med_angle), math.sin(med_angle)])
 
@@ -337,17 +318,12 @@ def dewarp(img: np.ndarray, cfg: TransferConfig, verbose: bool = True) -> np.nda
     lines = _detect_blue_lines(img, cfg)
 
     if len(lines) < cfg.min_lines_per_axis * 2:
-        _log(
-            f"  [warn] Only {len(lines)} blue lines found — skipping de-warp.", verbose
-        )
+        _log(f"  [warn] Only {len(lines)} blue lines found — skipping de-warp.", verbose)
         return img
 
     h_lines, v_lines = _split_hv(lines)
-    _log(
-        f"  Blue lines: {len(lines)} total "
-        f"({len(h_lines)} horizontal, {len(v_lines)} vertical)",
-        verbose,
-    )
+    _log(f"  Blue lines: {len(lines)} total "
+         f"({len(h_lines)} horizontal, {len(v_lines)} vertical)", verbose)
 
     d_h = _weighted_direction(h_lines, force_positive="x")
     d_v = _weighted_direction(v_lines, force_positive="y")
@@ -363,10 +339,10 @@ def dewarp(img: np.ndarray, cfg: TransferConfig, verbose: bool = True) -> np.nda
         if d_v[1] < 0:
             d_v = -d_v
 
-    A = np.column_stack([d_h, d_v]).astype(np.float64)
+    A   = np.column_stack([d_h, d_v]).astype(np.float64)
     if float(np.linalg.det(A)) < 0:
         d_v = -d_v
-        A = np.column_stack([d_h, d_v]).astype(np.float64)
+        A   = np.column_stack([d_h, d_v]).astype(np.float64)
 
     cond = np.linalg.cond(A)
     if cond > 20:
@@ -380,8 +356,8 @@ def dewarp(img: np.ndarray, cfg: TransferConfig, verbose: bool = True) -> np.nda
 
     ih, iw = img.shape[:2]
     cx, cy = iw / 2.0, ih / 2.0
-    t = np.array([cx, cy]) - A_inv @ np.array([cx, cy])
-    M = np.hstack([A_inv, t.reshape(2, 1)])
+    t      = np.array([cx, cy]) - A_inv @ np.array([cx, cy])
+    M      = np.hstack([A_inv, t.reshape(2, 1)])
 
     corners_src = np.array([[0, 0], [iw, 0], [iw, ih], [0, ih]], dtype=np.float64)
     corners_dst = (A_inv @ corners_src.T).T + t
@@ -394,9 +370,7 @@ def dewarp(img: np.ndarray, cfg: TransferConfig, verbose: bool = True) -> np.nda
     M[1, 2] -= y_min
 
     corrected = cv2.warpAffine(
-        img,
-        M,
-        (new_w, new_h),
+        img, M, (new_w, new_h),
         flags=cv2.INTER_LANCZOS4,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0),
@@ -409,13 +383,10 @@ def dewarp(img: np.ndarray, cfg: TransferConfig, verbose: bool = True) -> np.nda
 # Stage 2 — Crop to blue boundary + zero-out outside green wall hull
 # ===============================================================================
 
-
-def _find_blue_boundary(
-    img: np.ndarray, cfg: TransferConfig
-) -> Tuple[int, int, int, int]:
+def _find_blue_boundary(img: np.ndarray, cfg: TransferConfig) -> Tuple[int, int, int, int]:
     mask = _blue_mask(img, cfg)
     h, w = mask.shape
-    thr = cfg.blue_edge_min_pixels
+    thr  = cfg.blue_edge_min_pixels
 
     row_counts = (mask > 0).sum(axis=1)
     col_counts = (mask > 0).sum(axis=0)
@@ -440,26 +411,20 @@ def _find_blue_boundary(
     return top, bottom, left, right
 
 
-def crop_to_blue(
-    img: np.ndarray, cfg: TransferConfig, verbose: bool = True
-) -> np.ndarray:
+def crop_to_blue(img: np.ndarray, cfg: TransferConfig, verbose: bool = True) -> np.ndarray:
     h_img, w_img = img.shape[:2]
     top, bottom, left, right = _find_blue_boundary(img, cfg)
-    _log(
-        f"  Blue boundary: top={top} bottom={bottom} left={left} right={right} "
-        f"(image {w_img}x{h_img})",
-        verbose,
-    )
+    _log(f"  Blue boundary: top={top} bottom={bottom} left={left} right={right} "
+         f"(image {w_img}x{h_img})", verbose)
 
     if (bottom - top) < h_img * 0.10 or (right - left) < w_img * 0.10:
         _log("  [warn] Boundary too small — keeping full image.", verbose)
         return img
-    return img[top : bottom + 1, left : right + 1].copy()
+    return img[top:bottom + 1, left:right + 1].copy()
 
 
-def mask_outside_wall(
-    img: np.ndarray, cfg: TransferConfig, verbose: bool = True
-) -> Tuple[np.ndarray, np.ndarray]:
+def mask_outside_wall(img: np.ndarray, cfg: TransferConfig,
+                      verbose: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build a green-wall convex hull, dilate it slightly, and zero out
     everything outside it. Returns (cleaned_image, hull_mask).
@@ -493,10 +458,7 @@ def mask_outside_wall(
 
     out = img.copy()
     out[hull_mask == 0] = (0, 0, 0)
-    _log(
-        f"  Outside-wall mask applied (hull area = {int(hull_mask.sum() / 255)} px)",
-        verbose,
-    )
+    _log(f"  Outside-wall mask applied (hull area = {int(hull_mask.sum() / 255)} px)", verbose)
     return out, hull_mask
 
 
@@ -504,31 +466,22 @@ def mask_outside_wall(
 # Stage 3 — Clean pink & green masks
 # ===============================================================================
 
-
-def build_clean_masks(
-    img: np.ndarray, cfg: TransferConfig, verbose: bool = True
-) -> Tuple[np.ndarray, np.ndarray]:
-    pink = _pink_mask(img, cfg)
+def build_clean_masks(img: np.ndarray, cfg: TransferConfig,
+                      verbose: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+    pink  = _pink_mask(img,  cfg)
     green = _green_mask(img, cfg)
 
     if cfg.close_iterations > 0 and cfg.morph_kernel > 0:
         k = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (cfg.morph_kernel, cfg.morph_kernel)
         )
-        pink = cv2.morphologyEx(
-            pink, cv2.MORPH_CLOSE, k, iterations=cfg.close_iterations
-        )
-        green = cv2.morphologyEx(
-            green, cv2.MORPH_CLOSE, k, iterations=cfg.close_iterations
-        )
+        pink  = cv2.morphologyEx(pink,  cv2.MORPH_CLOSE, k, iterations=cfg.close_iterations)
+        green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, k, iterations=cfg.close_iterations)
         # also a light open on pink to drop tiny specks
-        pink = cv2.morphologyEx(pink, cv2.MORPH_OPEN, k, iterations=1)
+        pink  = cv2.morphologyEx(pink,  cv2.MORPH_OPEN,  k, iterations=1)
 
-    _log(
-        f"  Mask pixels: pink={int(pink.sum()/255)}  green={int(green.sum()/255)}  "
-        f"(close iters = {cfg.close_iterations})",
-        verbose,
-    )
+    _log(f"  Mask pixels: pink={int(pink.sum()/255)}  green={int(green.sum()/255)}  "
+         f"(close iters = {cfg.close_iterations})", verbose)
     return pink, green
 
 
@@ -536,30 +489,32 @@ def build_clean_masks(
 # Stage 4 — Blob extraction + heuristic shape classification
 # ===============================================================================
 
-
 @dataclass
 class Blob:
-    contour: np.ndarray  # Nx1x2 int32
+    contour: np.ndarray          # Nx1x2 int32
     area: float
-    bbox: Tuple[int, int, int, int]  # x, y, w, h
+    bbox: Tuple[int, int, int, int]   # x, y, w, h
     centroid: Tuple[float, float]
     solidity: float
     aspect: float
     rectangularity: float
     circularity: float
     n_vertices: int
-    heuristic_label: str  # "box" / "cone" / "unknown"
+    heuristic_label: str         # "box" / "cone" / "unknown"
     heuristic_confidence: float  # 0..1
     final_label: Optional[str] = None  # set after classify / Florence-2
+
+    # Consistency score in [0, 1] (1.0 == high confidence).
+    # Populated by compute_consistency(); None means "not computed".
+    consistency: Optional[float] = None
+    consistency_components: Optional[Dict[str, float]] = None
 
     @property
     def area_frac(self) -> float:
         return self.area  # convenience placeholder; populated externally
 
 
-def _classify_blob(
-    contour: np.ndarray, cfg: TransferConfig
-) -> Tuple[str, float, Dict[str, float]]:
+def _classify_blob(contour: np.ndarray, cfg: TransferConfig) -> Tuple[str, float, Dict[str, float]]:
     """
     Returns (label, confidence, metrics_dict).
     Heuristic only — lenient: prefers to label something rather than 'unknown'
@@ -572,16 +527,16 @@ def _classify_blob(
     peri = cv2.arcLength(contour, closed=True) + 1e-9
     hull = cv2.convexHull(contour)
     hull_area = float(cv2.contourArea(hull)) + 1e-9
-    solidity = area / hull_area
+    solidity  = area / hull_area
 
-    rect = cv2.minAreaRect(contour)  # ((cx,cy),(w,h),angle)
-    w, h = rect[1]
-    rect_a = max(w * h, 1e-9)
+    rect    = cv2.minAreaRect(contour)   # ((cx,cy),(w,h),angle)
+    (w, h)  = rect[1]
+    rect_a  = max(w * h, 1e-9)
     rectangularity = area / rect_a
     if w == 0 or h == 0:
         aspect = 0.0
     else:
-        aspect = min(w, h) / max(w, h)  # 1.0 == square, <1 == elongated
+        aspect = min(w, h) / max(w, h)   # 1.0 == square, <1 == elongated
 
     circularity = 4.0 * math.pi * area / (peri * peri)
 
@@ -589,18 +544,15 @@ def _classify_blob(
     n_vert = len(approx)
 
     metrics = dict(
-        area=area,
-        solidity=solidity,
-        aspect=aspect,
-        rectangularity=rectangularity,
-        circularity=circularity,
+        area=area, solidity=solidity, aspect=aspect,
+        rectangularity=rectangularity, circularity=circularity,
         n_vertices=float(n_vert),
     )
 
     # Box test: high rectangularity, decent solidity, moderate aspect.
     is_box = (
         rectangularity >= cfg.box_rectangularity_min
-        and solidity >= cfg.min_solidity_box
+        and solidity   >= cfg.min_solidity_box
         and cfg.box_aspect_min <= aspect <= cfg.box_aspect_max
     )
 
@@ -614,8 +566,8 @@ def _classify_blob(
     is_cone_triangle = (
         cfg.cone_triangle_vertices[0] <= n_vert <= cfg.cone_triangle_vertices[1]
         and solidity >= cfg.min_solidity_box - 0.10
-        and aspect <= 0.95  # rules out near-square boxes that triangulate to 4 verts
-        and rectangularity < cfg.box_rectangularity_min  # avoid box overlap
+        and aspect   <= 0.95     # rules out near-square boxes that triangulate to 4 verts
+        and rectangularity < cfg.box_rectangularity_min   # avoid box overlap
     )
 
     if is_box and not (is_cone_circle and circularity > 0.85):
@@ -637,9 +589,8 @@ def _classify_blob(
     return "unknown", 0.0, metrics
 
 
-def extract_blobs(
-    pink_mask: np.ndarray, cfg: TransferConfig, verbose: bool = True
-) -> List[Blob]:
+def extract_blobs(pink_mask: np.ndarray, cfg: TransferConfig,
+                  verbose: bool = True) -> List[Blob]:
     img_area = float(pink_mask.shape[0] * pink_mask.shape[1])
     min_area = cfg.min_blob_area_frac * img_area
     max_area = cfg.max_blob_area_frac * img_area
@@ -658,36 +609,25 @@ def extract_blobs(
 
         label, conf, metrics = _classify_blob(c, cfg)
 
-        blobs.append(
-            Blob(
-                contour=c,
-                area=a,
-                bbox=(x, y, w, h),
-                centroid=(cx, cy),
-                solidity=metrics.get("solidity", 0.0),
-                aspect=metrics.get("aspect", 0.0),
-                rectangularity=metrics.get("rectangularity", 0.0),
-                circularity=metrics.get("circularity", 0.0),
-                n_vertices=int(metrics.get("n_vertices", 0)),
-                heuristic_label=label,
-                heuristic_confidence=conf,
-                final_label=label if label != "unknown" else None,
-            )
-        )
+        blobs.append(Blob(
+            contour=c, area=a, bbox=(x, y, w, h), centroid=(cx, cy),
+            solidity=metrics.get("solidity", 0.0),
+            aspect=metrics.get("aspect", 0.0),
+            rectangularity=metrics.get("rectangularity", 0.0),
+            circularity=metrics.get("circularity", 0.0),
+            n_vertices=int(metrics.get("n_vertices", 0)),
+            heuristic_label=label,
+            heuristic_confidence=conf,
+            final_label=label if label != "unknown" else None,
+        ))
 
-    _log(
-        f"  Found {len(blobs)} candidate blobs after area filter "
-        f"[{min_area:.0f}..{max_area:.0f} px]",
-        verbose,
-    )
+    _log(f"  Found {len(blobs)} candidate blobs after area filter "
+         f"[{min_area:.0f}..{max_area:.0f} px]", verbose)
     for i, b in enumerate(blobs):
-        _log(
-            f"    [{i:02d}] area={b.area:7.0f}  solid={b.solidity:.2f}  "
-            f"asp={b.aspect:.2f}  rect={b.rectangularity:.2f}  "
-            f"circ={b.circularity:.2f}  verts={b.n_vertices}  "
-            f"-> {b.heuristic_label} ({b.heuristic_confidence:.2f})",
-            verbose,
-        )
+        _log(f"    [{i:02d}] area={b.area:7.0f}  solid={b.solidity:.2f}  "
+             f"asp={b.aspect:.2f}  rect={b.rectangularity:.2f}  "
+             f"circ={b.circularity:.2f}  verts={b.n_vertices}  "
+             f"-> {b.heuristic_label} ({b.heuristic_confidence:.2f})", verbose)
     return blobs
 
 
@@ -695,14 +635,13 @@ def extract_blobs(
 # Stage 5 — Florence-2 verification (soft import, opt-in)
 # ===============================================================================
 
-
 class Florence2Verifier:
     """Lazy wrapper. Import + load the model only if instantiated."""
 
     def __init__(self, cfg: TransferConfig, verbose: bool = True):
         try:
             from transformers import AutoProcessor, AutoModelForCausalLM  # noqa: F401
-            import torch  # noqa: F401
+            import torch                                                  # noqa: F401
         except ImportError as e:
             raise ImportError(
                 "Florence-2 verification requested but `transformers`/`torch` "
@@ -719,33 +658,24 @@ class Florence2Verifier:
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
         _log(f"  Loading Florence-2 ({cfg.florence2_model_id}) on {device}...", verbose)
-        self.device = device
-        self.processor = AutoProcessor.from_pretrained(
-            cfg.florence2_model_id, trust_remote_code=True
-        )
-        self.model = (
-            AutoModelForCausalLM.from_pretrained(
-                cfg.florence2_model_id, trust_remote_code=True
-            )
-            .to(device)
-            .eval()
-        )
+        self.device    = device
+        self.processor = AutoProcessor.from_pretrained(cfg.florence2_model_id,
+                                                       trust_remote_code=True)
+        self.model     = AutoModelForCausalLM.from_pretrained(cfg.florence2_model_id,
+                                                              trust_remote_code=True
+                                                              ).to(device).eval()
         self.cfg = cfg
 
     def _caption(self, pil_img) -> str:
         import torch
-
         task = "<MORE_DETAILED_CAPTION>"
-        inputs = self.processor(text=task, images=pil_img, return_tensors="pt").to(
-            self.device
-        )
+        inputs = self.processor(text=task, images=pil_img,
+                                return_tensors="pt").to(self.device)
         with torch.no_grad():
             ids = self.model.generate(
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
-                max_new_tokens=128,
-                num_beams=3,
-                do_sample=False,
+                max_new_tokens=128, num_beams=3, do_sample=False,
             )
         text = self.processor.batch_decode(ids, skip_special_tokens=True)[0]
         return text.lower()
@@ -753,7 +683,6 @@ class Florence2Verifier:
     def verify(self, blob_crop_bgr: np.ndarray) -> Optional[str]:
         """Return the matched expected-shape name or None."""
         from PIL import Image
-
         pil = Image.fromarray(cv2.cvtColor(blob_crop_bgr, cv2.COLOR_BGR2RGB))
         caption = self._caption(pil)
 
@@ -779,9 +708,8 @@ class Florence2Verifier:
         return False
 
 
-def verify_with_florence2(
-    img_bgr: np.ndarray, blobs: List[Blob], cfg: TransferConfig, verbose: bool = True
-) -> List[Blob]:
+def verify_with_florence2(img_bgr: np.ndarray, blobs: List[Blob],
+                          cfg: TransferConfig, verbose: bool = True) -> List[Blob]:
     if not cfg.use_florence2:
         return blobs
     if not blobs:
@@ -793,26 +721,18 @@ def verify_with_florence2(
     kept: List[Blob] = []
     for i, b in enumerate(blobs):
         x, y, w, h = b.bbox
-        x0 = max(0, x - pad)
-        y0 = max(0, y - pad)
-        x1 = min(W, x + w + pad)
-        y1 = min(H, y + h + pad)
+        x0 = max(0, x - pad);  y0 = max(0, y - pad)
+        x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
         crop = img_bgr[y0:y1, x0:x1]
         label = verifier.verify(crop)
         if label is None:
-            _log(
-                f"    [{i:02d}] Florence-2 rejected (heuristic said "
-                f"{b.heuristic_label})",
-                verbose,
-            )
+            _log(f"    [{i:02d}] Florence-2 rejected (heuristic said "
+                 f"{b.heuristic_label})", verbose)
             b.final_label = None
             continue
         b.final_label = label
-        _log(
-            f"    [{i:02d}] Florence-2: {label} "
-            f"(heuristic said {b.heuristic_label})",
-            verbose,
-        )
+        _log(f"    [{i:02d}] Florence-2: {label} "
+             f"(heuristic said {b.heuristic_label})", verbose)
         kept.append(b)
     return kept
 
@@ -821,27 +741,24 @@ def verify_with_florence2(
 # Stage 6 — Project onto background
 # ===============================================================================
 
-
-def _detect_background_wall_bbox(
-    bg: np.ndarray, cfg: TransferConfig, verbose: bool = True
-) -> Tuple[int, int, int, int]:
+def _detect_background_wall_bbox(bg: np.ndarray,
+                                 cfg: TransferConfig,
+                                 verbose: bool = True
+                                 ) -> Tuple[int, int, int, int]:
     """Return the inner bounding box (x, y, w, h) of the brown wall on
     background.png — i.e. the playable arena rectangle."""
     hsv = _hsv(bg)
-    lo = np.array(
-        [cfg.background_wall_h_lo, cfg.background_wall_s_lo, cfg.background_wall_v_lo],
-        dtype=np.uint8,
-    )
-    hi = np.array(
-        [cfg.background_wall_h_hi, 255, cfg.background_wall_v_hi], dtype=np.uint8
-    )
+    lo = np.array([cfg.background_wall_h_lo,
+                   cfg.background_wall_s_lo,
+                   cfg.background_wall_v_lo], dtype=np.uint8)
+    hi = np.array([cfg.background_wall_h_hi,
+                   255,
+                   cfg.background_wall_v_hi], dtype=np.uint8)
     wall = cv2.inRange(hsv, lo, hi)
     pts = cv2.findNonZero(wall)
     if pts is None:
-        _log(
-            "  [warn] No brown wall found in background — using full image bbox.",
-            verbose,
-        )
+        _log("  [warn] No brown wall found in background — using full image bbox.",
+             verbose)
         H, W = bg.shape[:2]
         return 0, 0, W, H
     x, y, w, h = cv2.boundingRect(pts)
@@ -849,9 +766,8 @@ def _detect_background_wall_bbox(
     return x, y, w, h
 
 
-def _detect_grid_lines_xy(
-    img: np.ndarray, cfg: TransferConfig
-) -> Tuple[List[int], List[int]]:
+def _detect_grid_lines_xy(img: np.ndarray, cfg: TransferConfig
+                          ) -> Tuple[List[int], List[int]]:
     """Return sorted unique x-coordinates of vertical blue lines and
     sorted y-coordinates of horizontal blue lines on the given image."""
     mask = _blue_mask(img, cfg)
@@ -932,19 +848,11 @@ def project_onto_background(
     map_grid_fn = None
     if cfg.project_mode == "grid":
         src_xs, src_ys = _detect_grid_lines_xy(cleaned, cfg)
-        bg_xs, bg_ys = _detect_grid_lines_xy(bg, cfg)
-        _log(
-            f"  Grid lines: source ({len(src_xs)}x{len(src_ys)})  "
-            f"background ({len(bg_xs)}x{len(bg_ys)})",
-            verbose,
-        )
+        bg_xs,  bg_ys  = _detect_grid_lines_xy(bg, cfg)
+        _log(f"  Grid lines: source ({len(src_xs)}x{len(src_ys)})  "
+             f"background ({len(bg_xs)}x{len(bg_ys)})", verbose)
 
-        if (
-            len(src_xs) >= 2
-            and len(bg_xs) >= 2
-            and len(src_ys) >= 2
-            and len(bg_ys) >= 2
-        ):
+        if len(src_xs) >= 2 and len(bg_xs) >= 2 and len(src_ys) >= 2 and len(bg_ys) >= 2:
             # If counts differ, align by trimming the longer one symmetrically.
             def _align(a: List[int], b: List[int]) -> Tuple[List[int], List[int]]:
                 if len(a) == len(b):
@@ -952,11 +860,10 @@ def project_onto_background(
                 if len(a) > len(b):
                     drop = len(a) - len(b)
                     left, right = drop // 2, drop - drop // 2
-                    return a[left : len(a) - right], b
+                    return a[left:len(a) - right], b
                 drop = len(b) - len(a)
                 left, right = drop // 2, drop - drop // 2
-                return a, b[left : len(b) - right]
-
+                return a, b[left:len(b) - right]
             xa, xb = _align(src_xs, bg_xs)
             ya, yb = _align(src_ys, bg_ys)
 
@@ -964,14 +871,10 @@ def project_onto_background(
                 qx = _interp_pos(px, xa, xb)
                 qy = _interp_pos(py, ya, yb)
                 return int(round(qx)), int(round(qy))
-
             map_grid_fn = _map_grid
         else:
-            _log(
-                "  [warn] grid mode requested but not enough lines on one side "
-                "— falling back to bbox.",
-                verbose,
-            )
+            _log("  [warn] grid mode requested but not enough lines on one side "
+                 "— falling back to bbox.", verbose)
 
     map_fn = map_grid_fn if map_grid_fn is not None else _map_bbox
 
@@ -991,15 +894,15 @@ def project_onto_background(
 
         # Transform contour points
         pts_src = b.contour.reshape(-1, 2)
-        pts_dst = np.array(
-            [map_fn(float(p[0]), float(p[1])) for p in pts_src], dtype=np.int32
-        ).reshape(-1, 1, 2)
+        pts_dst = np.array([map_fn(float(p[0]), float(p[1])) for p in pts_src],
+                           dtype=np.int32).reshape(-1, 1, 2)
 
         cv2.drawContours(out, [pts_dst], -1, color, thickness=cv2.FILLED)
         if cfg.draw_outline_px > 0:
             # darker outline
             outline = tuple(int(c * 0.6) for c in color)
-            cv2.drawContours(out, [pts_dst], -1, outline, thickness=cfg.draw_outline_px)
+            cv2.drawContours(out, [pts_dst], -1, outline,
+                             thickness=cfg.draw_outline_px)
         drawn += 1
         _log(f"    [{i:02d}] drew {label} blob ({len(pts_src)} pts)", verbose)
 
@@ -1011,14 +914,8 @@ def project_onto_background(
 # Debug image helpers
 # ===============================================================================
 
-
-def _save_debug(
-    path: Optional[str],
-    name: str,
-    img: np.ndarray,
-    debug_dir: Optional[str],
-    verbose: bool = True,
-):
+def _save_debug(path: Optional[str], name: str, img: np.ndarray,
+                debug_dir: Optional[str], verbose: bool = True):
     if not debug_dir:
         return
     os.makedirs(debug_dir, exist_ok=True)
@@ -1047,23 +944,238 @@ def _blob_overlay(img_bgr: np.ndarray, blobs: List[Blob]) -> np.ndarray:
         text = f"#{i} {b.heuristic_label}"
         if b.final_label and b.final_label != b.heuristic_label:
             text += f"->{b.final_label}"
-        cv2.putText(
-            out,
-            text,
-            (cx - 30, cy),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.putText(out, text, (cx - 30, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
     return out
+
+
+# ===============================================================================
+# Consistency scoring (no ground truth)
+# ===============================================================================
+#
+# We approximate per-blob detection confidence by running the pipeline N times
+# with different parameters and projection modes, then matching blobs across
+# runs. The proxies used:
+#
+#   A. bbox-vs-grid centroid agreement
+#        Same blob, two projection modes → small distance in arena cells means
+#        the geometry is internally consistent.
+#
+#   B. forward-project IoU against the source pink mask
+#        Project the drawn blob from the background back into the cleaned-image
+#        coordinate frame, intersect with the original pink mask. High overlap
+#        = no information lost in the round trip.
+#
+#   C. parameter-perturbation stability (close_iters ± 1)
+#        Run the heuristic three times with close_iters in {k-1, k, k+1} (or
+#        clamped to >= 1). For matched blobs across runs, low std in centroid
+#        and area means the detection is robust.
+#
+# Final score is a weighted average of A, B, C, each clipped to [0, 1].
+# A blob present only in some runs (no match) gets a stability penalty.
+
+
+@dataclass
+class ConsistencyConfig:
+    """How to compute the per-blob consistency score."""
+    weight_agreement:   float = 0.40    # A
+    weight_roundtrip:   float = 0.35    # B
+    weight_stability:   float = 0.25    # C
+    centroid_match_max_frac: float = 0.10
+    """Two blobs from different runs are considered the same object if the
+    distance between their centroids is < this fraction of the smaller image
+    dimension."""
+    enable_perturbation: bool = True
+    """If False, skip the perturbation passes (C) and reweight A, B."""
+
+
+def _match_blobs(ref: List[Blob], cand: List[Blob],
+                 img_shape: Tuple[int, int],
+                 max_frac: float) -> Dict[int, Optional[int]]:
+    """Greedy nearest-centroid matching from `ref` to `cand`.
+    Returns {ref_idx: cand_idx | None}."""
+    if not ref or not cand:
+        return {i: None for i in range(len(ref))}
+    h, w = img_shape
+    max_d = max_frac * min(h, w)
+
+    out: Dict[int, Optional[int]] = {}
+    used: set = set()
+    for i, rb in enumerate(ref):
+        best_j, best_d = None, float("inf")
+        for j, cb in enumerate(cand):
+            if j in used:
+                continue
+            dx = rb.centroid[0] - cb.centroid[0]
+            dy = rb.centroid[1] - cb.centroid[1]
+            d  = math.hypot(dx, dy)
+            if d < best_d and d <= max_d:
+                best_d, best_j = d, j
+        if best_j is not None:
+            used.add(best_j)
+        out[i] = best_j
+    return out
+
+
+def _agreement_score(ref: Blob, alt: Optional[Blob],
+                     img_shape: Tuple[int, int]) -> float:
+    """Sub-component A: centroid + area agreement between two runs (e.g.
+    bbox vs grid projection modes). Returns a value in [0, 1]."""
+    if alt is None:
+        return 0.0
+    h, w = img_shape
+    # Centroid distance normalized by image diagonal.
+    diag = math.hypot(h, w) + 1e-9
+    dx = ref.centroid[0] - alt.centroid[0]
+    dy = ref.centroid[1] - alt.centroid[1]
+    d_norm = math.hypot(dx, dy) / diag           # ~0 perfect; ~0.05 = 5% of diag
+    pos_score = math.exp(-d_norm * 40.0)          # 0.5 at ~1.7% diag
+
+    # Area ratio (always <= 1).
+    a_ratio = min(ref.area, alt.area) / max(max(ref.area, alt.area), 1e-9)
+
+    return 0.5 * pos_score + 0.5 * a_ratio
+
+
+def _roundtrip_iou(blob: Blob, source_pink_mask: np.ndarray) -> float:
+    """Sub-component B: IoU between the blob's contour (in cleaned-image
+    coords) and the original pink mask after the closing operation."""
+    if source_pink_mask is None:
+        return 0.0
+    h, w = source_pink_mask.shape[:2]
+    drawn = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(drawn, [blob.contour], -1, 255, thickness=cv2.FILLED)
+    inter = int(cv2.countNonZero(cv2.bitwise_and(drawn, source_pink_mask)))
+    union = int(cv2.countNonZero(cv2.bitwise_or(drawn, source_pink_mask & drawn |
+                                                drawn)))  # safer below
+    # Compute union properly:
+    union_mask = cv2.bitwise_or(drawn, source_pink_mask)
+    # But we want IoU only over the local blob region; restricting union to
+    # the dilated bbox keeps far-away pink from inflating the union.
+    x, y, bw_, bh_ = blob.bbox
+    pad = max(bw_, bh_) // 2
+    x0 = max(0, x - pad); y0 = max(0, y - pad)
+    x1 = min(w, x + bw_ + pad); y1 = min(h, y + bh_ + pad)
+    local_union = union_mask[y0:y1, x0:x1]
+    local_inter = cv2.bitwise_and(drawn, source_pink_mask)[y0:y1, x0:x1]
+    u = int(cv2.countNonZero(local_union)) + 1
+    i = int(cv2.countNonZero(local_inter))
+    return i / u
+
+
+def _stability_score(matched_blobs: List[Optional[Blob]],
+                     img_shape: Tuple[int, int]) -> float:
+    """Sub-component C: low variance in centroid + area across N runs.
+    Missing runs (None) are penalized linearly."""
+    present = [b for b in matched_blobs if b is not None]
+    if not present:
+        return 0.0
+    presence_ratio = len(present) / len(matched_blobs)
+
+    cxs = np.array([b.centroid[0] for b in present])
+    cys = np.array([b.centroid[1] for b in present])
+    areas = np.array([b.area      for b in present])
+
+    h, w = img_shape
+    diag = math.hypot(h, w) + 1e-9
+    # std of centroid as fraction of diagonal
+    cstd = math.hypot(float(cxs.std()), float(cys.std())) / diag
+    centroid_score = math.exp(-cstd * 50.0)
+
+    if areas.mean() <= 0:
+        area_score = 0.0
+    else:
+        cv_area = float(areas.std() / (areas.mean() + 1e-9))
+        area_score = math.exp(-cv_area * 3.0)
+
+    return presence_ratio * (0.5 * centroid_score + 0.5 * area_score)
+
+
+def compute_consistency(
+    primary_blobs:   List[Blob],
+    primary_pink:    np.ndarray,
+    primary_shape:   Tuple[int, int],
+    alt_mode_blobs:  Optional[List[Blob]] = None,
+    perturbed_runs:  Optional[List[List[Blob]]] = None,
+    ccfg:            Optional[ConsistencyConfig] = None,
+) -> None:
+    """Populate `blob.consistency` and `blob.consistency_components` in place.
+
+    Args:
+        primary_blobs:   blobs from the primary run (canonical output).
+        primary_pink:    cleaned pink mask from the primary run (for IoU).
+        primary_shape:   (H, W) of the cleaned image (the coord frame the
+                         primary contours live in).
+        alt_mode_blobs:  blobs from a second run with the *other* projection
+                         mode but same cleaned image (used for A).
+        perturbed_runs:  list of blob-lists from perturbed close_iters runs
+                         (used for C). Each list lives in the same coord frame
+                         as primary_blobs because they share the dewarp+crop.
+        ccfg:            scoring weights/thresholds.
+    """
+    ccfg = ccfg or ConsistencyConfig()
+    H, W = primary_shape
+
+    # Match the primary blobs to the alt-mode run (note: alt-mode has the SAME
+    # contours in the cleaned-image frame; projection only happens later. So
+    # 'agreement' here is really a robustness check, not a mode-difference
+    # check, unless we explicitly run two separate primary pipelines. The ROS
+    # node does that and passes the result here.)
+    agree_match = _match_blobs(primary_blobs, alt_mode_blobs or [],
+                               primary_shape, ccfg.centroid_match_max_frac)
+
+    # Match the primary blobs to each perturbed run.
+    perturbed_matches: List[List[Optional[Blob]]] = []
+    if ccfg.enable_perturbation and perturbed_runs:
+        for run in perturbed_runs:
+            m = _match_blobs(primary_blobs, run, primary_shape,
+                             ccfg.centroid_match_max_frac)
+            perturbed_matches.append([run[j] if j is not None else None
+                                      for j in m.values()])
+
+    # Compute weights, dropping stability if no perturbed runs.
+    wA = ccfg.weight_agreement
+    wB = ccfg.weight_roundtrip
+    wC = ccfg.weight_stability if perturbed_matches else 0.0
+    s = wA + wB + wC
+    if s <= 0:
+        return
+    wA, wB, wC = wA / s, wB / s, wC / s
+
+    for i, b in enumerate(primary_blobs):
+        # A: agreement with alt-mode run (e.g., the second projection mode
+        # applied to the same blobs; here we use it as a generic second-run
+        # cross-check).
+        alt_b = (alt_mode_blobs[agree_match[i]]
+                 if agree_match.get(i) is not None and alt_mode_blobs else None)
+        a_score = _agreement_score(b, alt_b, primary_shape)
+
+        # B: forward-project IoU vs source pink mask.
+        b_score = _roundtrip_iou(b, primary_pink)
+
+        # C: stability across perturbed runs (include self as run 0 so a blob
+        # that's the only detection still scores nonzero presence).
+        if perturbed_matches:
+            stack: List[Optional[Blob]] = [b]
+            for run in perturbed_matches:
+                stack.append(run[i] if i < len(run) else None)
+            c_score = _stability_score(stack, primary_shape)
+        else:
+            c_score = 0.0
+
+        score = wA * a_score + wB * b_score + wC * c_score
+        b.consistency = float(max(0.0, min(1.0, score)))
+        b.consistency_components = {
+            "agreement_A":  a_score,
+            "roundtrip_B":  b_score,
+            "stability_C":  c_score,
+            "wA": wA, "wB": wB, "wC": wC,
+        }
 
 
 # ===============================================================================
 # Public API
 # ===============================================================================
-
 
 def run_pipeline(
     reconstructed_path: str,
@@ -1086,15 +1198,13 @@ def run_pipeline(
     img = cv2.imread(reconstructed_path)
     if img is None:
         raise IOError(f"Cannot read reconstructed image: {reconstructed_path!r}")
-    bg = cv2.imread(background_path)
+    bg  = cv2.imread(background_path)
     if bg is None:
         raise IOError(f"Cannot read background image: {background_path!r}")
     stages["input"] = img.copy()
 
     _log(sep, verbose)
-    _log(
-        f"  Input:      {reconstructed_path}  [{img.shape[1]}x{img.shape[0]}]", verbose
-    )
+    _log(f"  Input:      {reconstructed_path}  [{img.shape[1]}x{img.shape[0]}]", verbose)
     _log(f"  Background: {background_path}  [{bg.shape[1]}x{bg.shape[0]}]", verbose)
     _log(sep, verbose)
 
@@ -1122,14 +1232,12 @@ def run_pipeline(
     # Stage 3 ------------------------------------------------------------
     _log("\n[3/6] Building pink & green masks with closing...", verbose)
     pink, green = build_clean_masks(cleaned, cfg, verbose=verbose)
-    stages["pink_mask"] = pink
+    stages["pink_mask"]  = pink
     stages["green_mask"] = green
-    _save_debug(
-        None, "04_pink_mask", _mask_to_bgr(pink, (255, 0, 255)), debug_dir, verbose
-    )
-    _save_debug(
-        None, "05_green_mask", _mask_to_bgr(green, (0, 255, 0)), debug_dir, verbose
-    )
+    _save_debug(None, "04_pink_mask",  _mask_to_bgr(pink,  (255,   0, 255)),
+                debug_dir, verbose)
+    _save_debug(None, "05_green_mask", _mask_to_bgr(green, (  0, 255,   0)),
+                debug_dir, verbose)
 
     # Stage 4 ------------------------------------------------------------
     _log("\n[4/6] Extracting blobs and classifying heuristically...", verbose)
@@ -1147,10 +1255,8 @@ def run_pipeline(
     _save_debug(None, "06_blob_overlay", overlay, debug_dir, verbose)
 
     # Stage 6 ------------------------------------------------------------
-    _log(
-        f"\n[6/6] Projecting blobs onto background " f"(mode={cfg.project_mode})...",
-        verbose,
-    )
+    _log(f"\n[6/6] Projecting blobs onto background "
+         f"(mode={cfg.project_mode})...", verbose)
     final = project_onto_background(bg, cleaned, blobs, cfg, verbose=verbose)
     stages["final"] = final
     _save_debug(None, "07_final", final, debug_dir, verbose)
@@ -1163,71 +1269,47 @@ def run_pipeline(
 # CLI
 # ===============================================================================
 
-
 def _build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Clean a reconstructed drone map and transfer its "
-        "obstacles onto a flat background template."
+                    "obstacles onto a flat background template."
     )
     ap.add_argument("image", help="Reconstructed drone map (PNG/JPG)")
-    ap.add_argument(
-        "--background",
-        "-b",
-        required=True,
-        help="Background template image to draw onto",
-    )
-    ap.add_argument(
-        "--out", "-o", default="result.png", help="Path for the final composited image"
-    )
-    ap.add_argument("--debug-dir", help="If set, write per-stage debug images here")
+    ap.add_argument("--background", "-b", required=True,
+                    help="Background template image to draw onto")
+    ap.add_argument("--out", "-o", default="result.png",
+                    help="Path for the final composited image")
+    ap.add_argument("--debug-dir",
+                    help="If set, write per-stage debug images here")
 
     # Stage 1
-    ap.add_argument(
-        "--no-dewarp",
-        action="store_true",
-        help="Skip Stage 1 (blue-grid perspective correction)",
-    )
+    ap.add_argument("--no-dewarp", action="store_true",
+                    help="Skip Stage 1 (blue-grid perspective correction)")
 
     # Stage 3
-    ap.add_argument(
-        "--close-iters",
-        type=int,
-        default=3,
-        help="MORPH_CLOSE iterations on pink/green masks (default 3)",
-    )
-    ap.add_argument(
-        "--morph-kernel", type=int, default=5, help="Closing kernel size (default 5)"
-    )
+    ap.add_argument("--close-iters", type=int, default=3,
+                    help="MORPH_CLOSE iterations on pink/green masks (default 3)")
+    ap.add_argument("--morph-kernel", type=int, default=5,
+                    help="Closing kernel size (default 5)")
 
     # Stage 4
     ap.add_argument("--min-area-frac", type=float, default=0.001)
     ap.add_argument("--max-area-frac", type=float, default=0.25)
 
     # Stage 5
-    ap.add_argument(
-        "--use-florence2",
-        action="store_true",
-        help="Verify every blob with Florence-2 (needs transformers)",
-    )
+    ap.add_argument("--use-florence2", action="store_true",
+                    help="Verify every blob with Florence-2 (needs transformers)")
     ap.add_argument("--florence2-model", default="microsoft/Florence-2-base")
-    ap.add_argument(
-        "--florence2-device", default="auto", choices=["auto", "cpu", "cuda"]
-    )
+    ap.add_argument("--florence2-device", default="auto",
+                    choices=["auto", "cpu", "cuda"])
 
     # Stage 6
-    ap.add_argument(
-        "--project-mode",
-        default="bbox",
-        choices=["bbox", "grid"],
-        help="bbox = simple scale-and-shift to background wall bbox; "
-        "grid = piecewise-linear via detected blue grid lines.",
-    )
-    ap.add_argument(
-        "--keep-unknown",
-        action="store_true",
-        help="Draw blobs the heuristic couldn't classify "
-        "(gray) instead of dropping them.",
-    )
+    ap.add_argument("--project-mode", default="bbox", choices=["bbox", "grid"],
+                    help="bbox = simple scale-and-shift to background wall bbox; "
+                         "grid = piecewise-linear via detected blue grid lines.")
+    ap.add_argument("--keep-unknown", action="store_true",
+                    help="Draw blobs the heuristic couldn't classify "
+                         "(gray) instead of dropping them.")
 
     ap.add_argument("--quiet", action="store_true")
     return ap
@@ -1238,24 +1320,21 @@ def main():
     args = ap.parse_args()
 
     cfg = TransferConfig(
-        correct_perspective=not args.no_dewarp,
-        close_iterations=args.close_iters,
-        morph_kernel=args.morph_kernel,
-        min_blob_area_frac=args.min_area_frac,
-        max_blob_area_frac=args.max_area_frac,
-        use_florence2=args.use_florence2,
-        florence2_model_id=args.florence2_model,
-        florence2_device=args.florence2_device,
-        project_mode=args.project_mode,
-        drop_unknown=not args.keep_unknown,
+        correct_perspective = not args.no_dewarp,
+        close_iterations    = args.close_iters,
+        morph_kernel        = args.morph_kernel,
+        min_blob_area_frac  = args.min_area_frac,
+        max_blob_area_frac  = args.max_area_frac,
+        use_florence2       = args.use_florence2,
+        florence2_model_id  = args.florence2_model,
+        florence2_device    = args.florence2_device,
+        project_mode        = args.project_mode,
+        drop_unknown        = not args.keep_unknown,
     )
 
     final, _stages = run_pipeline(
-        args.image,
-        args.background,
-        cfg,
-        debug_dir=args.debug_dir,
-        verbose=not args.quiet,
+        args.image, args.background, cfg,
+        debug_dir=args.debug_dir, verbose=not args.quiet,
     )
     cv2.imwrite(args.out, final)
     if not args.quiet:
