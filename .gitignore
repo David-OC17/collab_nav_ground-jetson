@@ -6,8 +6,8 @@ src/yahboomRDK_X3/*
 
 src/drone_map_create/src/drone_map_create/out
 
-# Created by https://www.toptal.com/developers/gitignore/api/python,ros2,c++,cmake
-# Edit at https://www.toptal.com/developers/gitignore?templates=python,ros2,c++,cmake
+# Created by https://www.toptal.com/developers/gitignore/api/c++,ros2,cmake,python,visualstudiocode
+# Edit at https://www.toptal.com/developers/gitignore?templates=c++,ros2,cmake,python,visualstudiocode
 
 ### C++ ###
 # Prerequisites
@@ -262,5 +262,23 @@ qtcreator-*
 COLCON_IGNORE
 AMENT_IGNORE
 
-# End of https://www.toptal.com/developers/gitignore/api/python,ros2,c++,cmake
+### VisualStudioCode ###
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
 
+# Local History for Visual Studio Code
+.history/
+
+# Built Visual Studio Code Extensions
+*.vsix
+
+### VisualStudioCode Patch ###
+# Ignore all local history of files
+.history
+.ionide
+
+# End of https://www.toptal.com/developers/gitignore/api/c++,ros2,cmake,python,visualstudiocode

@@ -1,0 +1,51 @@
+# Parameters for map_fusion_node. Values mirror the defaults in the spec
+# (Section 10); override here as needed for your arena / sensors.
+map_fusion_node:
+  ros__parameters:
+    # --- topics ---
+    drone_map_topic: /drone/map
+    slam_map_topic: /map
+    aruco_pose_topic: /aruco/amr_pose
+    aruco_tracking_topic: /aruco/amr_tracking
+    reprojected_topic: /fusion/slam_reprojected
+    confidence_topic: /fusion/confidence
+    status_topic: /fusion/status
+
+    # --- frames ---
+    world_frame: world
+    slam_frame: slam_map
+    base_frame: base_link
+
+    # --- optional features ---
+    use_live_tracking: false
+
+    # --- preprocessing (Stages 1 & 2) ---
+    occupied_threshold_drone: 65
+    occupied_threshold_slam: 65
+    edge_kernel_size: 1          # structuring-element radius -> 3x3 kernel
+    output_resolution_m: 0.02
+
+    # --- coarse search (Stage 4) ---
+    coarse_translation_step_m: 0.10
+    coarse_rotation_step_deg: 5.0
+    coarse_translation_radius_m: 1.0
+    coarse_top_k: 5
+    symmetry_score_tolerance: 0.05
+
+    # --- ICP (Stage 5) ---
+    icp_max_correspondence_m: 0.10
+    icp_max_iterations: 50
+    icp_convergence_epsilon: 0.0001
+    icp_residual_scale: 0.05
+
+    # --- validation / gating (Stage 6) ---
+    confidence_rerun_threshold: 0.3
+    min_publish_confidence: 0.15
+    transform_sanity_delta_m: 0.15
+    transform_sanity_delta_deg: 10.0
+
+    # --- timeouts / fault handling (Section 7) ---
+    slam_timeout_sec: 10.0
+    drone_timeout_sec: 300.0
+    confidence_decay_per_miss: 0.1
+    max_consecutive_miss_before_rerun: 3

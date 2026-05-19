@@ -1,0 +1,31 @@
+# Nav2 global-costmap fragment for the layered map-fusion costmap (spec
+# Section 8). Merge this into your full nav2_params.yaml -- it is NOT a
+# complete Nav2 configuration on its own.
+#
+#   drone_static_layer  : the reliable global prior from the drone map.
+#   slam_aligned_layer  : the SLAM map reprojected into `world` by this package;
+#                         absent until the confidence gate is first passed.
+#   inflation_layer     : compensates for residual alignment error.
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      global_frame: world
+      robot_base_frame: base_link
+      use_sim_time: false
+      plugins: ["drone_static_layer", "slam_aligned_layer", "inflation_layer"]
+
+      drone_static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+        topic: /drone/map
+
+      slam_aligned_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+        topic: /fusion/slam_reprojected
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        inflation_radius: 0.15      # meters; absorbs alignment error
+        cost_scaling_factor: 3.0
