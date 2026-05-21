@@ -153,11 +153,16 @@ def run_pipeline(
     video_path:    str,
     csv_path:      str,
     cfg:           PipelineConfig,
-) -> Dict[int, MarkerResult]:
-    """Run the full pipeline. Returns {marker_id: MarkerResult}.
+) -> Tuple[Dict[int, MarkerResult], List[DronePose]]:
+    """Run the full pipeline.
 
-    Markers detected but rejected during aggregation (too few survivors)
-    are omitted from the result.
+    Returns
+    ───────
+    results       : {marker_id: MarkerResult} for each accepted marker.
+                    Markers rejected during aggregation are omitted.
+    drone_poses   : the full OptiTrack trajectory loaded from the CSV
+                    (one DronePose per CSV row), so downstream debug /
+                    visualization code doesn't need to re-read the file.
     """
     # ── 1) Load intrinsics, CSV, and pre-build the static transforms ──
     if not cfg.intrinsics_path:
@@ -266,4 +271,4 @@ def run_pipeline(
             n_observations=agg.n_observations,
         )
 
-    return results
+    return results, drone_poses

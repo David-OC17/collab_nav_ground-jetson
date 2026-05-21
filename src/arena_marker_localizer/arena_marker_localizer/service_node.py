@@ -46,6 +46,9 @@ from arena_marker_localizer.transforms import (
 from arena_marker_localizer.marker_detection import DictionaryConfig
 from arena_marker_localizer.quality import QualityConfig
 from arena_marker_localizer.aggregation import AggregationConfig
+from arena_marker_localizer.debug_image import (
+    DebugImageConfig, render_debug_image,
+)
 
 
 class MarkerLocalizerService(Node):
@@ -108,10 +111,15 @@ class MarkerLocalizerService(Node):
         self.declare_parameter("aggregation.convergence_eps",  1e-5)
         self.declare_parameter("max_obs_per_marker",           200)
 
-        # ── Grid sizing for cell-index field ───────────────────────────
-        self.declare_parameter("grid.resolution_m_per_cell", 0.05)
-        self.declare_parameter("grid.width_cells",            80)
-        self.declare_parameter("grid.height_cells",           80)
+        # ── Arena / grid sizing ────────────────────────────────────────
+        self.declare_parameter("arena.width_m",               3.14)
+        self.declare_parameter("arena.height_m",              3.14)
+        self.declare_parameter("grid.resolution_m_per_cell",  0.05)
+
+        # ── Debug image ────────────────────────────────────────────────
+        self.declare_parameter("debug.output_path",
+                               "/tmp/marker_localizer_debug.png")
+        self.declare_parameter("debug.px_per_cell", 12)
 
         self.declare_parameter("verbose", False)
 
@@ -182,8 +190,12 @@ class MarkerLocalizerService(Node):
             ),
             max_obs_per_marker = int(self._get("max_obs_per_marker")),
             resolution_m_per_cell = float(self._get("grid.resolution_m_per_cell")),
-            grid_width_cells  = int(self._get("grid.width_cells")),
-            grid_height_cells = int(self._get("grid.height_cells")),
+            grid_width_cells  = math.ceil(
+                float(self._get("arena.width_m"))  / float(self._get("grid.resolution_m_per_cell"))
+            ),
+            grid_height_cells = math.ceil(
+                float(self._get("arena.height_m")) / float(self._get("grid.resolution_m_per_cell"))
+            ),
             verbose = bool(self._get("verbose")),
         )
 
@@ -254,7 +266,7 @@ class MarkerLocalizerService(Node):
             self.get_logger().info(
                 f"Localizing markers: video={video!r}, csv={csv!r}"
             )
-            results = run_pipeline(video, csv, cfg)
+            results, drone_poses = run_pipeline(video, csv, cfg)
         except Exception as e:
             self.get_logger().error(f"Pipeline crashed: {e}")
             response.success = False
@@ -265,6 +277,28 @@ class MarkerLocalizerService(Node):
             self._marker_result_to_msg(r)
             for r in sorted(results.values(), key=lambda x: x.marker_id)
         ]
+
+        # ── Debug reference image ────────────────────────────────────
+        # Best-effort: write the debug PNG but don't fail the service
+        # if it can't be written (disk full, permission, etc.).
+        try:
+            flip = np.diag([float(cfg.optitrack_axis.x_dir),
+                            float(cfg.optitrack_axis.y_dir),
+                            1.0, 1.0])
+            T_opti_to_map = cfg.T_map_from_opti.as_matrix() @ flip
+            dbg_cfg = DebugImageConfig(
+                grid_width_cells      = cfg.grid_width_cells,
+                grid_height_cells     = cfg.grid_height_cells,
+                resolution_m_per_cell = cfg.resolution_m_per_cell,
+                px_per_cell           = int(self._get("debug.px_per_cell")),
+                T_opti_to_map         = T_opti_to_map,
+            )
+            out_path = str(self._get("debug.output_path"))
+            render_debug_image(results.values(), drone_poses, dbg_cfg, out_path)
+            self.get_logger().info(f"Debug reference image: {out_path}")
+        except Exception as e:
+            self.get_logger().warn(f"Debug image render failed: {e}")
+
         response.success = True
         response.message = f"Localized {len(msgs)} marker(s)."
         response.markers = msgs

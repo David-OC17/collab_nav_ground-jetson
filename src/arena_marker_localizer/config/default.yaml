@@ -1,6 +1,6 @@
 marker_localizer_service:
   ros__parameters:
-    # ── REQUIRED: path to the OpenCV-format camera intrinsics YAML ──
+    # ── Set automatically by the launch file to config/calibration.yaml ──
     intrinsics_path: ""
 
     intrinsics:
@@ -22,39 +22,45 @@ marker_localizer_service:
     # ── Static transform: drone-body-frame from camera-frame ──
     #    (camera mounting position + rotation from OpenCV camera to body)
     T_drone_from_cam:
-      x: 0.0
+      x: 0.035 # cm
       y: 0.0
       z: 0.0
-      roll: 0.0
+      roll: 3.14159 # flip camera +Z to point along drone -Z
       pitch: 0.0
       yaw: 0.0
 
     # ── Static transform: map-frame from OptiTrack-frame ──
     #    (where the OccupancyGrid origin sits in the OptiTrack frame)
     T_map_from_opti:
-      x: 0.0
-      y: 0.0
+      x: 1.57 # cm
+      y: 1.57 # cm
       z: 0.0
       roll: 0.0
       pitch: 0.0
-      yaw: 0.0
+      yaw: 1.570795
 
     optitrack:
       yaw_axis: "z"     # "z" or "y"
-      x_dir: 1          # +1 or -1
+      x_dir: 1         # +1 or -1
       y_dir: 1
 
     aggregation:
       mad_k: 3.5
-      min_observations: 40
+      min_observations: 50
       max_iterations: 100
       convergence_eps: 1.0e-5
 
     max_obs_per_marker: 200
 
+    arena:
+      width_m: 3.85
+      height_m: 3.85
+
     grid:
       resolution_m_per_cell: 0.05
-      width_cells: 80
-      height_cells: 80
+
+    debug:
+      output_path: "/tmp/marker_localizer_debug.png"
+      px_per_cell: 12
 
     verbose: false

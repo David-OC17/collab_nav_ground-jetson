@@ -71,8 +71,12 @@ Execute a test via:
 
 ```bash
 # Terminal 1
+ros2 run arena_map_builder build_arena_map_server
 
 # Terminal 2
+ros2 param set /build_arena_map_server transfer.background_path /abs/path/background.png
+
+python3 example_client.py /abs/path/video.mp4
 ```
 
 ## Arena marker localizer
@@ -81,7 +85,10 @@ Execute a test via:
 # Terminal 1
 source install/setup.sh
 
-ros2 run arena_marker_localizer marker_localizer_service
+# Pass yaml file explicitly, currently not finding default.yaml on its own
+WS_YAML=$(find /path/to/workspace -name "default.yaml" -path "*arena_marker_localizer*" -not -path "*build*" | head -1)
+echo "Using YAML: $WS_YAML"
+ros2 launch arena_marker_localizer marker_localizer.launch.py params_file:=$WS_YAML
 
 # Terminal 2
 source install/setup.sh
