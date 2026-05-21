@@ -4,7 +4,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
-
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 class OptiTrackPoseNode(Node):
     """
@@ -27,8 +27,15 @@ class OptiTrackPoseNode(Node):
         self._vy = 0.0
         self._wz = 0.0
 
+        # Define QoS compatible con BEST_EFFORT
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
         self.create_subscription(
-            PoseStamped, '/optitrack/rigid_body', self._cb, 10)
+            PoseStamped, '/optitrack/rigid_body', self._cb, qos)
 
         self._pub = self.create_publisher(Odometry, '/amr/pose', 10)
 
