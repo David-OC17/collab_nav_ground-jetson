@@ -6,19 +6,15 @@ y - green: 0 cm
 z - blue: 13 cm
 
 ```bash
-colcon build --symlink-install --packages-select oradar_ros network_bridge yahboomcar_laser rf2o_laser_odometry odom_to_tf fixed_stamp_scan slam_gmapping openslam_gmapping
+colcon build --symlink-install --packages-select amr_optitrack arena_map_builder_msgs  arena_marker_localizer_interfaces local_costmap odom_to_tf trajectory_planner arena_map_builder  arena_marker_localizer fixed_stamp_scan map_fusion oradar_ros
 ```
 
 In Jetson:
 
 ```bash
-ros2 launch network_bridge tcp.launch.py
-
 ros2 launch oradar_lidar ms200_scan.launch.py
 
-ros2 run odom_to_tf odomTF_node
-
-ros2 launch slam_gmapping slam_gmapping.launch.py use_sim_time:=false
+ros2 launch slam_toolbox online_async
 
 rviz2
 ```
@@ -76,7 +72,7 @@ ros2 run arena_map_builder build_arena_map_server
 # Terminal 2
 ros2 param set /build_arena_map_server transfer.background_path /abs/path/background.png
 
-python3 example_client.py /abs/path/video.mp4
+python3 src/arena_map_builder/arena_map_builder/example_client.py /abs/path/video.mp4
 ```
 
 ## Arena marker localizer
@@ -92,9 +88,6 @@ ros2 launch arena_marker_localizer marker_localizer.launch.py params_file:=$WS_Y
 
 # Terminal 2
 source install/setup.sh
-
-ros2 param set /marker_localizer_service intrinsics_path \
- /absolute/path/to/your/calibration.yaml
 
 ros2 service call /localize_markers arena_marker_localizer_interfaces/srv/LocalizeMarkers \
   "{video_path: '/absolute/path/to/your/video.mp4',
