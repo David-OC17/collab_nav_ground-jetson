@@ -149,41 +149,62 @@ class FakeMapPublisher(Node):
 
         # -------------------------------------------------------------------
         # CHOKE POINT — horizontal wall across upper half with a narrow gap
-        # Wall runs from x=-3.5 to x=3.5 at y=1.5, gap at x=[-0.4, 0.4]
         # -------------------------------------------------------------------
         self._rect(grid, -3.8,  1.3,  3.2, 0.2, fill=True)   # left segment
         self._rect(grid,  0.6,  1.3,  3.2, 0.2, fill=True)   # right segment
-        # gap is between x=[-0.6, 0.6] — only ~1.2m wide
 
         # -------------------------------------------------------------------
         # SCATTERED BOXES — different sizes, asymmetrically placed
         # -------------------------------------------------------------------
-        # [A] Small box top-left quadrant
-        self._rect(grid, -3.2,  2.2,  0.4, 0.4, fill=True)
-
-        # [B] Medium box centre-right, below choke
-        self._rect(grid,  1.5,  0.0,  0.8, 0.8, fill=True)
-
-        # [C] Tall thin pillar centre-left
-        self._rect(grid, -1.5, -0.8,  0.25, 1.6, fill=True)
-
-        # [D] Small box bottom-right
-        self._rect(grid,  2.5, -3.2,  0.5, 0.5, fill=True)
+        self._rect(grid, -3.2,  2.2,  0.4, 0.4, fill=True)   # [A] top-left
+        self._rect(grid,  1.5,  0.0,  0.8, 0.8, fill=True)   # [B] centre-right
+        self._rect(grid, -1.5, -0.8,  0.25, 1.6, fill=True)  # [C] tall pillar
+        self._rect(grid,  2.5, -3.2,  0.5, 0.5, fill=True)   # [D] bottom-right
 
         # -------------------------------------------------------------------
-        # L-SHAPED WALL — bottom-left, forces detour around corner
-        # Vertical arm + horizontal arm
+        # L-SHAPED WALL — bottom-left
         # -------------------------------------------------------------------
-        self._rect(grid, -3.5, -3.5,  0.2, 2.5, fill=True)   # vertical arm
-        self._rect(grid, -3.5, -3.5,  2.0, 0.2, fill=True)   # horizontal arm
+        self._rect(grid, -3.5, -3.5,  0.2, 2.5, fill=True)
+        self._rect(grid, -3.5, -3.5,  2.0, 0.2, fill=True)
 
         # -------------------------------------------------------------------
-        # U-SHAPED PARTIAL WALL — bottom-right, creates a pocket
-        # Open side faces left — robot must go around, not through
+        # U-SHAPED POCKET — bottom-right
         # -------------------------------------------------------------------
-        self._rect(grid,  1.5, -3.5,  0.2, 2.0, fill=True)   # left wall of U
-        self._rect(grid,  3.2, -3.5,  0.2, 2.0, fill=True)   # right wall of U
-        self._rect(grid,  1.5, -3.5,  1.9, 0.2, fill=True)   # bottom of U
+        self._rect(grid,  1.5, -3.5,  0.2, 2.0, fill=True)
+        self._rect(grid,  3.2, -3.5,  0.2, 2.0, fill=True)
+        self._rect(grid,  1.5, -3.5,  1.9, 0.2, fill=True)
+
+        # -------------------------------------------------------------------
+        # NEW: DIAGONAL STEPPING STONES — forces slalom across centre
+        # -------------------------------------------------------------------
+        for i, (ox, oy) in enumerate([
+            (-2.5, -1.5),
+            (-1.8, -0.5),
+            (-1.0,  0.5),
+            (-0.2,  1.0),
+        ]):
+            self._rect(grid, ox, oy, 0.35, 0.35, fill=True)
+
+        # -------------------------------------------------------------------
+        # NEW: ZIGZAG BARRIER — right side, creates forced detour
+        # -------------------------------------------------------------------
+        self._rect(grid,  2.2, -1.5,  1.5, 0.2, fill=True)   # top arm →
+        self._rect(grid,  2.2, -1.5,  0.2, 1.0, fill=True)   # drop down
+        self._rect(grid,  1.0, -2.5,  1.4, 0.2, fill=True)   # middle arm ←
+        self._rect(grid,  2.2, -2.5,  0.2, 0.8, fill=True)   # drop down again
+        self._rect(grid,  2.2, -3.3,  1.5, 0.2, fill=True)   # bottom arm →
+
+        # -------------------------------------------------------------------
+        # NEW: PILLAR CLUSTER — top-right quadrant, forces route choice
+        # -------------------------------------------------------------------
+        for ox, oy in [(2.0, 2.5), (2.6, 2.0), (3.0, 2.8), (2.3, 3.2)]:
+            self._rect(grid, ox, oy, 0.3, 0.3, fill=True)
+
+        # -------------------------------------------------------------------
+        # NEW: THIN HORIZONTAL DIVIDER — centre area, partial wall
+        # -------------------------------------------------------------------
+        self._rect(grid, -3.0, -0.1,  2.0, 0.15, fill=True)  # left of centre
+        self._rect(grid,  0.5, -0.1,  1.0, 0.15, fill=True)  # right fragment
 
     # ==========================================================================
     # Primitive: filled or hollow rectangle

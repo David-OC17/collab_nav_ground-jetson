@@ -38,6 +38,7 @@ from std_msgs.msg import Header, ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
+from geometry_msgs.msg import PoseWithCovarianceStamped
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -191,6 +192,9 @@ class AStarPlanner(Node):
     def __init__(self):
         super().__init__('astar_planner')
 
+        # /aruco/amr_pose
+        # /aruco/goal_pose
+
         # ------------------------------------------------------------------
         # Parameters
         # ------------------------------------------------------------------
@@ -205,7 +209,7 @@ class AStarPlanner(Node):
         self.declare_parameter('spline_enabled',    True)
         self.declare_parameter('spline_decimation', 5)    # keep every Nth A* waypoint as knot
         self.declare_parameter('spline_samples',    200)  # output resolution
-        self.declare_parameter('inflation_radius',    0.55)
+        self.declare_parameter('inflation_radius',    0.2)
         self.declare_parameter('robot_radius',        0.20)
         self.declare_parameter('cost_scaling',        3.5)
 
@@ -300,6 +304,12 @@ class AStarPlanner(Node):
             f'(decim={self.spline_decimation}, samples={self.spline_samples})'
         )
 
+        self.initial_pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped,
+            '/initialpose',
+            self._initial_pose_callback,
+            10)
+
     # ==========================================================================
     # Callbacks
     # ==========================================================================
@@ -327,6 +337,19 @@ class AStarPlanner(Node):
         self.map_received = True
 
 
+    def _initial_pose_callback(self, msg: PoseWithCovarianceStamped):
+        self.robot_x = msg.pose.pose.position.x
+        self.robot_y = msg.pose.pose.position.y
+
+        q = msg.pose.pose.orientation
+        self.robot_yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+        self.get_logger().info(
+            f'Initial pose set: x={self.robot_x:.2f} y={self.robot_y:.2f} yaw={self.robot_yaw:.2f}')
+
+
     def _goal_callback(self, msg: PoseStamped):
         self.goal_x = msg.pose.position.x
         self.goal_y = msg.pose.position.y
@@ -334,6 +357,7 @@ class AStarPlanner(Node):
         self.get_logger().info(
             f'New goal: ({self.goal_x:.2f}, {self.goal_y:.2f})')
         self._plan()
+        
 
     # ==========================================================================
     # Stuck detection
@@ -537,15 +561,30 @@ class AStarPlanner(Node):
         msg.header.stamp    = self.get_clock().now().to_msg()
         msg.header.frame_id = self.map_frame
 
+        if len(waypoints) > 0 and len(waypoints[0]) == 4:
+            # Has velocity — normalize and encode into orientation.x/y
+            speeds    = [math.hypot(p[2], p[3]) for p in waypoints]
+            max_speed = max(speeds) if max(speeds) > 0 else 1.0
+            max_robot_speed = 0.5   # ← or make this a parameter
+        else:
+            max_speed = 1.0
+            max_robot_speed = 0.5
+
         for point in waypoints:
-            wx, wy = point[0], point[1]   # safe for (x,y) or (x,y,vx,vy)
+            wx, wy = point[0], point[1]
+            vx_world = (point[2] / max_speed) * max_robot_speed if len(point) == 4 else 0.0
+            vy_world = (point[3] / max_speed) * max_robot_speed if len(point) == 4 else 0.0
+
             pose = PoseStamped()
             pose.header = msg.header
             pose.pose.position.x    = float(wx)
             pose.pose.position.y    = float(wy)
             pose.pose.position.z    = 0.0
+            pose.pose.orientation.x = float(vx_world)
+            pose.pose.orientation.y = float(vy_world)
             pose.pose.orientation.w = 1.0
             msg.poses.append(pose)
+
         publisher.publish(msg)
 
 

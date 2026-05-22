@@ -36,6 +36,8 @@ from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
 
 import tf2_ros
+from nav_msgs.msg import Path, Odometry
+from geometry_msgs.msg import PoseWithCovarianceStamped
 
 
 class PathFollowerNode(Node):
@@ -92,6 +94,12 @@ class PathFollowerNode(Node):
         self.path_sub = self.create_subscription(
             Path, self.path_topic, self._path_callback, reliable_qos)
 
+        self.initial_pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped,
+            '/initialpose',
+            self._initial_pose_callback,
+            10)
+
         # ------------------------------------------------------------------
         # Publishers
         # ------------------------------------------------------------------
@@ -100,6 +108,10 @@ class PathFollowerNode(Node):
 
         self.progress_pub = self.create_publisher(
             Float32, '/follower/progress', reliable_qos)
+
+        
+        self.reference_pub = self.create_publisher(
+            Odometry, '/amr/reference', reliable_qos)
 
         # ------------------------------------------------------------------
         # Control timer
@@ -120,8 +132,14 @@ class PathFollowerNode(Node):
             self.get_logger().warn('Received path with < 2 poses — ignoring.')
             return
 
-        self.path = [(p.pose.position.x, p.pose.position.y)
-                     for p in msg.poses]
+        self.path = [
+            (p.pose.position.x,
+            p.pose.position.y,
+            p.pose.orientation.x,   # vx world
+            p.pose.orientation.y)   # vy world
+            for p in msg.poses
+        ]
+        
         self.path_index   = 0
         self.goal_reached = False
 
@@ -133,59 +151,127 @@ class PathFollowerNode(Node):
         self.get_logger().info(
             f'New path received: {len(self.path)} waypoints — starting follower')
 
+    
+    def _initial_pose_callback(self, msg: PoseWithCovarianceStamped):
+        self.robot_x = msg.pose.pose.position.x
+        self.robot_y = msg.pose.pose.position.y
+
+        q = msg.pose.pose.orientation
+        self.robot_yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+        self._broadcast_tf()   # ← immediately broadcast so planner can read it
+
+        self.get_logger().info(
+            f'Initial pose set: x={self.robot_x:.2f} y={self.robot_y:.2f} yaw={self.robot_yaw:.2f}')
+
+
+    # ==========================================================================
+    # Publish to cmd_vel
+    # ==========================================================================    
+    def _publish_cmd_vel(self):
+        if self.goal_reached or not self.path or self.path_index >= len(self.path):
+            self._publish_reference(0.0, 0.0, 0.0)
+            return
+
+        _, _, vx_world, vy_world = self.path[self.path_index]
+
+        cos_y    =  math.cos(self.robot_yaw)
+        sin_y    =  math.sin(self.robot_yaw)
+        vx_robot =  cos_y * vx_world + sin_y * vy_world
+        vy_robot = -sin_y * vx_world + cos_y * vy_world
+
+        target_yaw = math.atan2(vy_world, vx_world)
+        yaw_error  = math.atan2(
+            math.sin(target_yaw - self.robot_yaw),
+            math.cos(target_yaw - self.robot_yaw))
+        omega = 1.5 * yaw_error
+
+        self._publish_reference(vx_robot, vy_robot, omega)
+
+
+    # Publish an Odom message type (position and velocities x,y) to the reference node for the controller
+    def _publish_reference(self, vx_robot, vy_robot, omega):
+        msg = Odometry()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.map_frame
+        msg.child_frame_id  = self.robot_base_frame
+
+        msg.pose.pose.position.x    = self.robot_x
+        msg.pose.pose.position.y    = self.robot_y
+        msg.pose.pose.position.z    = 0.0
+        msg.pose.pose.orientation.z = math.sin(self.robot_yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(self.robot_yaw / 2.0)
+
+        msg.twist.twist.linear.x  = vx_robot
+        msg.twist.twist.linear.y  = vy_robot
+        msg.twist.twist.angular.z = omega
+
+        self.reference_pub.publish(msg)
+        
+
+    def _send_twist(self, vx, vy, omega):
+        msg = Twist()
+        msg.linear.x  = vx
+        msg.linear.y  = vy    
+        msg.angular.z = omega
+        self.cmd_vel_pub.publish(msg)
+
     # ==========================================================================
     # Main update loop
     # ==========================================================================
-
     def _update(self):
         self._broadcast_tf()
         self._publish_robot_marker()
 
         if self.goal_reached or not self.path:
+            self._publish_reference(0.0, 0.0, 0.0)   # ← was _send_twist
             return
 
-        step_remaining = self.linear_speed * self.dt
+        _, _, vx_world, vy_world = self.path[self.path_index]
+        current_speed  = math.hypot(vx_world, vy_world)
+        current_speed  = max(current_speed, 0.05)
+        step_remaining = current_speed * self.dt
 
         while step_remaining > 0 and self.path_index < len(self.path):
-            tx, ty = self.path[self.path_index]
-            dx     = tx - self.robot_x
-            dy     = ty - self.robot_y
-            dist   = math.hypot(dx, dy)
+            tx, ty = self.path[self.path_index][0], self.path[self.path_index][1]
+            dx   = tx - self.robot_x
+            dy   = ty - self.robot_y
+            dist = math.hypot(dx, dy)
 
-            # Avoid division by zero for duplicate points
             if dist < 1e-6:
                 self.path_index += 1
                 continue
 
             if dist <= step_remaining:
-                # Can fully reach this waypoint — move there and keep going
                 step_remaining -= dist
                 self.robot_x    = tx
                 self.robot_y    = ty
                 self.path_index += 1
             else:
-                # Partial step — move exactly step_remaining along the direction
                 ratio           = step_remaining / dist
                 self.robot_x   += ratio * dx
                 self.robot_y   += ratio * dy
                 step_remaining  = 0
 
-            # Update heading toward next waypoint
             if self.path_index < len(self.path):
-                nx, ny         = self.path[self.path_index]
-                self.robot_yaw = math.atan2(ny - self.robot_y,
-                                            nx - self.robot_x)
+                nx = self.path[self.path_index][0]
+                ny = self.path[self.path_index][1]
+                self.robot_yaw = math.atan2(ny - self.robot_y, nx - self.robot_x)
 
-        # Check goal reached
         if self.path_index >= len(self.path):
-            gx, gy = self.path[-1]
+            gx, gy = self.path[-1][0], self.path[-1][1]
             if math.hypot(self.robot_x - gx, self.robot_y - gy) < self.goal_tolerance:
                 self.robot_x      = gx
                 self.robot_y      = gy
                 self.goal_reached = True
-                self.get_logger().info('Goal reached — waiting for new path.')
+                self._publish_reference(0.0, 0.0, 0.0)   # ← was _send_twist
+                self.get_logger().info('Goal reached.')
                 self._publish_progress(1.0)
                 return
+
+        self._publish_cmd_vel()
 
         progress = self.path_index / max(len(self.path) - 1, 1)
         self._publish_progress(progress)
@@ -195,10 +281,10 @@ class PathFollowerNode(Node):
     # ==========================================================================
 
     def _heading_to(self, index: int) -> float:
-        """Return yaw angle pointing from robot toward path[index]."""
         if index >= len(self.path):
             return self.robot_yaw
-        tx, ty = self.path[index]
+        tx = self.path[index][0]   # safe for 4-tuples
+        ty = self.path[index][1]
         return math.atan2(ty - self.robot_y, tx - self.robot_x)
 
     # ==========================================================================
