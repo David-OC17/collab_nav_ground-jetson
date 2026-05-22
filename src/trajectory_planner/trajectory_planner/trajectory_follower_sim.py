@@ -55,12 +55,12 @@ class PathFollowerNode(Node):
         self.declare_parameter('robot_base_frame', 'base_link')
         self.declare_parameter('path_topic',       '/trajectory_planner/path')
 
-        self.linear_speed     = self.get_parameter('linear_speed').value
-        self.update_rate      = self.get_parameter('update_rate').value
-        self.goal_tolerance   = self.get_parameter('goal_tolerance').value
-        self.map_frame        = self.get_parameter('map_frame').value
-        self.robot_base_frame = self.get_parameter('robot_base_frame').value
-        self.path_topic       = self.get_parameter('path_topic').value
+        self.linear_speed     = float(self.get_parameter('linear_speed').value)
+        self.update_rate      = float(self.get_parameter('update_rate').value)
+        self.goal_tolerance   = float(self.get_parameter('goal_tolerance').value)
+        self.map_frame        = str(self.get_parameter('map_frame').value)
+        self.robot_base_frame = str(self.get_parameter('robot_base_frame').value)
+        self.path_topic       = str(self.get_parameter('path_topic').value)
 
         self.dt = 1.0 / self.update_rate   # seconds per update tick
 

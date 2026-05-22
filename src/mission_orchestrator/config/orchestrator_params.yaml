@@ -1,0 +1,83 @@
+# mission_orchestrator configuration
+# All paths must be absolute. All timeouts are in seconds.
+# ─────────────────────────────────────────────────────────────────────────────
+
+orchestrator:
+
+  # ── Raspberry Pi ────────────────────────────────────────────────────────
+  rasp:
+    ip: "192.168.1.100"
+    user: "ubuntu"
+    password: ""                         # Set before running
+    amr_launch_cmd: >-
+      source ~/ros2_ws/install/setup.bash &&
+      nohup ros2 launch amr_bringup launch_rasp.py
+      > /tmp/amr_launch.log 2>&1 & echo PID:$!
+    ping_count: 3
+    ping_timeout_sec: 2.0                # Timeout per ping attempt
+    ssh_connect_timeout_sec: 10.0
+
+  # ── EKF stability ───────────────────────────────────────────────────────
+  ekf:
+    topic: "/ekf/odom"
+    window_size: 20                      # Sliding-window length (samples)
+    velocity_threshold_mps: 0.05        # Mean |v| below this → stable
+    timeout_sec: 120.0
+
+  # ── OptiTrack ───────────────────────────────────────────────────────────
+  optitrack:
+    topic: "/optitrack/rigid_body"
+    expected_frame_id: "drone"           # header.frame_id must match this
+    max_stamp_age_sec: 1.0               # Message must be this fresh
+    check_timeout_sec: 30.0             # How long to wait for a message
+    retry_delay_sec: 3.0                 # Delay before re-checking after launching client
+
+  # ── Tello drone ─────────────────────────────────────────────────────────
+  drone:
+    state_topic: "/drone/state"          # std_msgs/Int32  (-1..4)
+    camera_topic: "/camera/image_raw"
+    battery_topic: "/battery_state"
+    cmd_vel_topic: "/cmd_vel"
+    battery_min_pct: 20.0               # Minimum battery % (0-100 scale)
+    camera_timeout_sec: 30.0
+    battery_timeout_sec: 10.0
+    # State transition timeouts
+    state1_timeout_sec: 60.0            # Stabilize
+    state2_timeout_sec: 300.0           # Trajectory
+    state3_timeout_sec: 30.0            # Going Back
+    state4_timeout_sec: 60.0            # Landing
+
+  # ── Video output files ───────────────────────────────────────────────────
+  video:
+    output_dir: "/CHANGEME/path/to/workspace/video"
+    scan_filename: "scan.mp4"
+    telemetry_filename: "telemetry.csv"
+    file_watch_poll_sec: 1.0
+    file_appear_timeout_sec: 180.0       # Time allowed for files to appear after landing
+
+  # ── ArUco pose publication ───────────────────────────────────────────────
+  aruco:
+    amr_marker_id: 0                     # MarkerPose.id for the AMR
+    goal_marker_id: 1                    # MarkerPose.id for the goal
+    amr_pose_topic: "/aruco/amr_pose"
+    goal_pose_topic: "/aruco/goal_pose"
+
+  # ── Arena marker localizer ───────────────────────────────────────────────
+  marker_localizer:
+    workspace_path: "/CHANGEME/path/to/workspace"  # Used to find default.yaml
+    service_name: "/localize_markers"
+    service_timeout_sec: 300.0
+    server_ready_timeout_sec: 60.0
+
+  # ── Arena map builder ────────────────────────────────────────────────────
+  map_builder:
+    background_image_path: "/CHANGEME/path/to/background.png"
+    action_name: "build_arena_map"
+    action_timeout_sec: 300.0
+    server_ready_timeout_sec: 30.0
+    drone_map_topic: "/drone/map"
+
+  # ── Logging ─────────────────────────────────────────────────────────────
+  logging:
+    log_dir: "/tmp/mission_orchestrator_logs"
+    log_level: "INFO"                    # DEBUG | INFO | WARNING | ERROR

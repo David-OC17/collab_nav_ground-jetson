@@ -14,7 +14,7 @@ In Jetson:
 ```bash
 ros2 launch oradar_lidar ms200_scan.launch.py
 
-ros2 launch slam_toolbox online_async
+ros2 launch slam_toolbox online_async_launch.py
 
 rviz2
 ```
@@ -24,7 +24,8 @@ In Rasp:
 ```bash
 ros2 launch ekf_amr ekf_launch.py
 ros2 launch amr_bringup position_control_launch.py
-ros2  launch network_bridge tcp.launch.py
+
+ros2 launch amr_bringup launch_rasp.py
 ```
 
 ## Arena map builder
@@ -92,4 +93,15 @@ source install/setup.sh
 ros2 service call /localize_markers arena_marker_localizer_interfaces/srv/LocalizeMarkers \
   "{video_path: '/absolute/path/to/your/video.mp4',
     optitrack_csv: '/absolute/path/to/your/optitrack.csv'}"
+```
+
+## Drone init
+
+(Optional) In case OptiTrack is not yet available/up:
+```bash
+ros2 run optitrack_client optitrack_client
+```
+
+```bash
+ros2 launch tello_driver tello_driver.launch.py
 ```

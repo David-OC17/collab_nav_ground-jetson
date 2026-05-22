@@ -294,8 +294,9 @@ class AStarPlanner(Node):
             MarkerArray, '/trajectory_planner/path_markers', reliable_qos)
 
         if self.stuck_detection:
+            stuck_rate = 1.0 if self.stuck_check_rate is None else float(self.stuck_check_rate)
             self.stuck_timer = self.create_timer(
-                1.0 / self.stuck_check_rate, self._check_stuck)
+                1.0 / stuck_rate, self._check_stuck)
 
         self.get_logger().info(
             'AStarPlanner ready | '

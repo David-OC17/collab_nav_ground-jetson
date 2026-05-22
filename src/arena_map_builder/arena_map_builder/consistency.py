@@ -202,7 +202,7 @@ def _estimate_cell_width_px(stages: dict) -> float:
     # helpers.
     import cv2
     hsv = cv2.cvtColor(cleaned, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (95, 60, 60), (135, 255, 255))
+    mask = cv2.inRange(hsv, np.array([95, 60, 60]), np.array([135, 255, 255]))
     col_counts = (mask > 0).sum(axis=0)
     thr = max(8, int(H * 0.30))
 

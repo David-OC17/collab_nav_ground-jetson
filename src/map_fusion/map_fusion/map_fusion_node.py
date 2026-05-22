@@ -31,7 +31,7 @@ from .preprocessing import preprocess_grid
 PARAM_SPEC = [
     # --- topic / frame names ---
     ('drone_map_topic', '/drone/map'),
-    ('slam_map_topic', '/map'),
+    ('slam_map_topic', '/amr/map'),
     ('aruco_pose_topic', '/aruco/amr_pose'),
     ('aruco_tracking_topic', '/aruco/amr_tracking'),
     ('reprojected_topic', '/fusion/slam_reprojected'),

@@ -1,0 +1,23 @@
+[TYPECHECK]
+# cv2 is a C extension — pylint can't introspect its members
+extension-pkg-whitelist=cv2
+# ROS2 packages generate members at runtime
+generated-members=
+    cv2.*,
+    rclpy.*,
+    rcl_interfaces.*,
+    nav_msgs.*,
+    geometry_msgs.*,
+    std_msgs.*,
+    sensor_msgs.*,
+    visualization_msgs.*,
+    tf2_ros.*,
+    builtin_interfaces.*
+
+[MESSAGES CONTROL]
+# E1101: generated-members catches most; disable the remainder for ROS2 msg fields
+disable=
+    E1101,
+    C0114,
+    C0115,
+    C0116

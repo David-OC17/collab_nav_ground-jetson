@@ -1,4 +1,36 @@
 {
   "python-envs.defaultEnvManager": "ms-python.python:conda",
-  "python-envs.defaultPackageManager": "ms-python.python:conda"
+  "python-envs.defaultPackageManager": "ms-python.python:conda",
+  "python.analysis.extraPaths": [
+    "./src",
+    "/opt/ros/humble/local/lib/python3.10/dist-packages",
+    "/opt/ros/humble/lib/python3.10/site-packages",
+    "/home/david/miniforge3/envs/collab_nav/lib/python3.11/site-packages",
+    "/home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/install/map_fusion/lib/python3.11/site-packages",
+    "/home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/install/arena_marker_localizer/lib/python3.11/site-packages",
+    "/home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/install/arena_marker_localizer_interfaces/lib/python3.11/site-packages",
+    "/home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/install/arena_map_builder/lib/python3.11/site-packages",
+    "/home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/install/arena_map_builder_msgs/lib/python3.11/site-packages"
+  ],
+  "ROS2.distro": "humble",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportAttributeAccessIssue": "none",
+    "reportMissingModuleSource": "none",
+    "reportUnknownMemberType": "none",
+    "reportUnknownVariableType": "none",
+    "reportUnknownArgumentType": "none",
+    "reportOperatorIssue": "none"
+  },
+  "python.autoComplete.extraPaths": [
+    "/home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/build/map_fusion",
+    "/home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/install/map_fusion/lib/python3.11/site-packages",
+    "/home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/install/arena_marker_localizer/lib/python3.11/site-packages",
+    "/home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/install/arena_marker_localizer_interfaces/lib/python3.11/site-packages",
+    "/home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/install/arena_map_builder/lib/python3.11/site-packages",
+    "/home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson/install/arena_map_builder_msgs/lib/python3.11/site-packages",
+    "/home/david/miniforge3/envs/collab_nav/lib/python311/site-packages",
+    "/home/david/miniforge3/envs/collab_nav/lib/python3.11/site-packages",
+    "/opt/ros/humble/lib/python3.10/site-packages",
+    "/opt/ros/humble/local/lib/python3.10/dist-packages"
+  ]
 }

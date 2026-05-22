@@ -32,7 +32,7 @@ import rclpy
 from rclpy.node import Node
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
-from geometry_msgs.msg import Pose, Point, Quaternion, Pose2D
+from geometry_msgs.msg import Pose, Point, Quaternion, Pose2D, PoseWithCovarianceStamped
 
 from arena_marker_localizer_interfaces.srv import LocalizeMarkers
 from arena_marker_localizer_interfaces.msg import MarkerPose
@@ -123,6 +123,12 @@ class MarkerLocalizerService(Node):
 
         self.declare_parameter("verbose", False)
 
+        # ── Covariance for pose_with_covariance ────────────────────────
+        # Diagonal variance is base_var / n_observations.
+        self.declare_parameter("pose_cov.base_var_pos", 0.01)   # m^2
+        self.declare_parameter("pose_cov.base_var_yaw", 0.10)   # rad^2
+        self.declare_parameter("pose_cov.frame_id", "world")
+
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
@@ -199,8 +205,7 @@ class MarkerLocalizerService(Node):
             verbose = bool(self._get("verbose")),
         )
 
-    @staticmethod
-    def _marker_result_to_msg(r: MarkerResult) -> MarkerPose:
+    def _marker_result_to_msg(self, r: MarkerResult, stamp) -> MarkerPose:
         msg = MarkerPose()
         msg.id = int(r.marker_id)
 
@@ -226,6 +231,33 @@ class MarkerLocalizerService(Node):
             y=float(r.position_m[1]),
             theta=float(r.yaw_rad),
         )
+
+        # ── pose_with_covariance ──
+        # Diagonal covariance scales with 1/n_observations so that more
+        # observations → tighter uncertainty estimate.
+        n = max(1, int(r.n_observations))
+        base_var_pos = float(self._get("pose_cov.base_var_pos"))
+        base_var_yaw = float(self._get("pose_cov.base_var_yaw"))
+        frame_id = str(self._get("pose_cov.frame_id"))
+
+        cov_pos = base_var_pos / n
+        cov_yaw = base_var_yaw / n
+        large = 1e6  # very uncertain (unused axes in 2D)
+
+        cov36 = [0.0] * 36
+        cov36[0]  = cov_pos   # x–x
+        cov36[7]  = cov_pos   # y–y
+        cov36[14] = large      # z–z
+        cov36[21] = large      # roll–roll
+        cov36[28] = large      # pitch–pitch
+        cov36[35] = cov_yaw   # yaw–yaw
+
+        pwcs = PoseWithCovarianceStamped()
+        pwcs.header.stamp = stamp
+        pwcs.header.frame_id = frame_id
+        pwcs.pose.pose = msg.pose_3d
+        pwcs.pose.covariance = cov36
+        msg.pose_with_covariance = pwcs
 
         msg.cell_x = int(r.cell_x)
         msg.cell_y = int(r.cell_y)
@@ -273,8 +305,9 @@ class MarkerLocalizerService(Node):
             response.message = f"pipeline exception: {e}"
             return response
 
+        stamp = self.get_clock().now().to_msg()
         msgs: List[MarkerPose] = [
-            self._marker_result_to_msg(r)
+            self._marker_result_to_msg(r, stamp)
             for r in sorted(results.values(), key=lambda x: x.marker_id)
         ]
 
