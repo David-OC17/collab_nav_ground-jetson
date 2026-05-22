@@ -4,3 +4,6 @@
 [submodule "src/oradar_ros"]
 	path = src/oradar_ros
 	url = git@github.com:David-OC17/oradar_ros.git
+[submodule "src/collab_nav_uav"]
+	path = src/collab_nav_uav
+	url = git@github.com:NoeRos22/collab_nav_uav.git
