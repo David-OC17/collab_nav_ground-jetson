@@ -40,6 +40,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
 from geometry_msgs.msg import PoseWithCovarianceStamped
 
+from std_msgs.msg import Float32
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -209,6 +211,7 @@ class AStarPlanner(Node):
         self.declare_parameter('spline_enabled',    True)
         self.declare_parameter('spline_decimation', 5)    # keep every Nth A* waypoint as knot
         self.declare_parameter('spline_samples',    200)  # output resolution
+        # Map fusion
         self.declare_parameter('inflation_radius',    0.2)
         self.declare_parameter('robot_radius',        0.20)
         self.declare_parameter('cost_scaling',        3.5)
@@ -227,6 +230,15 @@ class AStarPlanner(Node):
         self.inflation_radius = self.get_parameter('inflation_radius').value
         self.robot_radius     = self.get_parameter('robot_radius').value
         self.cost_scaling     = self.get_parameter('cost_scaling').value
+        self.declare_parameter('fusion_confidence_topic', '/fusion/confidence')
+        self.declare_parameter('slam_reprojected_topic',  '/fusion/slam_reprojected')
+        self.declare_parameter('map_fusion_threshold',    0.4)
+        self.declare_parameter('min_replan_interval_sec', 3.0)
+        # Map Fusion
+        self.fusion_confidence_topic = self.get_parameter('fusion_confidence_topic').value
+        self.slam_reprojected_topic  = self.get_parameter('slam_reprojected_topic').value
+        self.map_fusion_threshold    = self.get_parameter('map_fusion_threshold').value
+        self.min_replan_interval_sec = self.get_parameter('min_replan_interval_sec').value
 
         # ------------------------------------------------------------------
         # State
@@ -257,6 +269,17 @@ class AStarPlanner(Node):
         self.map_resolution   = None   # set on first map callback
         self._inflation_lut   = {}     # built after first map arrives
 
+        # Map fusion
+        self.drone_map_data   = None   # raw drone map array
+        self.slam_map_data    = None   # reprojected SLAM map array
+        self.fusion_confidence = 0.0
+        # Handle replannings
+        self.last_replan_time = 0.0
+        self.min_replan_interval_sec = 3.0 
+
+        self.robot_yaw = 0.0
+        self._pose_from_follower = False
+
         # ------------------------------------------------------------------
         # TF
         # ------------------------------------------------------------------
@@ -281,11 +304,22 @@ class AStarPlanner(Node):
         # ------------------------------------------------------------------
         # Subscribers / Publishers
         # ------------------------------------------------------------------
-        self.map_sub = self.create_subscription(
-            OccupancyGrid, self.map_topic, self._map_callback, map_qos)
+        # self.map_sub = self.create_subscription(
+        #     OccupancyGrid, self.map_topic, self._map_callback, map_qos)
         self.goal_sub = self.create_subscription(
             PoseStamped, self.goal_topic, self._goal_callback, reliable_qos)
+        # Map fusion
+        self.drone_map_sub = self.create_subscription(
+            OccupancyGrid, '/drone/map', self._drone_map_callback, map_qos)
+        self.slam_map_sub = self.create_subscription(
+            OccupancyGrid, self.slam_reprojected_topic, self._slam_map_callback, map_qos)
+        self.confidence_sub = self.create_subscription(
+            Float32, self.fusion_confidence_topic, self._confidence_callback, reliable_qos)
+        self.follower_pose_sub = self.create_subscription(PoseWithCovarianceStamped, '/follower/pose',
+                     self._follower_pose_callback, reliable_qos)
 
+
+        # PUBLISHERS 
         self.path_pub = self.create_publisher(
             Path, '/trajectory_planner/path', reliable_qos)
         self.raw_path_pub = self.create_publisher(
@@ -315,27 +349,27 @@ class AStarPlanner(Node):
     # Callbacks
     # ==========================================================================
 
-    def _map_callback(self, msg: OccupancyGrid):
-        self.map_resolution = msg.info.resolution
-        self.map_origin_x   = msg.info.origin.position.x
-        self.map_origin_y   = msg.info.origin.position.y
-        self.map_width      = msg.info.width
-        self.map_height     = msg.info.height
-        self.map_data       = np.array(msg.data, dtype=np.int8).reshape((self.map_height, self.map_width))
-        self.get_logger().info(f'Map received: {self.map_width}x{self.map_height} cells',throttle_duration_sec=5.0)
+    # def _map_callback(self, msg: OccupancyGrid):
+    #     self.map_resolution = msg.info.resolution
+    #     self.map_origin_x   = msg.info.origin.position.x
+    #     self.map_origin_y   = msg.info.origin.position.y
+    #     self.map_width      = msg.info.width
+    #     self.map_height     = msg.info.height
+    #     self.map_data       = np.array(msg.data, dtype=np.int8).reshape((self.map_height, self.map_width))
+    #     self.get_logger().info(f'Map received: {self.map_width}x{self.map_height} cells',throttle_duration_sec=5.0)
 
-        if self.replan_on_map and self.goal_received:
-            self._plan()
+    #     if self.replan_on_map and self.goal_received:
+    #         self._plan()
         
-        raw = np.array(msg.data, dtype=np.int8).reshape((self.map_height, self.map_width))
+    #     raw = np.array(msg.data, dtype=np.int8).reshape((self.map_height, self.map_width))
 
-        # Build LUT once (resolution now known)
-        if not self._inflation_lut:
-            self._build_inflation_lut()
+    #     # Build LUT once (resolution now known)
+    #     if not self._inflation_lut:
+    #         self._build_inflation_lut()
 
-        # Store inflated map — A* uses this instead of raw
-        self.map_data     = self._inflate_map(raw)
-        self.map_received = True
+    #     # Store inflated map — A* uses this instead of raw
+    #     self.map_data     = self._inflate_map(raw)
+    #     self.map_received = True
 
 
     def _initial_pose_callback(self, msg: PoseWithCovarianceStamped):
@@ -359,6 +393,54 @@ class AStarPlanner(Node):
             f'New goal: ({self.goal_x:.2f}, {self.goal_y:.2f})')
         self._plan()
         
+
+    def _drone_map_callback(self, msg: OccupancyGrid):
+        """Cache the drone map and rebuild the active map."""
+        self.map_resolution = msg.info.resolution
+        self.map_origin_x   = msg.info.origin.position.x
+        self.map_origin_y   = msg.info.origin.position.y
+        self.map_width      = msg.info.width
+        self.map_height     = msg.info.height
+        self.drone_map_data = np.array(msg.data, dtype=np.int8).reshape(
+            (self.map_height, self.map_width))
+        self.get_logger().info('Drone map received.')
+        # Trigger a map rebuild 
+        self._rebuild_active_map()
+
+
+    def _slam_map_callback(self, msg: OccupancyGrid):
+        """Cache the reprojected SLAM map and rebuild the active map."""
+        slam_raw = np.array(msg.data, dtype=np.int8).reshape(
+            (msg.info.height, msg.info.width))
+        # Resize to drone map dimensions if they differ
+        if slam_raw.shape != (self.map_height, self.map_width):
+            self.get_logger().warn(
+                f'SLAM map shape {slam_raw.shape} != '
+                f'drone map shape ({self.map_height},{self.map_width}) — skipping.')
+            return
+        self.slam_map_data = slam_raw
+        # Trigger a map rebuild 
+        self._rebuild_active_map()
+        
+
+    def _confidence_callback(self, msg: Float32):
+        """Update confidence and rebuild the active map."""
+        old = self.fusion_confidence
+        self.fusion_confidence = msg.data
+        # Only replan if confidence crosses the threshold boundary
+        crossed = ((old <  self.map_fusion_threshold) !=
+                (self.fusion_confidence < self.map_fusion_threshold))
+        if crossed and self.goal_received:
+            self.get_logger().info(
+                f'Confidence crossed threshold '
+                f'({old:.2f} -> {self.fusion_confidence:.2f}) — replanning.')
+            self._plan()
+
+
+    def _follower_pose_callback(self, msg: PoseWithCovarianceStamped):
+        self.robot_x = msg.pose.pose.position.x
+        self.robot_y = msg.pose.pose.position.y
+        self._pose_from_follower = True
 
     # ==========================================================================
     # Stuck detection
@@ -387,6 +469,46 @@ class AStarPlanner(Node):
             self.last_stuck_check_x = self.robot_x
             self.last_stuck_check_y = self.robot_y
             self._plan()
+
+
+    # ==========================================================================
+    # Rebuild map based on confidence score 
+    # ==========================================================================
+    def _rebuild_active_map(self):
+        if self.drone_map_data is None:
+            return
+
+        if (self.fusion_confidence >= self.map_fusion_threshold
+                and self.slam_map_data is not None):
+            drone  = self.drone_map_data.astype(np.int16)
+            slam   = self.slam_map_data.astype(np.int16)
+            merged = np.full_like(drone, -1, dtype=np.int16)
+            drone_known = drone != -1
+            slam_known  = slam  != -1
+            merged[drone_known] = drone[drone_known]
+            merged[slam_known]  = np.maximum(merged[slam_known], slam[slam_known])
+            raw = merged.astype(np.int8)
+            self.get_logger().info(
+                f'Using MERGED map (confidence={self.fusion_confidence:.2f})',
+                throttle_duration_sec=5.0)
+        else:
+            raw = self.drone_map_data.copy()
+            self.get_logger().info(
+                f'Using DRONE ONLY map (confidence={self.fusion_confidence:.2f})',
+                throttle_duration_sec=5.0)
+
+        if not self._inflation_lut:
+            self._build_inflation_lut()
+
+        self.map_data     = self._inflate_map(raw)
+        self.map_received = True
+
+        # --- Rate-limit replanning so SLAM updates don't replan every second ---
+        if self.replan_on_map and self.goal_received:
+            now = time.time()
+            if now - self.last_replan_time >= self.min_replan_interval_sec:
+                self.last_replan_time = now
+                self._plan()
 
     # ==========================================================================
     # Planning
@@ -664,6 +786,11 @@ class AStarPlanner(Node):
     # ==========================================================================
 
     def _update_robot_pose(self) -> bool:
+        # If the follower is publishing its pose, use that — it's the ground truth
+        if self._pose_from_follower:
+            return True
+
+        # Fall back to TF if follower isn't running
         try:
             tf_stamped = self.tf_buffer.lookup_transform(
                 self.map_frame, self.robot_base_frame,
@@ -678,18 +805,22 @@ class AStarPlanner(Node):
                 f'TF unavailable: {e}', throttle_duration_sec=3.0)
             return False
 
+
     def _world_to_cell(self, wx, wy):
         ci = int((wx - self.map_origin_x) / self.map_resolution)
         cj = int((wy - self.map_origin_y) / self.map_resolution)
         return ci, cj
+
 
     def _cell_to_world(self, ci, cj):
         wx = self.map_origin_x + (ci + 0.5) * self.map_resolution
         wy = self.map_origin_y + (cj + 0.5) * self.map_resolution
         return wx, wy
 
+
     def _in_bounds(self, ci, cj):
         return 0 <= ci < self.map_width and 0 <= cj < self.map_height
+
 
     def _is_lethal(self, ci, cj):
         return int(self.map_data[cj, ci]) >= LETHAL_THRESHOLD

@@ -4,8 +4,10 @@ Panels:
     Name: Displays
     Property Tree Widget:
       Expanded:
-        - /Map1
+        - /Drone Map1
+        - /SLAM Reprojected1
         - /Path1
+        - /Raw Path1
         - /MarkerArray1
         - /TF1
       Splitter Ratio: 0.5
@@ -26,27 +28,59 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
-    - Alpha: 0.7
+
+    # ------------------------------------------------------------------
+    # Drone map — full static overhead map (blue/grey tint via costmap scheme)
+    # ------------------------------------------------------------------
+    - Alpha: 0.6
       Class: rviz_default_plugins/Map
       Color Scheme: map
-      Draw Behind: false
+      Draw Behind: true          # render first so SLAM layer sits on top
       Enabled: true
-      Name: Map
+      Name: Drone Map
       Topic:
         Depth: 1
         Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /map
+        Value: /drone/map
       Update Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /map_updates
+        Value: /drone/map_updates
       Use Timestamp: false
       Value: true
 
+    # ------------------------------------------------------------------
+    # SLAM reprojected map — grows over time, drawn on top of drone map
+    # Use costmap colour scheme so occupied/free/unknown are clearly distinct
+    # ------------------------------------------------------------------
+    - Alpha: 0.75
+      Class: rviz_default_plugins/Map
+      Color Scheme: costmap      # grey=unknown, white=free, red=occupied
+      Draw Behind: false
+      Enabled: true
+      Name: SLAM Reprojected
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /fusion/slam_reprojected
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /fusion/slam_reprojected_updates
+      Use Timestamp: false
+      Value: true
+
+    # ------------------------------------------------------------------
+    # Smoothed spline path (cyan)
+    # ------------------------------------------------------------------
     - Alpha: 1.0
       Buffer Length: 1
       Class: rviz_default_plugins/Path
@@ -59,7 +93,7 @@ Visualization Manager:
       Head Length: 0.07
       Length: 0.3
       Line Style: Lines
-      Line Width: 0.04
+      Line Width: 0.05
       Name: Path
       Offset:
         X: 0
@@ -81,6 +115,46 @@ Visualization Manager:
         Value: /trajectory_planner/path
       Value: true
 
+    # ------------------------------------------------------------------
+    # Raw A* path (yellow, semi-transparent — shows what spline smooths over)
+    # ------------------------------------------------------------------
+    - Alpha: 0.45
+      Buffer Length: 1
+      Class: rviz_default_plugins/Path
+      Color:
+        B: 0
+        G: 255
+        R: 255
+      Enabled: true
+      Head Diameter: 0.08
+      Head Length: 0.05
+      Length: 0.2
+      Line Style: Lines
+      Line Width: 0.02
+      Name: Raw A* Path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color:
+        B: 0
+        G: 0
+        R: 180
+      Pose Style: None
+      Radius: 0.02
+      Shaft Diameter: 0.03
+      Shaft Length: 0.08
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /trajectory_planner/path_raw
+      Value: true
+
+    # ------------------------------------------------------------------
+    # Path markers — start/goal spheres and spline knots (from A* node)
+    # ------------------------------------------------------------------
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: MarkerArray
@@ -94,6 +168,43 @@ Visualization Manager:
         Value: /trajectory_planner/path_markers
       Value: true
 
+    # ------------------------------------------------------------------
+    # Robot body marker from the follower node (arrow, green → orange)
+    # ------------------------------------------------------------------
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Robot Marker
+      Namespaces:
+        follower: true
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /follower/robot_marker
+      Value: true
+
+    # ------------------------------------------------------------------
+    # Confidence score overlay — shown as a text marker published
+    # by adding a small status marker publisher to the fake map node
+    # (see note below)
+    # ------------------------------------------------------------------
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Confidence Label
+      Namespaces:
+        fusion_status: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /fusion/status_marker
+      Value: true
+
+    # ------------------------------------------------------------------
+    # TF frames
+    # ------------------------------------------------------------------
     - Class: rviz_default_plugins/TF
       Enabled: true
       Frame Timeout: 15
@@ -145,7 +256,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /initialpose
-    - Class: rviz_default_plugins/SetGoalPose
+    - Class: rviz_default_plugins/SetGoal
       Topic:
         Depth: 5
         Durability Policy: Volatile

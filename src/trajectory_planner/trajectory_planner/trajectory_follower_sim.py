@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Path Follower Node — RViz visualization only
+Path Follower Node — RVIZ visualization and publishes to controller reference node (position, vx, vy)
 =============================================
 Subscribes to the smoothed spline path from the A* planner and animates
 the robot (base_link TF) along it at a constant speed.
 
-No cmd_vel is published — this is purely for RViz visualization.
-
 Subscribes to:
   - /trajectory_planner/path   (nav_msgs/Path) — smoothed spline path
+  - /initialpose               Robot's initial pose 
 
 Publishes:
   - TF map → base_link         — robot pose animated along the path
@@ -34,7 +33,6 @@ from std_msgs.msg import Float32
 from geometry_msgs.msg import TransformStamped, Point
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
-
 import tf2_ros
 from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -89,7 +87,7 @@ class PathFollowerNode(Node):
         )
 
         # ------------------------------------------------------------------
-        # Subscriber
+        # Subscribers
         # ------------------------------------------------------------------
         self.path_sub = self.create_subscription(
             Path, self.path_topic, self._path_callback, reliable_qos)
@@ -113,6 +111,9 @@ class PathFollowerNode(Node):
         self.reference_pub = self.create_publisher(
             Odometry, '/amr/reference', reliable_qos)
 
+        self.pose_pub = self.create_publisher(
+            PoseWithCovarianceStamped, '/follower/pose', reliable_qos)
+
         # ------------------------------------------------------------------
         # Control timer
         # ------------------------------------------------------------------
@@ -132,24 +133,32 @@ class PathFollowerNode(Node):
             self.get_logger().warn('Received path with < 2 poses — ignoring.')
             return
 
-        self.path = [
+        new_path = [
             (p.pose.position.x,
             p.pose.position.y,
-            p.pose.orientation.x,   # vx world
-            p.pose.orientation.y)   # vy world
+            p.pose.orientation.x,
+            p.pose.orientation.y)
             for p in msg.poses
         ]
-        
-        self.path_index   = 0
-        self.goal_reached = False
 
-        # Snap robot to path start
-        self.robot_x   = self.path[0][0]
-        self.robot_y   = self.path[0][1]
-        self.robot_yaw = self._heading_to(0)
+        # Find the closest point on the new path to where the robot currently is
+        # so we don't snap back to the start on replan
+        closest_idx = 0
+        closest_dist = float('inf')
+        for i, wp in enumerate(new_path):
+            d = math.hypot(wp[0] - self.robot_x, wp[1] - self.robot_y)
+            if d < closest_dist:
+                closest_dist = d
+                closest_idx = i
+
+        self.path       = new_path
+        self.path_index = closest_idx   # ← resume from closest point, not start
+        self.goal_reached = False
+        self.robot_yaw  = self._heading_to(self.path_index)
 
         self.get_logger().info(
-            f'New path received: {len(self.path)} waypoints — starting follower')
+            f'New path received: {len(self.path)} waypoints — '
+            f'resuming from index {closest_idx} (dist={closest_dist:.2f}m)')
 
     
     def _initial_pose_callback(self, msg: PoseWithCovarianceStamped):
@@ -218,11 +227,23 @@ class PathFollowerNode(Node):
         msg.angular.z = omega
         self.cmd_vel_pub.publish(msg)
 
+
+    def _publish_pose(self):
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.map_frame
+        msg.pose.pose.position.x    = self.robot_x
+        msg.pose.pose.position.y    = self.robot_y
+        msg.pose.pose.orientation.z = math.sin(self.robot_yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(self.robot_yaw / 2.0)
+        self.pose_pub.publish(msg)
+
     # ==========================================================================
     # Main update loop
     # ==========================================================================
     def _update(self):
         self._broadcast_tf()
+        self._publish_pose()
         self._publish_robot_marker()
 
         if self.goal_reached or not self.path:
