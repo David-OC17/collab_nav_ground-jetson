@@ -7,3 +7,6 @@
 [submodule "src/collab_nav_uav"]
 	path = src/collab_nav_uav
 	url = git@github.com:NoeRos22/collab_nav_uav.git
+[submodule "src/optitrack_client"]
+	path = src/optitrack_client
+	url = git@github.com:NoeRos22/optitrack_client.git
