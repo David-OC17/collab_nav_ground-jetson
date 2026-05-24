@@ -8,21 +8,20 @@ Stages
  01  Ping Raspberry Pi
  02  SSH connect to Raspberry Pi
  03  Launch AMR bringup on Raspberry Pi (nohup, captures PID)
- 04  Wait for stable /ekf/odom  (sliding-window velocity < threshold)
+ 04  Wait for stable /amr/ekf/odom  (sliding-window velocity < threshold)
  05  Check /optitrack/rigid_body presence + header; launch client if absent
  06  Launch tello_driver
  07  Drone preflight: verify /camera/image_raw live, /battery_state ≥ min %
  08  Launch tello_map (drone takes off and executes scanning routine)
- 09  Observe drone state transitions 1→2→3→4 with per-stage timeouts;
-     file monitor thread runs concurrently
-10  Verify scan.mp4 and telemetry.csv exist and are non-empty
+ 09  Observe drone state transitions 1→2→3→4 with per-stage timeouts
+10  Wait for /drone/video_filename and /drone/telemetry_filename topic messages
 11  Verify scan.mp4 integrity via ffmpeg
 12  Launch trajectory_planner
 13  Launch map_fusion
 14  Launch oradar lidar
 15  Launch arena_marker_localizer service node + wait for readiness
 16  Call /localize_markers service → parse marker poses
-17  Publish /aruco/amr_pose and /aruco/goal_pose as PoseWithCovarianceStamped
+17  Publish /aruco/amr/pose and /aruco/goal/pose as PoseWithCovarianceStamped
 18  Launch arena_map_builder server + set background_path parameter
 19  Send BuildArenaMap action goal → wait for result
 20  Publish the resulting OccupancyGrid to /drone/map
@@ -61,7 +60,7 @@ from rclpy.qos import (
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import BatteryState, Image
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, String
 
 from arena_map_builder_msgs.action import BuildArenaMap
 from arena_marker_localizer_interfaces.srv import LocalizeMarkers
@@ -145,6 +144,11 @@ class MissionOrchestratorNode(Node):
         self._battery_event = threading.Event()
         self._battery_pct: Optional[float] = None
 
+        self._video_filename_event = threading.Event()
+        self._telemetry_filename_event = threading.Event()
+        self._video_path: Optional[str] = None
+        self._telemetry_path: Optional[str] = None
+
         self._drone_map_event = threading.Event()
 
         self._init_ros_interfaces()
@@ -206,6 +210,10 @@ class MissionOrchestratorNode(Node):
             cfg['drone']['camera_topic'], self._camera_cb, best_effort)
         self.create_subscription(BatteryState,
             cfg['drone']['battery_topic'], self._battery_cb, 10)
+        self.create_subscription(String,
+            cfg['drone']['video_filename_topic'], self._video_filename_cb, 10)
+        self.create_subscription(String,
+            cfg['drone']['telemetry_filename_topic'], self._telemetry_filename_cb, 10)
         self.create_subscription(OccupancyGrid,
             cfg['map_builder']['drone_map_topic'], self._drone_map_cb, latched)
 
@@ -258,6 +266,16 @@ class MissionOrchestratorNode(Node):
         self._battery_pct = float(msg.percentage)
         if self._battery_pct >= self._cfg['drone']['battery_min_pct']:
             self._battery_event.set()
+
+    def _video_filename_cb(self, msg: String) -> None:
+        self._video_path = msg.data
+        self._video_filename_event.set()
+        self._log.debug(f"Received video_filename: {msg.data!r}")
+
+    def _telemetry_filename_cb(self, msg: String) -> None:
+        self._telemetry_path = msg.data
+        self._telemetry_filename_event.set()
+        self._log.debug(f"Received telemetry_filename: {msg.data!r}")
 
     def _drone_map_cb(self, _msg: OccupancyGrid) -> None:
         self._drone_map_event.set()
@@ -375,29 +393,6 @@ class MissionOrchestratorNode(Node):
         self._log.error("══════ ABORT COMPLETE ══════")
 
     # ────────────────────────────────────────────────────────────────────────
-    # File monitor (runs in background thread during drone operation)
-    # ────────────────────────────────────────────────────────────────────────
-
-    def _file_monitor_loop(self, stop_evt: threading.Event) -> None:
-        cfg_v = self._cfg['video']
-        scan_path = os.path.join(cfg_v['output_dir'], cfg_v['scan_filename'])
-        telem_path = os.path.join(cfg_v['output_dir'], cfg_v['telemetry_filename'])
-
-        mtimes: Dict[str, Optional[float]] = {scan_path: None, telem_path: None}
-
-        while not stop_evt.wait(timeout=cfg_v['file_watch_poll_sec']):
-            for path in (scan_path, telem_path):
-                if os.path.exists(path):
-                    mtime = os.path.getmtime(path)
-                    if mtime != mtimes[path]:
-                        size_kb = os.path.getsize(path) / 1024
-                        if mtimes[path] is None:
-                            self._log.info(f"  [file-watch] Created: {path} ({size_kb:.1f} KB)")
-                        else:
-                            self._log.info(f"  [file-watch] Changed: {path} ({size_kb:.1f} KB)")
-                        mtimes[path] = mtime
-
-    # ────────────────────────────────────────────────────────────────────────
     # Stages
     # ────────────────────────────────────────────────────────────────────────
 
@@ -447,7 +442,7 @@ class MissionOrchestratorNode(Node):
         self._log.info("╚══ Stage 03 OK: AMR bringup launched")
 
     def _stage_04_wait_ekf_stable(self) -> None:
-        self._log.info("╔══ Stage 04: Waiting for stable /ekf/odom")
+        self._log.info("╔══ Stage 04: Waiting for stable /amr/ekf/odom")
         timeout = self._cfg['ekf']['timeout_sec']
         thr = self._cfg['ekf']['velocity_threshold_mps']
         self._log.info(f"  Threshold: |v| < {thr} m/s over {self._cfg['ekf']['window_size']} samples")
@@ -569,31 +564,41 @@ class MissionOrchestratorNode(Node):
 
         self._log.info("╚══ Stage 09 OK: Drone mission complete (state 4)")
 
-    def _stage_10_verify_video_files(self) -> None:
-        self._log.info("╔══ Stage 10: Verify video output files")
+    def _stage_10_wait_video_topics(self) -> None:
+        self._log.info("╔══ Stage 10: Wait for video file-path topics")
+        cfg_d = self._cfg['drone']
         cfg_v = self._cfg['video']
-        scan_path = os.path.join(cfg_v['output_dir'], cfg_v['scan_filename'])
-        telem_path = os.path.join(cfg_v['output_dir'], cfg_v['telemetry_filename'])
         timeout = cfg_v['file_appear_timeout_sec']
-        deadline = time.monotonic() + timeout
 
-        for label, path in (('scan.mp4', scan_path), ('telemetry.csv', telem_path)):
-            self._log.info(f"  Waiting for {label} at {path} …")
-            while not (os.path.exists(path) and os.path.getsize(path) > 0):
-                if time.monotonic() > deadline:
-                    raise MissionAbortError(
-                        f"{label} not found or empty at {path} after {timeout}s")
-                time.sleep(1.0)
+        self._log.info(
+            f"  Waiting for {cfg_d['video_filename_topic']} (timeout={timeout}s) …")
+        if not self._video_filename_event.wait(timeout=timeout):
+            raise MissionAbortError(
+                f"No message on {cfg_d['video_filename_topic']} after {timeout}s")
+
+        self._log.info(
+            f"  Waiting for {cfg_d['telemetry_filename_topic']} (timeout={timeout}s) …")
+        if not self._telemetry_filename_event.wait(timeout=timeout):
+            raise MissionAbortError(
+                f"No message on {cfg_d['telemetry_filename_topic']} after {timeout}s")
+
+        self._log.info(f"  video_path:    {self._video_path!r}")
+        self._log.info(f"  telemetry_path:{self._telemetry_path!r}")
+
+        for label, path in (('scan.mp4', self._video_path), ('telemetry.csv', self._telemetry_path)):
+            if not path or not os.path.isfile(path):
+                raise MissionAbortError(f"{label} path does not exist: {path!r}")
             size_kb = os.path.getsize(path) / 1024
+            if size_kb == 0:
+                raise MissionAbortError(f"{label} is empty: {path!r}")
             self._log.info(f"  {label}: {size_kb:.1f} KB — OK")
+
         self._log.info("╚══ Stage 10 OK")
 
     def _stage_11_verify_video_integrity(self) -> None:
         self._log.info("╔══ Stage 11: Verify scan.mp4 integrity via ffmpeg")
-        cfg_v = self._cfg['video']
-        scan_path = os.path.join(cfg_v['output_dir'], cfg_v['scan_filename'])
         result = subprocess.run(
-            ['ffmpeg', '-v', 'error', '-i', scan_path, '-f', 'null', '-'],
+            ['ffmpeg', '-v', 'error', '-i', self._video_path, '-f', 'null', '-'],
             capture_output=True,
         )
         if result.returncode != 0:
@@ -670,16 +675,12 @@ class MissionOrchestratorNode(Node):
 
     def _stage_16_call_localize_markers(self) -> List:
         self._log.info("╔══ Stage 16: Call /localize_markers")
-        cfg_v = self._cfg['video']
-        scan_path = os.path.join(cfg_v['output_dir'], cfg_v['scan_filename'])
-        telem_path = os.path.join(cfg_v['output_dir'], cfg_v['telemetry_filename'])
-
         req = LocalizeMarkers.Request()
-        req.video_path = scan_path
-        req.optitrack_csv = telem_path
+        req.video_path = self._video_path
+        req.optitrack_csv = self._telemetry_path
 
         timeout = self._cfg['marker_localizer']['service_timeout_sec']
-        self._log.info(f"  video={scan_path!r}, csv={telem_path!r}")
+        self._log.info(f"  video={self._video_path!r}, csv={self._telemetry_path!r}")
         response = self._call_service(self._loc_client, req, timeout_sec=timeout)
 
         if not response.success:
@@ -696,7 +697,7 @@ class MissionOrchestratorNode(Node):
         return markers
 
     def _stage_17_publish_aruco_poses(self, markers: List) -> None:
-        self._log.info("╔══ Stage 17: Publish /aruco/amr_pose and /aruco/goal_pose")
+        self._log.info("╔══ Stage 17: Publish /aruco/amr/pose and /aruco/goal/pose")
         cfg_a = self._cfg['aruco']
         amr_id = cfg_a['amr_marker_id']
         goal_id = cfg_a['goal_marker_id']
@@ -749,12 +750,9 @@ class MissionOrchestratorNode(Node):
 
     def _stage_19_call_map_builder(self) -> OccupancyGrid:
         self._log.info("╔══ Stage 19: Call BuildArenaMap action")
-        cfg_v = self._cfg['video']
-        scan_path = os.path.join(cfg_v['output_dir'], cfg_v['scan_filename'])
-
         goal = BuildArenaMap.Goal()
-        goal.video_path = scan_path
-        self._log.info(f"  video_path={scan_path!r}")
+        goal.video_path = self._video_path
+        self._log.info(f"  video_path={self._video_path!r}")
 
         timeout = self._cfg['map_builder']['action_timeout_sec']
         result = self._call_action(goal, timeout_sec=timeout)
@@ -801,25 +799,9 @@ class MissionOrchestratorNode(Node):
             self._stage_05_check_optitrack()
             self._stage_06_launch_tello_driver()
             self._stage_07_drone_preflight()
-
-            # Start the file monitor before the drone takes off
-            stop_file_monitor = threading.Event()
-            file_monitor = threading.Thread(
-                target=self._file_monitor_loop,
-                args=(stop_file_monitor,),
-                name='file-monitor',
-                daemon=True,
-            )
-            file_monitor.start()
-
-            try:
-                self._stage_08_launch_tello_map()
-                self._stage_09_observe_drone_states()
-            finally:
-                stop_file_monitor.set()
-                file_monitor.join(timeout=5.0)
-
-            self._stage_10_verify_video_files()
+            self._stage_08_launch_tello_map()
+            self._stage_09_observe_drone_states()
+            self._stage_10_wait_video_topics()
             self._stage_11_verify_video_integrity()
             self._stage_12_launch_trajectory_planner()
             self._stage_13_launch_map_fusion()

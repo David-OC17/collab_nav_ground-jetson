@@ -6,9 +6,9 @@ orchestrator:
 
   # ── Raspberry Pi ────────────────────────────────────────────────────────
   rasp:
-    ip: "192.168.1.100"
-    user: "ubuntu"
-    password: ""                         # Set before running
+    ip: "10.42.0.184"
+    user: "root"
+    password: "root"                         # Set before running
     amr_launch_cmd: >-
       source ~/ros2_ws/install/setup.bash &&
       nohup ros2 launch amr_bringup launch_rasp.py
@@ -19,7 +19,7 @@ orchestrator:
 
   # ── EKF stability ───────────────────────────────────────────────────────
   ekf:
-    topic: "/ekf/odom"
+    topic: "/amr/ekf/odom"
     window_size: 20                      # Sliding-window length (samples)
     velocity_threshold_mps: 0.05        # Mean |v| below this → stable
     timeout_sec: 120.0
@@ -46,21 +46,19 @@ orchestrator:
     state2_timeout_sec: 300.0           # Trajectory
     state3_timeout_sec: 30.0            # Going Back
     state4_timeout_sec: 60.0            # Landing
+    video_filename_topic: "/drone/video_filename"
+    telemetry_filename_topic: "/drone/telemetry_filename"
 
   # ── Video output files ───────────────────────────────────────────────────
   video:
-    output_dir: "/CHANGEME/path/to/workspace/video"
-    scan_filename: "scan.mp4"
-    telemetry_filename: "telemetry.csv"
-    file_watch_poll_sec: 1.0
-    file_appear_timeout_sec: 180.0       # Time allowed for files to appear after landing
+    file_appear_timeout_sec: 180.0       # Time allowed for file-path topics to arrive after landing
 
   # ── ArUco pose publication ───────────────────────────────────────────────
   aruco:
     amr_marker_id: 0                     # MarkerPose.id for the AMR
     goal_marker_id: 1                    # MarkerPose.id for the goal
-    amr_pose_topic: "/aruco/amr_pose"
-    goal_pose_topic: "/aruco/goal_pose"
+    amr_pose_topic: "/aruco/amr/pose"
+    goal_pose_topic: "/aruco/goal/pose"
 
   # ── Arena marker localizer ───────────────────────────────────────────────
   marker_localizer:

@@ -23,7 +23,6 @@ setup(
     maintainer_email='daveoc1704@gmail.com',
     description='End-to-end mission orchestrator for collab_nav ground+drone system.',
     license='MIT',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'orchestrator = mission_orchestrator.orchestrator_node:main',
