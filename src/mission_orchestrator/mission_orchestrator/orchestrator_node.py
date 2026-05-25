@@ -7,9 +7,10 @@ Stages
 ──────
  01  Ping Raspberry Pi
  02  SSH connect to Raspberry Pi
- 03  Launch AMR bringup on Raspberry Pi (nohup, captures PID)
+ 03  Start amr_bringup systemd service on Raspberry Pi; verify active
  04  Wait for stable /amr/ekf/odom  (sliding-window velocity < threshold)
  05  Check /optitrack/rigid_body presence + header; launch client if absent
+ 05b Connect to Tello WiFi (nmcli scan + connect on wlx14ebb67dae0b)
  06  Launch tello_driver
  07  Drone preflight: verify /camera/image_raw live, /battery_state ≥ min %
  08  Launch tello_map (drone takes off and executes scanning routine)
@@ -55,6 +56,8 @@ from rclpy.qos import (
     QoSHistoryPolicy,
     QoSProfile,
     QoSReliabilityPolicy,
+    ReliabilityPolicy,
+    HistoryPolicy,
 )
 
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
@@ -120,7 +123,6 @@ class MissionOrchestratorNode(Node):
 
         # SSH state
         self._ssh: Optional[paramiko.SSHClient] = None
-        self._ssh_amr_pid: Optional[int] = None
 
         # Mission state flags
         self._mission_complete = False
@@ -200,10 +202,16 @@ class MissionOrchestratorNode(Node):
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
 
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
         self.create_subscription(Odometry,
             cfg['ekf']['topic'], self._ekf_cb, 10)
         self.create_subscription(PoseStamped,
-            cfg['optitrack']['topic'], self._optitrack_cb, 10)
+            cfg['optitrack']['topic'], self._optitrack_cb, qos)
         self.create_subscription(Int32,
             cfg['drone']['state_topic'], self._drone_state_cb, 10)
         self.create_subscription(Image,
@@ -371,25 +379,29 @@ class MissionOrchestratorNode(Node):
 
         self._log.warning("══ DRONE ABORT COMPLETE ══")
 
+    def _teardown_ssh(self) -> None:
+        """Stop the AMR service and close the SSH connection. Idempotent."""
+        if self._ssh is None:
+            return
+        try:
+            svc = self._cfg['rasp']['amr_service']
+            self._ssh.exec_command(f'systemctl stop {svc}')
+            self._log.info(f"  Stopped {svc} on Raspberry Pi")
+        except Exception:
+            pass
+        try:
+            self._ssh.close()
+        except Exception:
+            pass
+        self._ssh = None
+
     def _abort(self) -> None:
         """Kill all processes and close SSH.  Idempotent."""
         self._log.error("══════ MISSION ABORT ══════")
         self._abort_drone()
         for name, proc in list(self._processes.items()):
             _kill_proc(proc, name, self._log)
-        if self._ssh is not None:
-            if self._ssh_amr_pid is not None:
-                try:
-                    self._ssh.exec_command(f'kill -INT {self._ssh_amr_pid} 2>/dev/null')
-                    time.sleep(3)
-                    self._ssh.exec_command(f'kill -9 {self._ssh_amr_pid} 2>/dev/null')
-                except Exception:
-                    pass
-            try:
-                self._ssh.close()
-            except Exception:
-                pass
-            self._ssh = None
+        self._teardown_ssh()
         self._log.error("══════ ABORT COMPLETE ══════")
 
     # ────────────────────────────────────────────────────────────────────────
@@ -421,25 +433,42 @@ class MissionOrchestratorNode(Node):
         self._ssh = client
         self._log.info(f"╚══ Stage 02 OK: SSH connected to {cfg_r['user']}@{cfg_r['ip']}")
 
-    def _stage_03_launch_amr(self) -> None:
-        self._log.info("╔══ Stage 03: Launch AMR bringup on Raspberry Pi")
-        cmd = self._cfg['rasp']['amr_launch_cmd']
-        _stdin, stdout, _stderr = self._ssh.exec_command(
-            f'bash -c \'{cmd}\'', get_pty=False)
-        output = stdout.read().decode().strip()
-        self._log.info(f"  SSH command output: {output!r}")
+    def _ssh_run(self, cmd: str) -> tuple[int, str, str]:
+        """Run a command over SSH; return (exit_code, stdout, stderr)."""
+        _in, out, err = self._ssh.exec_command(cmd)
+        exit_code = out.channel.recv_exit_status()
+        return exit_code, out.read().decode().strip(), err.read().decode().strip()
 
-        for line in output.splitlines():
-            if line.startswith('PID:'):
-                try:
-                    self._ssh_amr_pid = int(line.split(':', 1)[1].strip())
-                    self._log.info(f"  AMR launch PID on Raspberry Pi: {self._ssh_amr_pid}")
-                except ValueError:
-                    self._log.warning("  Could not parse AMR PID from output")
+    def _stage_03_launch_amr(self) -> None:
+        self._log.info("╔══ Stage 03: Start AMR bringup service on Raspberry Pi")
+        cfg_r = self._cfg['rasp']
+        svc = cfg_r['amr_service']
+        timeout = cfg_r['amr_service_start_timeout_sec']
+
+        # Start the service (idempotent — fine if already running)
+        rc, _, stderr = self._ssh_run(f'systemctl start {svc}')
+        if rc != 0:
+            raise MissionAbortError(
+                f"systemctl start {svc} failed (rc={rc}): {stderr}")
+        self._log.info(f"  systemctl start {svc} → OK")
+
+        # Poll until active or timeout
+        self._log.info(f"  Waiting for {svc} to become active (up to {timeout}s) …")
+        deadline = time.monotonic() + timeout
+        while True:
+            _, state, _ = self._ssh_run(f'systemctl is-active {svc}')
+            if state == 'active':
                 break
-        if self._ssh_amr_pid is None:
-            self._log.warning("  AMR PID not captured; remote kill may not work")
-        self._log.info("╚══ Stage 03 OK: AMR bringup launched")
+            if time.monotonic() > deadline:
+                # Grab journal tail for diagnostics
+                _, journal, _ = self._ssh_run(
+                    f'journalctl -u {svc} -n 20 --no-pager')
+                raise MissionAbortError(
+                    f"{svc} did not become active within {timeout}s "
+                    f"(state={state!r}).\nJournal tail:\n{journal}")
+            time.sleep(1.0)
+
+        self._log.info(f"╚══ Stage 03 OK: {svc} is active")
 
     def _stage_04_wait_ekf_stable(self) -> None:
         self._log.info("╔══ Stage 04: Waiting for stable /amr/ekf/odom")
@@ -492,6 +521,58 @@ class MissionOrchestratorNode(Node):
                 f"OptiTrack stamp is stale: age={age:.2f}s > max={max_age}s")
 
         self._log.info(f"  OptiTrack OK — frame_id='{msg.header.frame_id}', age={age:.3f}s")
+
+    def _stage_05b_connect_tello_wifi(self) -> None:
+        self._log.info("╔══ Stage 05b: Connect to Tello WiFi")
+        cfg_w = self._cfg['tello_wifi']
+        iface = cfg_w['interface']
+        ssid = cfg_w['ssid']
+        scan_retries = int(cfg_w.get('scan_retries', 3))
+        connect_timeout = float(cfg_w.get('connect_timeout_sec', 30.0))
+
+        # Scan for the Tello network; retry in case it takes a moment to appear
+        self._log.info(f"  Scanning for '{ssid}' on interface {iface} …")
+        found = False
+        for attempt in range(1, scan_retries + 1):
+            result = subprocess.run(
+                ['nmcli', 'device', 'wifi', 'list', 'ifname', iface],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                self._log.warning(
+                    f"  nmcli scan failed (attempt {attempt}): {result.stderr.strip()}")
+            elif ssid in result.stdout:
+                found = True
+                self._log.info(f"  '{ssid}' visible on scan attempt {attempt}")
+                break
+            else:
+                self._log.info(
+                    f"  '{ssid}' not yet visible (attempt {attempt}/{scan_retries}) — retrying …")
+                time.sleep(2.0)
+
+        if not found:
+            raise MissionAbortError(
+                f"Tello WiFi '{ssid}' not found after {scan_retries} scans on {iface}")
+
+        # Connect
+        self._log.info(f"  Connecting to '{ssid}' on {iface} …")
+        try:
+            result = subprocess.run(
+                ['sudo', 'nmcli', 'device', 'wifi', 'connect', ssid, 'ifname', iface],
+                capture_output=True, text=True,
+                timeout=connect_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise MissionAbortError(
+                f"nmcli connect to '{ssid}' timed out after {connect_timeout}s")
+
+        if result.returncode != 0:
+            raise MissionAbortError(
+                f"Failed to connect to '{ssid}': "
+                f"{result.stderr.strip() or result.stdout.strip()}")
+
+        self._log.info(f"  {result.stdout.strip()}")
+        self._log.info("╚══ Stage 05b OK: Tello WiFi connected")
 
     def _stage_06_launch_tello_driver(self) -> None:
         self._log.info("╔══ Stage 06: Launch tello_driver")
@@ -797,6 +878,7 @@ class MissionOrchestratorNode(Node):
             self._stage_03_launch_amr()
             self._stage_04_wait_ekf_stable()
             self._stage_05_check_optitrack()
+            self._stage_05b_connect_tello_wifi()
             self._stage_06_launch_tello_driver()
             self._stage_07_drone_preflight()
             self._stage_08_launch_tello_map()
@@ -877,6 +959,7 @@ def main(args=None) -> None:
     finally:
         if not node._mission_complete:
             node._abort()
+        node._teardown_ssh()  # always stop AMR service on exit
         executor.shutdown(timeout_sec=5.0)
         node.destroy_node()
         if rclpy.ok():

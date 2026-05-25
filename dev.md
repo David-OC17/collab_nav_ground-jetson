@@ -6,7 +6,7 @@ y - green: 0 cm
 z - blue: 13 cm
 
 ```bash
-colcon build --symlink-install --packages-select amr_optitrack arena_map_builder_msgs  arena_marker_localizer_interfaces local_costmap odom_to_tf trajectory_planner arena_map_builder  arena_marker_localizer fixed_stamp_scan map_fusion oradar_ros
+colcon build --symlink-install --packages-select amr_optitrack arena_map_builder_msgs  arena_marker_localizer_interfaces local_costmap odom_to_tf trajectory_planner arena_map_builder  arena_marker_localizer fixed_stamp_scan map_fusion oradar_lidar optitrack_client tello_driver tello_pos_control tello_msgs
 ```
 
 In Jetson:
@@ -102,6 +102,13 @@ ros2 service call /localize_markers arena_marker_localizer_interfaces/srv/Locali
 ros2 run optitrack_client optitrack_client
 ```
 
+Verify Tello's Wifi connection availability and connect:
+```bash
+nmcli device wifi list ifname wlx14ebb67dae0b
+sudo nmcli device wifi connect "TELLO-594992" ifname wlx14ebb67dae0b
+```
+
 ```bash
 ros2 launch tello_driver tello_driver.launch.py
+ros2 launch tello_pos_control tello_map.launch.py
 ```

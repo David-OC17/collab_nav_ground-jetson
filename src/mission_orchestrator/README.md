@@ -128,7 +128,7 @@ The file is loaded at runtime via the `config_file` ROS parameter —
 orchestrator:
 
   rasp:
-    ip: "10.42.0.184"          # Raspberry Pi address
+    ip: "10.42.0.50"          # Raspberry Pi address
     user: "root"
     password: "root"
     amr_launch_cmd: >-         # Command executed over SSH

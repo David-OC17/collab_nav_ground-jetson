@@ -6,13 +6,11 @@ orchestrator:
 
   # ── Raspberry Pi ────────────────────────────────────────────────────────
   rasp:
-    ip: "10.42.0.184"
+    ip: "10.42.0.50"
     user: "root"
     password: "root"                         # Set before running
-    amr_launch_cmd: >-
-      source ~/ros2_ws/install/setup.bash &&
-      nohup ros2 launch amr_bringup launch_rasp.py
-      > /tmp/amr_launch.log 2>&1 & echo PID:$!
+    amr_service: "amr_bringup"             # systemd service name
+    amr_service_start_timeout_sec: 15.0    # How long to wait for active state
     ping_count: 3
     ping_timeout_sec: 2.0                # Timeout per ping attempt
     ssh_connect_timeout_sec: 10.0
@@ -31,6 +29,13 @@ orchestrator:
     max_stamp_age_sec: 1.0               # Message must be this fresh
     check_timeout_sec: 30.0             # How long to wait for a message
     retry_delay_sec: 3.0                 # Delay before re-checking after launching client
+
+  # ── Tello WiFi connection ────────────────────────────────────────────────
+  tello_wifi:
+    interface: "wlx14ebb67dae0b"           # WiFi adapter ifname
+    ssid: "TELLO-594992"                   # Tello access-point SSID
+    scan_retries: 3                        # Scan attempts before giving up
+    connect_timeout_sec: 30.0             # Timeout for nmcli connect call
 
   # ── Tello drone ─────────────────────────────────────────────────────────
   drone:
