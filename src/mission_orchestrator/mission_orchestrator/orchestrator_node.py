@@ -688,6 +688,16 @@ class MissionOrchestratorNode(Node):
                 f"scan.mp4 failed ffmpeg integrity check: {err}")
         self._log.info("╚══ Stage 11 OK: scan.mp4 is valid")
 
+    def _wait_for_publisher(self, topic: str, timeout_sec: float, label: str) -> None:
+        """Block until at least one publisher exists on *topic* or raise MissionAbortError."""
+        deadline = time.monotonic() + timeout_sec
+        while self.count_publishers(topic) == 0:
+            if time.monotonic() > deadline:
+                raise MissionAbortError(
+                    f"{label} not ready: no publisher on '{topic}' after {timeout_sec}s")
+            time.sleep(0.5)
+        self._log.info(f"  {label} ready — publisher on '{topic}' detected")
+
     def _stage_12_launch_trajectory_planner(self) -> None:
         self._log.info("╔══ Stage 12: Launch trajectory_planner")
         proc = subprocess.Popen(
@@ -696,6 +706,9 @@ class MissionOrchestratorNode(Node):
         )
         self._processes['trajectory_planner'] = proc
         self._log.info(f"  trajectory_planner launched (pid={proc.pid})")
+        cfg_tp = self._cfg['trajectory_planner']
+        self._wait_for_publisher(
+            cfg_tp['ready_topic'], cfg_tp['ready_timeout_sec'], 'trajectory_planner')
         self._log.info("╚══ Stage 12 OK")
 
     def _stage_13_launch_map_fusion(self) -> None:
@@ -706,16 +719,22 @@ class MissionOrchestratorNode(Node):
         )
         self._processes['map_fusion'] = proc
         self._log.info(f"  map_fusion launched (pid={proc.pid})")
+        cfg_mf = self._cfg['map_fusion']
+        self._wait_for_publisher(
+            cfg_mf['ready_topic'], cfg_mf['ready_timeout_sec'], 'map_fusion')
         self._log.info("╚══ Stage 13 OK")
 
     def _stage_14_launch_oradar(self) -> None:
         self._log.info("╔══ Stage 14: Launch oradar lidar")
         proc = subprocess.Popen(
-            ['ros2', 'launch', 'oradar_lidar', 'ms200_scan.launch.py'],
+            ['ros2', 'launch', 'oradar_ros', 'ms200_scan.launch.py'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self._processes['oradar'] = proc
         self._log.info(f"  oradar launched (pid={proc.pid})")
+        cfg_or = self._cfg['oradar']
+        self._wait_for_publisher(
+            cfg_or['scan_topic'], cfg_or['ready_timeout_sec'], 'oradar')
         self._log.info("╚══ Stage 14 OK")
 
     def _stage_15_launch_marker_localizer(self) -> None:
@@ -816,17 +835,27 @@ class MissionOrchestratorNode(Node):
             raise MissionAbortError(
                 f"BuildArenaMap action server not available after {server_timeout}s")
 
-        # Set background_path parameter
+        # Set background_path parameter — retry because ros2cli node discovery
+        # can lag behind the action server becoming available.
         bg = self._cfg['map_builder']['background_image_path']
         self._log.info(f"  Setting background_path → {bg}")
-        result = subprocess.run(
-            ['ros2', 'param', 'set', '/build_arena_map_server',
-             'transfer.background_path', bg],
-            capture_output=True, text=True, timeout=10,
-        )
+        result = None
+        for attempt in range(1, 6):
+            result = subprocess.run(
+                ['ros2', 'param', 'set', '/build_arena_map_server',
+                 'transfer.background_path', bg],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                break
+            self._log.info(
+                f"  ros2 param set attempt {attempt}/5 failed "
+                f"({result.stderr.strip()!r}), retrying …")
+            time.sleep(1.0)
         if result.returncode != 0:
             raise MissionAbortError(
-                f"Failed to set background_path: {result.stderr.strip()}")
+                f"Failed to set background_path after 5 attempts: "
+                f"{result.stderr.strip()}")
         self._log.info("╚══ Stage 18 OK: map_builder ready")
 
     def _stage_19_call_map_builder(self) -> OccupancyGrid:

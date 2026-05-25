@@ -65,6 +65,21 @@ orchestrator:
     amr_pose_topic: "/aruco/amr/pose"
     goal_pose_topic: "/aruco/goal/pose"
 
+  # ── trajectory_planner ──────────────────────────────────────────────────
+  trajectory_planner:
+    ready_topic: "/trajectory_planner/path"  # topic the node advertises on startup
+    ready_timeout_sec: 30.0
+
+  # ── map_fusion ──────────────────────────────────────────────────────────
+  map_fusion:
+    ready_topic: "/fusion/status"            # published immediately on node start
+    ready_timeout_sec: 30.0
+
+  # ── oradar lidar ────────────────────────────────────────────────────────
+  oradar:
+    scan_topic: "/scan"
+    ready_timeout_sec: 30.0
+
   # ── Arena marker localizer ───────────────────────────────────────────────
   marker_localizer:
     workspace_path: "/CHANGEME/path/to/workspace"  # Used to find default.yaml

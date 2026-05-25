@@ -48,6 +48,9 @@ class _OrchestratorUnderTest(TestableOrchestratorNode):
     def _stage_05_check_optitrack(self):
         pass
 
+    def _stage_05b_connect_tello_wifi(self):
+        pass
+
     def _stage_06_launch_tello_driver(self) -> None:
         self._log.info("╔══ Stage 06: [MOCK] tello_driver")
         self._processes['tello_driver'] = _FakeProc()

@@ -79,10 +79,17 @@ def make_test_config(tmp_path, overrides: Optional[dict] = None) -> str:
                 'ip': '127.0.0.1',
                 'user': 'test',
                 'password': 'test',
-                'amr_launch_cmd': 'echo PID:1234',
+                'amr_service': 'amr_bringup',
+                'amr_service_start_timeout_sec': 5.0,
                 'ping_count': 1,
                 'ping_timeout_sec': 1.0,
                 'ssh_connect_timeout_sec': 5.0,
+            },
+            'tello_wifi': {
+                'interface': 'wlx14ebb67dae0b',
+                'ssid': 'TELLO-594992',
+                'scan_retries': 1,
+                'connect_timeout_sec': 5.0,
             },
             'ekf': {
                 'topic': '/amr/ekf/odom',
@@ -114,6 +121,18 @@ def make_test_config(tmp_path, overrides: Optional[dict] = None) -> str:
             },
             'video': {
                 'file_appear_timeout_sec': 15.0,
+            },
+            'trajectory_planner': {
+                'ready_topic': '/trajectory_planner/path',
+                'ready_timeout_sec': 10.0,
+            },
+            'map_fusion': {
+                'ready_topic': '/fusion/status',
+                'ready_timeout_sec': 10.0,
+            },
+            'oradar': {
+                'scan_topic': '/scan',
+                'ready_timeout_sec': 10.0,
             },
             'aruco': {
                 'amr_marker_id': 0,
@@ -161,11 +180,26 @@ def _deep_merge(base: dict, override: dict) -> None:
 # SSH mock factory
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_ssh_mock(pid: int = 9999) -> MagicMock:
-    """Return a paramiko.SSHClient mock whose exec_command echoes a PID line."""
+def make_ssh_mock() -> MagicMock:
+    """Return a paramiko.SSHClient mock compatible with _ssh_run().
+
+    exec_command returns (stdin, stdout, stderr) where stdout exposes
+    .channel.recv_exit_status() → 0 and .read() → command-appropriate text.
+    systemctl is-active returns 'active'; all other commands return empty stdout.
+    """
     client = MagicMock()
     client.connect.return_value = None
-    stdout = MagicMock()
-    stdout.read.return_value = f'PID:{pid}\n'.encode()
-    client.exec_command.return_value = (MagicMock(), stdout, MagicMock())
+
+    def _make_out(text: str) -> MagicMock:
+        out = MagicMock()
+        out.channel.recv_exit_status.return_value = 0
+        out.read.return_value = text.encode()
+        return out
+
+    def _exec_side_effect(cmd: str):
+        if 'is-active' in cmd:
+            return MagicMock(), _make_out('active'), MagicMock()
+        return MagicMock(), _make_out(''), MagicMock()
+
+    client.exec_command.side_effect = _exec_side_effect
     return client

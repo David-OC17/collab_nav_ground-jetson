@@ -30,6 +30,9 @@ class _OrchestratorUnderTest(TestableOrchestratorNode):
     def _stage_04_wait_ekf_stable(self):
         pass
 
+    def _stage_05b_connect_tello_wifi(self):
+        pass
+
     def _stage_06_launch_tello_driver(self):
         pass
 

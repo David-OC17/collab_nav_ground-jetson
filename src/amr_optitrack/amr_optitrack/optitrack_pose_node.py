@@ -16,7 +16,7 @@ class OptiTrackPoseNode(Node):
     def __init__(self):
         super().__init__('optitrack_pose_node')
 
-        self.declare_parameter('vel_alpha', 0.3)
+        self.declare_parameter('vel_alpha', 0.1)
         self._alpha = self.get_parameter('vel_alpha').value
 
         self._last_msg  = None
@@ -55,7 +55,7 @@ class OptiTrackPoseNode(Node):
             return
 
         dt = now - self._last_time
-        if dt <= 0.0 or dt > 0.5:
+        if dt <= 0.005 or dt > 0.5:
             self._last_msg  = msg
             self._last_time = now
             return
