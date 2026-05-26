@@ -91,10 +91,9 @@ def make_test_config(tmp_path, overrides: Optional[dict] = None) -> str:
                 'scan_retries': 1,
                 'connect_timeout_sec': 5.0,
             },
-            'ekf': {
-                'topic': '/amr/ekf/odom',
-                'window_size': 5,
-                'velocity_threshold_mps': 0.05,
+            'imu': {
+                'topic': '/imu/data_raw',
+                'message_count': 10,
                 'timeout_sec': 10.0,
             },
             'optitrack': {

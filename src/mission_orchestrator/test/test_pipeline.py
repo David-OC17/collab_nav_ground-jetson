@@ -90,7 +90,7 @@ class _PipelineOrchestratorBase(TestableOrchestratorNode):
     def _stage_01_ping(self): pass
     def _stage_02_ssh_connect(self): pass
     def _stage_03_launch_amr(self): pass
-    def _stage_04_wait_ekf_stable(self): pass
+    def _stage_04_wait_imu_ready(self): pass
     def _stage_05_check_optitrack(self): pass
     def _stage_05b_connect_tello_wifi(self): pass
     def _stage_06_launch_tello_driver(self): pass

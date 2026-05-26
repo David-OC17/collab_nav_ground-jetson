@@ -1,30 +1,27 @@
 """
-RaspMockNode — publishes /amr/ekf/odom to simulate the AMR's EKF odometry.
+ImuMockNode — publishes /imu/data_raw to simulate the AMR's IMU.
 """
 
 from __future__ import annotations
 
-import rclpy
 from rclpy.node import Node
-from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 
 
-class RaspMockNode(Node):
+class ImuMockNode(Node):
     """
-    Publishes Odometry on /amr/ekf/odom at 10 Hz.
+    Publishes Imu on /imu/data_raw at 100 Hz.
 
-    velocity_mps: linear.x velocity to embed in each message.
-                  Set to 0.0 for a stable EKF; set above the threshold
-                  (default 0.05 m/s) to simulate an unstable EKF.
+    active: when False, no messages are published (simulates IMU not running).
     """
 
-    def __init__(self, velocity_mps: float = 0.0) -> None:
-        super().__init__('rasp_mock')
-        self._velocity = velocity_mps
-        self._pub = self.create_publisher(Odometry, '/amr/ekf/odom', 10)
-        self.create_timer(0.1, self._publish)
+    def __init__(self, active: bool = True) -> None:
+        super().__init__('imu_mock')
+        self._active = active
+        self._pub = self.create_publisher(Imu, '/imu/data_raw', 10)
+        self.create_timer(0.01, self._publish)  # 100 Hz
 
     def _publish(self) -> None:
-        msg = Odometry()
-        msg.twist.twist.linear.x = self._velocity
-        self._pub.publish(msg)
+        if not self._active:
+            return
+        self._pub.publish(Imu())

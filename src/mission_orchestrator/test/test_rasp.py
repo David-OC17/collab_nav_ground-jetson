@@ -1,7 +1,7 @@
 """
-Integration tests for mission_orchestrator stages 01-04 (Raspberry Pi + EKF).
+Integration tests for mission_orchestrator stages 01-04 (Raspberry Pi + IMU).
 
-The _OrchestratorUnderTest subclass no-ops stages 05-20 so only the rasp/EKF
+The _OrchestratorUnderTest subclass no-ops stages 05-20 so only the rasp/IMU
 pipeline runs.  External calls (subprocess ping, paramiko SSH) are patched.
 """
 
@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import paramiko
 
 from test.test_helpers import TestableOrchestratorNode, make_ssh_mock, make_test_config
-from test.mocks.rasp_mock import RaspMockNode
+from test.mocks.rasp_mock import ImuMockNode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ def _ping_fail(_cmd, **_kw):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_rasp_happy_path(executor, tmp_path):
-    """Stages 01-04 all succeed: ping OK, SSH OK, AMR launched, EKF stable."""
+    """Stages 01-04 all succeed: ping OK, SSH OK, AMR launched, IMU ready."""
     cfg = make_test_config(tmp_path)
     ssh_client = make_ssh_mock()
 
@@ -99,18 +99,18 @@ def test_rasp_happy_path(executor, tmp_path):
          patch('paramiko.SSHClient', return_value=ssh_client):
 
         node = _OrchestratorUnderTest(cfg)
-        rasp = RaspMockNode(velocity_mps=0.0)
+        imu = ImuMockNode(active=True)
         executor.add_node(node)
-        executor.add_node(rasp)
+        executor.add_node(imu)
         try:
             node.run()
             assert node.mission_complete, "Mission should complete when all stages succeed"
             assert not node.abort_called
         finally:
             executor.remove_node(node)
-            executor.remove_node(rasp)
+            executor.remove_node(imu)
             node.destroy_node()
-            rasp.destroy_node()
+            imu.destroy_node()
 
 
 def test_rasp_abort_ping_fails(executor, tmp_path):
@@ -150,43 +150,24 @@ def test_rasp_abort_ssh_auth_fails(executor, tmp_path):
             node.destroy_node()
 
 
-def test_rasp_abort_ekf_timeout(executor, tmp_path):
-    """Stage 04 fails: no EKF messages published → timeout → MissionAbortError."""
-    cfg = make_test_config(tmp_path, overrides={'ekf': {'timeout_sec': 2.0}})
+def test_rasp_abort_imu_timeout(executor, tmp_path):
+    """Stage 04 fails: no IMU messages published → timeout → MissionAbortError."""
+    cfg = make_test_config(tmp_path, overrides={'imu': {'timeout_sec': 2.0}})
     ssh_client = make_ssh_mock()
 
     with patch('subprocess.run', side_effect=_ping_ok), \
          patch('paramiko.SSHClient', return_value=ssh_client):
 
         node = _OrchestratorUnderTest(cfg)
+        imu = ImuMockNode(active=False)
         executor.add_node(node)
+        executor.add_node(imu)
         try:
             node.run()
-            assert node.abort_called, "Abort should be triggered when EKF times out"
+            assert node.abort_called, "Abort should be triggered when IMU times out"
             assert not node.mission_complete
         finally:
             executor.remove_node(node)
+            executor.remove_node(imu)
             node.destroy_node()
-
-
-def test_rasp_abort_ekf_unstable(executor, tmp_path):
-    """Stage 04 fails: EKF publishes high velocity, window never stabilises → timeout."""
-    cfg = make_test_config(tmp_path, overrides={'ekf': {'timeout_sec': 2.0}})
-    ssh_client = make_ssh_mock()
-
-    with patch('subprocess.run', side_effect=_ping_ok), \
-         patch('paramiko.SSHClient', return_value=ssh_client):
-
-        node = _OrchestratorUnderTest(cfg)
-        rasp = RaspMockNode(velocity_mps=1.0)  # 1.0 >> threshold 0.05
-        executor.add_node(node)
-        executor.add_node(rasp)
-        try:
-            node.run()
-            assert node.abort_called, "Abort should be triggered when EKF stays unstable"
-            assert not node.mission_complete
-        finally:
-            executor.remove_node(node)
-            executor.remove_node(rasp)
-            node.destroy_node()
-            rasp.destroy_node()
+            imu.destroy_node()

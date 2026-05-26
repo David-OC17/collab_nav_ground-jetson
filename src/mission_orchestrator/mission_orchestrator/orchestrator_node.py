@@ -8,7 +8,7 @@ Stages
  01  Ping Raspberry Pi
  02  SSH connect to Raspberry Pi
  03  Start amr_bringup systemd service on Raspberry Pi; verify active
- 04  Wait for stable /amr/ekf/odom  (sliding-window velocity < threshold)
+ 04  Wait for /imu/data_raw to publish 200 messages (IMU running at 100 Hz)
  05  Check /optitrack/rigid_body presence + header; launch client if absent
  05b Connect to Tello WiFi (nmcli scan + connect on wlx14ebb67dae0b)
  06  Launch tello_driver
@@ -33,7 +33,6 @@ trajectory_planner operate autonomously.
 
 from __future__ import annotations
 
-import collections
 import logging
 import math
 import os
@@ -61,8 +60,8 @@ from rclpy.qos import (
 )
 
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
-from nav_msgs.msg import OccupancyGrid, Odometry
-from sensor_msgs.msg import BatteryState, Image
+from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import BatteryState, Image, Imu
 from std_msgs.msg import Int32, String
 
 from arena_map_builder_msgs.action import BuildArenaMap
@@ -129,9 +128,8 @@ class MissionOrchestratorNode(Node):
         self._drone_aborted = False
 
         # ── ROS 2 sync primitives ──
-        self._ekf_stable_event = threading.Event()
-        self._ekf_window: collections.deque = collections.deque(
-            maxlen=self._cfg['ekf']['window_size'])
+        self._imu_ready_event = threading.Event()
+        self._imu_msg_count: int = 0
 
         self._optitrack_event = threading.Event()
         self._optitrack_last_msg: Optional[PoseStamped] = None
@@ -208,8 +206,8 @@ class MissionOrchestratorNode(Node):
             depth=10
         )
 
-        self.create_subscription(Odometry,
-            cfg['ekf']['topic'], self._ekf_cb, 10)
+        self.create_subscription(Imu,
+            cfg['imu']['topic'], self._imu_cb, 10)
         self.create_subscription(PoseStamped,
             cfg['optitrack']['topic'], self._optitrack_cb, qos)
         self.create_subscription(Int32,
@@ -243,16 +241,11 @@ class MissionOrchestratorNode(Node):
     # ROS 2 callbacks
     # ────────────────────────────────────────────────────────────────────────
 
-    def _ekf_cb(self, msg: Odometry) -> None:
-        vx = msg.twist.twist.linear.x
-        vy = msg.twist.twist.linear.y
-        vz = msg.twist.twist.linear.z
-        self._ekf_window.append(math.sqrt(vx * vx + vy * vy + vz * vz))
-        if (len(self._ekf_window) == self._ekf_window.maxlen
-                and not self._ekf_stable_event.is_set()):
-            mean_vel = sum(self._ekf_window) / len(self._ekf_window)
-            if mean_vel < self._cfg['ekf']['velocity_threshold_mps']:
-                self._ekf_stable_event.set()
+    def _imu_cb(self, _msg: Imu) -> None:
+        self._imu_msg_count += 1
+        if (self._imu_msg_count >= self._cfg['imu']['message_count']
+                and not self._imu_ready_event.is_set()):
+            self._imu_ready_event.set()
 
     def _optitrack_cb(self, msg: PoseStamped) -> None:
         with self._optitrack_lock:
@@ -470,15 +463,15 @@ class MissionOrchestratorNode(Node):
 
         self._log.info(f"╚══ Stage 03 OK: {svc} is active")
 
-    def _stage_04_wait_ekf_stable(self) -> None:
-        self._log.info("╔══ Stage 04: Waiting for stable /amr/ekf/odom")
-        timeout = self._cfg['ekf']['timeout_sec']
-        thr = self._cfg['ekf']['velocity_threshold_mps']
-        self._log.info(f"  Threshold: |v| < {thr} m/s over {self._cfg['ekf']['window_size']} samples")
-        if not self._ekf_stable_event.wait(timeout=timeout):
+    def _stage_04_wait_imu_ready(self) -> None:
+        n = self._cfg['imu']['message_count']
+        timeout = self._cfg['imu']['timeout_sec']
+        self._log.info(f"╔══ Stage 04: Waiting for {n} messages on {self._cfg['imu']['topic']}")
+        if not self._imu_ready_event.wait(timeout=timeout):
             raise MissionAbortError(
-                f"EKF did not stabilise within {timeout}s")
-        self._log.info("╚══ Stage 04 OK: EKF is stable")
+                f"IMU did not publish {n} messages within {timeout}s "
+                f"(received {self._imu_msg_count})")
+        self._log.info(f"╚══ Stage 04 OK: IMU ready ({self._imu_msg_count} messages received)")
 
     def _stage_05_check_optitrack(self) -> None:
         self._log.info("╔══ Stage 05: Check OptiTrack")
@@ -905,7 +898,7 @@ class MissionOrchestratorNode(Node):
             self._stage_01_ping()
             self._stage_02_ssh_connect()
             self._stage_03_launch_amr()
-            self._stage_04_wait_ekf_stable()
+            self._stage_04_wait_imu_ready()
             self._stage_05_check_optitrack()
             self._stage_05b_connect_tello_wifi()
             self._stage_06_launch_tello_driver()

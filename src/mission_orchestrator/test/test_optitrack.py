@@ -27,7 +27,7 @@ class _OrchestratorUnderTest(TestableOrchestratorNode):
     def _stage_03_launch_amr(self):
         pass
 
-    def _stage_04_wait_ekf_stable(self):
+    def _stage_04_wait_imu_ready(self):
         pass
 
     def _stage_05b_connect_tello_wifi(self):
