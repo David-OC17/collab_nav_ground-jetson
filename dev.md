@@ -1,12 +1,7 @@
 # LiDAR mapping - apt packages only
 
-Deviation LiDAR center to robot center (geometric)
-x - red: 7 cm
-y - green: 0 cm
-z - blue: 13 cm
-
 ```bash
-colcon build --symlink-install --packages-select amr_optitrack arena_map_builder_msgs  arena_marker_localizer_interfaces local_costmap odom_to_tf trajectory_planner arena_map_builder  arena_marker_localizer fixed_stamp_scan map_fusion oradar_lidar optitrack_client tello_driver tello_pos_control tello_msgs
+colcon build --symlink-install --packages-select amr_optitrack arena_map_builder_msgs  arena_marker_localizer_interfaces local_costmap trajectory_planner arena_map_builder  arena_marker_localizer map_fusion oradar_lidar optitrack_client tello_driver tello_pos_control tello_msgs
 ```
 
 In Jetson:

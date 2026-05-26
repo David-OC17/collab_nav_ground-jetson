@@ -15,17 +15,16 @@ orchestrator:
     ping_timeout_sec: 2.0                # Timeout per ping attempt
     ssh_connect_timeout_sec: 10.0
 
-  # ── EKF stability ───────────────────────────────────────────────────────
-  ekf:
-    topic: "/amr/ekf/odom"
-    window_size: 20                      # Sliding-window length (samples)
-    velocity_threshold_mps: 0.05        # Mean |v| below this → stable
-    timeout_sec: 120.0
+  # ── IMU readiness ───────────────────────────────────────────────────────
+  imu:
+    topic: "/imu/data_raw"
+    message_count: 200                  # Number of messages to wait for
+    timeout_sec: 30.0
 
   # ── OptiTrack ───────────────────────────────────────────────────────────
   optitrack:
     topic: "/optitrack/rigid_body"
-    expected_frame_id: "drone"           # header.frame_id must match this
+    expected_frame_id: "drone113"           # header.frame_id must match this
     max_stamp_age_sec: 1.0               # Message must be this fresh
     check_timeout_sec: 30.0             # How long to wait for a message
     retry_delay_sec: 3.0                 # Delay before re-checking after launching client
@@ -43,7 +42,7 @@ orchestrator:
     camera_topic: "/camera/image_raw"
     battery_topic: "/battery_state"
     cmd_vel_topic: "/cmd_vel"
-    battery_min_pct: 20.0               # Minimum battery % (0-100 scale)
+    battery_min_pct: 60.0               # Minimum battery % (0-100 scale)
     camera_timeout_sec: 30.0
     battery_timeout_sec: 10.0
     # State transition timeouts
@@ -51,6 +50,8 @@ orchestrator:
     state2_timeout_sec: 300.0           # Trajectory
     state3_timeout_sec: 30.0            # Going Back
     state4_timeout_sec: 60.0            # Landing
+    driver_startup_delay_sec: 30.0       # Fixed wait after tello_driver launch before preflight
+    land_wait_sec: 40.0                  # Time to keep tello_driver alive after /land is sent
     video_filename_topic: "/drone/video_filename"
     telemetry_filename_topic: "/drone/telemetry_filename"
 

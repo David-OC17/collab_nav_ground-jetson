@@ -59,7 +59,7 @@ from rclpy.qos import (
     HistoryPolicy,
 )
 
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import BatteryState, Image, Imu
 from std_msgs.msg import Int32, String
@@ -227,8 +227,6 @@ class MissionOrchestratorNode(Node):
             PoseWithCovarianceStamped, cfg['aruco']['amr_pose_topic'], latched)
         self._pub_aruco_goal = self.create_publisher(
             PoseWithCovarianceStamped, cfg['aruco']['goal_pose_topic'], latched)
-        self._pub_cmd_vel = self.create_publisher(
-            Twist, cfg['drone']['cmd_vel_topic'], 10)
         self._pub_drone_map = self.create_publisher(
             OccupancyGrid, cfg['map_builder']['drone_map_topic'], latched)
 
@@ -345,27 +343,32 @@ class MissionOrchestratorNode(Node):
     # Abort helpers
     # ────────────────────────────────────────────────────────────────────────
 
-    def _publish_cmd_vel_zero(self, repeat: int = 10) -> None:
-        zero = Twist()
-        for _ in range(repeat):
-            self._pub_cmd_vel.publish(zero)
-            time.sleep(0.05)
-
     def _abort_drone(self) -> None:
-        """Emergency drone land sequence."""
+        """Safe drone land sequence: stop controller → /land → wait → kill driver."""
         if self._drone_aborted:
             return
         self._drone_aborted = True
         self._log.warning("══ DRONE ABORT SEQUENCE ══")
 
-        self._log.info("  Publishing zero cmd_vel …")
-        self._publish_cmd_vel_zero()
-
         self._log.info("  Killing tello_map (tello_controller) …")
         _kill_proc(self._processes.get('tello_map'), 'tello_map', self._log)
 
-        self._log.info("  Waiting 5 s before killing tello_driver …")
-        time.sleep(5.0)
+        # Publish /land via subprocess — avoids dependency on ROS context validity
+        self._log.info("  Sending /land command …")
+        try:
+            subprocess.run(
+                ['ros2', 'topic', 'pub', '-1', '-w', '1',
+                 '/land', 'std_msgs/msg/Empty', '{}'],
+                timeout=10.0,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self._log.info("  /land sent.")
+        except subprocess.TimeoutExpired:
+            self._log.warning("  /land publish timed out (tello_driver may already be down)")
+
+        land_wait = float(self._cfg['drone'].get('land_wait_sec', 30.0))
+        self._log.info(f"  Keeping tello_driver alive for {land_wait}s while drone lands …")
+        time.sleep(land_wait)
 
         self._log.info("  Killing tello_driver …")
         _kill_proc(self._processes.get('tello_driver'), 'tello_driver', self._log)
@@ -575,6 +578,9 @@ class MissionOrchestratorNode(Node):
         )
         self._processes['tello_driver'] = proc
         self._log.info(f"  tello_driver launched (pid={proc.pid})")
+        delay = float(self._cfg['drone'].get('driver_startup_delay_sec', 15.0))
+        self._log.info(f"  Waiting {delay}s for tello_driver to finish configuring …")
+        time.sleep(delay)
         self._log.info("╚══ Stage 06 OK")
 
     def _stage_07_drone_preflight(self) -> None:
