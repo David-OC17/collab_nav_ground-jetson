@@ -63,6 +63,7 @@ import os
 import cv2
 import numpy as np
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Generator, List, Optional, Tuple
 
@@ -1537,6 +1538,8 @@ class MapReconstructor:
         actual Python-visible memory is flat.
         """
         import gc
+        import queue as _queue
+        import threading
         import ctypes, sys
 
         def _trim_allocator():
@@ -1548,176 +1551,54 @@ class MapReconstructor:
                     pass
 
         gc_interval = 50   # trim every N frames processed (placed or not)
+        _DONE = object()   # sentinel: producer signals end-of-stream
+        prefetch_q: _queue.Queue = _queue.Queue(maxsize=2)
 
-        for i, frame in enumerate(stream_frames(video_path, extract_cfg, verbose), 1):
-            self.add_frame(frame, verbose=verbose)
+        def _producer():
+            try:
+                for frame in stream_frames(video_path, extract_cfg, verbose):
+                    # verbose=False: skip messages would interleave with consumer output
+                    prefetch_q.put(self._preprocess_frame(frame, verbose=False))
+            except Exception as exc:
+                prefetch_q.put(exc)
+            finally:
+                prefetch_q.put(_DONE)
+
+        producer_thread = threading.Thread(target=_producer, daemon=True)
+        producer_thread.start()
+
+        i = 0
+        while True:
+            item = prefetch_q.get()
+            if item is _DONE:
+                break
+            if isinstance(item, Exception):
+                producer_thread.join()
+                raise item
+            i += 1
+            if item is None:
+                # _preprocess_frame skipped this frame (bad keypoints / spread)
+                self._n_failed += 1
+            else:
+                self._place_frame(item, verbose=verbose)
             if verbose and i % 50 == 0:
                 print(f"  [frame {i}]  {self.stats}")
             if i % gc_interval == 0:
                 gc.collect()
                 _trim_allocator()
 
+        producer_thread.join()
+
     def add_frame(self, img: np.ndarray, verbose: bool = False) -> bool:
         """
         Attempt to place `img` onto the map canvas.
         Returns True if placed, False if alignment failed (frame is skipped).
         """
-        # ── optional downscale ───────────────────────────────────────────────
-        if self.cfg.processing_scale != 1.0:
-            s = self.cfg.processing_scale
-            nw = max(1, int(img.shape[1] * s))
-            nh = max(1, int(img.shape[0] * s))
-            img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
-
-        # ── colour masking (pre-stitch) ──────────────────────────────────────
-        # img_stitch has the masked colours replaced (e.g. yellow → white).
-        # img is kept unmasked so that keypoint detection uses the full
-        # original appearance, preserving homography quality.
-        img_stitch = _apply_color_masks(img, self.cfg.color_masks)
-
-        h, w = img.shape[:2]
-
-        # ── feature-detection mask (excludes repetitive structures) ──────────
-        # Pixels matching feature_exclude_hsv are NOT eligible for keypoint
-        # detection.  This forces SIFT onto unique scene content (object
-        # edges, corners) rather than the repetitive grid intersections that
-        # produced ambiguous matches and drift in the original pipeline.
-        feat_mask = _make_feature_mask(
-            img,
-            self.cfg.feature_exclude_hsv,
-            dilate_px=self.cfg.feature_exclude_dilate_px,
-        )
-        kp, des = _kp_des(self.detector, img, mask=feat_mask)
-        if feat_mask is not None:
-            del feat_mask
-        if des is None or len(kp) < 8:
-            self._n_failed += 1
-            if verbose:
-                print(f"  [skip] insufficient keypoints (n={0 if kp is None else len(kp)})")
-            return False
-
-        # ── spatial-spread gate (rejects clustered-keypoint frames) ──────────
-        if self.cfg.min_keypoint_bins > 0:
-            ok, reason = _keypoint_spread_ok(
-                kp, w, h, bins=8, min_filled=self.cfg.min_keypoint_bins
-            )
-            if not ok:
-                self._n_failed += 1
-                if verbose:
-                    print(f"  [skip:spread] {reason}")
-                return False
-
-        # ── blue grid intersection detection ─────────────────────────────────
-        # Detect once per frame and cache alongside SIFT features.
-        # Falls back gracefully to None if the grid isn't visible —
-        # _pairwise_H skips Stage 2 when grid_pts is None.
-        grid_pts: Optional[np.ndarray] = None
-        if self.cfg.use_grid_intersections:
-            grid_pts = detect_blue_grid_intersections(
-                img,
-                h_lo=self.cfg.grid_hsv_h_lo,
-                h_hi=self.cfg.grid_hsv_h_hi,
-                s_lo=self.cfg.grid_hsv_s_lo,
-                v_lo=self.cfg.grid_hsv_v_lo,
-            )
-            if len(grid_pts) == 0:
-                grid_pts = None   # normalise "no intersections" to None
-            elif verbose:
-                print(f"  [grid] {len(grid_pts)} intersections detected")
-
-        # ── first frame: initialise canvas ──────────────────────────────────
-        if self._canvas is None:
-            m = self.cfg.canvas_margin
-            if self.cfg.max_canvas_px > 0:
-                # Pre-allocate the full canvas upfront.  The first frame is
-                # placed at the centre so the drone has equal room in all
-                # directions without any reallocation.
-                cap_px = self.cfg.max_canvas_px
-                cx = (cap_px - w) // 2
-                cy = (cap_px - h) // 2
-                H0 = np.array([[1, 0, cx], [0, 1, cy], [0, 0, 1]], dtype=np.float64)
-                self._canvas = np.zeros((cap_px, cap_px, 3), dtype=np.uint8)
-                print(f"  Canvas pre-allocated: {cap_px}×{cap_px} px  "
-                      f"({cap_px*cap_px*3/1_048_576:.0f} MB)  "
-                      f"first frame offset=({cx},{cy})")
-            else:
-                # Dynamic allocation (original behaviour): start small,
-                # expand on overflow (causes double-canvas spikes).
-                H0 = np.array([[1, 0, m], [0, 1, m], [0, 0, 1]], dtype=np.float64)
-                self._canvas = np.zeros((h + 2 * m, w + 2 * m, 3), dtype=np.uint8)
-            self._warp_and_blend_roi(img_stitch, H0)
-            self._register(kp, des, H0, grid_pts=grid_pts)
-            self._n_placed = 1
-            return True
-
-        # ── match against recent frames + keyframes ──────────────────────────
-        lookback = min(self.cfg.lookback, len(self._recent))
-        candidates = self._recent[-lookback:] + self._keyframes
-
-        canvas_h_px, canvas_w_px = self._canvas.shape[:2]
-        # Allow overflow up to one frame diagonal on each side.
-        # Larger overflows indicate a degenerate composed H, not a legitimate
-        # slightly-out-of-bounds frame.
-        max_overflow = int(math.hypot(w, h))
-
-        best_H, best_n = None, 0
-        for ref in candidates:
-            H_pair, n_in = _pairwise_H(
-                (ref["kp"], ref["des"]),
-                (kp, des),
-                self.norm,
-                w,
-                h,
-                match_ratio=self.cfg.match_ratio,
-                mad_factor=self.cfg.mad_factor,
-                # ── grid refinement args ──────────────────────────────────
-                grid_pts_ref=ref.get("grid_pts"),
-                grid_pts_cur=grid_pts,
-                grid_match_dist=self.cfg.grid_match_dist,
-                grid_min_matches=self.cfg.grid_min_intersections,
-            )
-            if H_pair is None or n_in <= best_n:
-                continue
-
-            # Compose into canvas coordinates and validate the RESULT.
-            # H_pair can look fine individually while ref["H"] @ H_pair is
-            # degenerate due to accumulated drift in ref["H"].
-            composed = ref["H"] @ H_pair
-            ok, reason = _validate_composed_H(
-                composed, w, h, canvas_h_px, canvas_w_px, max_overflow
-            )
-            if not ok:
-                if verbose:
-                    print(f"  [reject_composed] {reason} (n_in={n_in})")
-                continue
-
-            best_H = composed
-            best_n = n_in
-
-        if best_H is None or best_n < self.cfg.min_inliers:
-            self._n_failed += 1
-            if verbose:
-                print(
-                    f"  [skip] #{self._n_placed + self._n_failed}: "
-                    f"no reliable H (best_n={best_n})"
-                )
-            return False
-
-        # ── grow canvas if frame falls outside ──────────────────────────────
-        result_H = self._expand_canvas(img, best_H)
-        if result_H is None:
-            # _expand_canvas rejected the frame (degenerate overflow).
-            # Count as failed and do not register the homography so the
-            # corrupt ref["H"] chain is not propagated to future frames.
+        prep = self._preprocess_frame(img, verbose=verbose)
+        if prep is None:
             self._n_failed += 1
             return False
-        best_H = result_H
-
-        # ── warp and blend (ROI only — the key memory fix) ──────────────────
-        self._warp_and_blend_roi(img_stitch, best_H)
-        self._n_placed += 1
-        self._register(kp, des, best_H, grid_pts=grid_pts)
-        return True
+        return self._place_frame(prep, verbose=verbose)
 
     def get_map(
         self,
@@ -1775,6 +1656,168 @@ class MapReconstructor:
         }
 
     # ── private helpers ──────────────────────────────────────────────────────
+
+    def _preprocess_frame(
+        self, img: np.ndarray, verbose: bool = False
+    ) -> Optional[dict]:
+        """Preprocessing phase: downscale, feature detection, grid intersections.
+
+        Returns a prep dict consumed by _place_frame, or None if the frame
+        should be skipped.  Thread-safe: reads only self.cfg and self.detector,
+        both of which are immutable after __init__.
+        """
+        if self.cfg.processing_scale != 1.0:
+            s = self.cfg.processing_scale
+            nw = max(1, int(img.shape[1] * s))
+            nh = max(1, int(img.shape[0] * s))
+            img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+
+        # img_stitch has masked colours replaced (e.g. yellow → white).
+        # img is kept unmasked so keypoint detection uses the full appearance.
+        img_stitch = _apply_color_masks(img, self.cfg.color_masks)
+        h, w = img.shape[:2]
+
+        feat_mask = _make_feature_mask(
+            img,
+            self.cfg.feature_exclude_hsv,
+            dilate_px=self.cfg.feature_exclude_dilate_px,
+        )
+        kp, des = _kp_des(self.detector, img, mask=feat_mask)
+        if feat_mask is not None:
+            del feat_mask
+        if des is None or len(kp) < 8:
+            if verbose:
+                print(f"  [skip] insufficient keypoints (n={0 if kp is None else len(kp)})")
+            return None
+
+        if self.cfg.min_keypoint_bins > 0:
+            ok, reason = _keypoint_spread_ok(
+                kp, w, h, bins=8, min_filled=self.cfg.min_keypoint_bins
+            )
+            if not ok:
+                if verbose:
+                    print(f"  [skip:spread] {reason}")
+                return None
+
+        grid_pts: Optional[np.ndarray] = None
+        if self.cfg.use_grid_intersections:
+            grid_pts = detect_blue_grid_intersections(
+                img,
+                h_lo=self.cfg.grid_hsv_h_lo,
+                h_hi=self.cfg.grid_hsv_h_hi,
+                s_lo=self.cfg.grid_hsv_s_lo,
+                v_lo=self.cfg.grid_hsv_v_lo,
+            )
+            if len(grid_pts) == 0:
+                grid_pts = None
+            elif verbose:
+                print(f"  [grid] {len(grid_pts)} intersections detected")
+
+        return {
+            "img_stitch": img_stitch,
+            "kp": kp,
+            "des": des,
+            "grid_pts": grid_pts,
+            "h": h,
+            "w": w,
+        }
+
+    def _place_frame(self, prep: dict, verbose: bool = False) -> bool:
+        """Placement phase: first-frame init, parallel candidate matching, warp+blend.
+
+        Must be called from the main thread — mutates self._canvas, self._recent,
+        self._keyframes, and the placement/failure counters.
+        """
+        img_stitch = prep["img_stitch"]
+        kp         = prep["kp"]
+        des        = prep["des"]
+        grid_pts   = prep["grid_pts"]
+        h, w       = prep["h"], prep["w"]
+
+        # ── first frame: initialise canvas ──────────────────────────────────
+        if self._canvas is None:
+            m = self.cfg.canvas_margin
+            if self.cfg.max_canvas_px > 0:
+                cap_px = self.cfg.max_canvas_px
+                cx = (cap_px - w) // 2
+                cy = (cap_px - h) // 2
+                H0 = np.array([[1, 0, cx], [0, 1, cy], [0, 0, 1]], dtype=np.float64)
+                self._canvas = np.zeros((cap_px, cap_px, 3), dtype=np.uint8)
+                print(f"  Canvas pre-allocated: {cap_px}×{cap_px} px  "
+                      f"({cap_px*cap_px*3/1_048_576:.0f} MB)  "
+                      f"first frame offset=({cx},{cy})")
+            else:
+                H0 = np.array([[1, 0, m], [0, 1, m], [0, 0, 1]], dtype=np.float64)
+                self._canvas = np.zeros((h + 2 * m, w + 2 * m, 3), dtype=np.uint8)
+            self._warp_and_blend_roi(img_stitch, H0)
+            self._register(kp, des, H0, grid_pts=grid_pts)
+            self._n_placed = 1
+            return True
+
+        # ── match against recent frames + keyframes (parallel) ───────────────
+        lookback = min(self.cfg.lookback, len(self._recent))
+        candidates = self._recent[-lookback:] + self._keyframes
+
+        canvas_h_px, canvas_w_px = self._canvas.shape[:2]
+        # Allow overflow up to one frame diagonal on each side.
+        max_overflow = int(math.hypot(w, h))
+
+        def _match_candidate(ref):
+            H_pair, n_in = _pairwise_H(
+                (ref["kp"], ref["des"]),
+                (kp, des),
+                self.norm,
+                w, h,
+                match_ratio=self.cfg.match_ratio,
+                mad_factor=self.cfg.mad_factor,
+                grid_pts_ref=ref.get("grid_pts"),
+                grid_pts_cur=grid_pts,
+                grid_match_dist=self.cfg.grid_match_dist,
+                grid_min_matches=self.cfg.grid_min_intersections,
+            )
+            if H_pair is None:
+                return None, 0, None
+            composed = ref["H"] @ H_pair
+            ok, reason = _validate_composed_H(
+                composed, w, h, canvas_h_px, canvas_w_px, max_overflow
+            )
+            if not ok:
+                return None, n_in, reason
+            return composed, n_in, None
+
+        best_H, best_n = None, 0
+        with ThreadPoolExecutor(max_workers=max(1, len(candidates))) as pool:
+            for composed, n_in, reject_reason in pool.map(_match_candidate, candidates):
+                if composed is None:
+                    if verbose and reject_reason is not None:
+                        print(f"  [reject_composed] {reject_reason} (n_in={n_in})")
+                    continue
+                if n_in > best_n:
+                    best_H = composed
+                    best_n = n_in
+
+        if best_H is None or best_n < self.cfg.min_inliers:
+            self._n_failed += 1
+            if verbose:
+                print(
+                    f"  [skip] #{self._n_placed + self._n_failed}: "
+                    f"no reliable H (best_n={best_n})"
+                )
+            return False
+
+        # ── grow canvas if frame falls outside ──────────────────────────────
+        result_H = self._expand_canvas(img_stitch, best_H)
+        if result_H is None:
+            # _expand_canvas rejected the frame (degenerate overflow).
+            self._n_failed += 1
+            return False
+        best_H = result_H
+
+        # ── warp and blend (ROI only) ────────────────────────────────────────
+        self._warp_and_blend_roi(img_stitch, best_H)
+        self._n_placed += 1
+        self._register(kp, des, best_H, grid_pts=grid_pts)
+        return True
 
     def _register(
         self,
