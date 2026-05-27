@@ -66,6 +66,13 @@ import math
 from dataclasses import dataclass, field
 from typing import Generator, List, Optional, Tuple
 
+# ── GPU warp backend (checked once at import time) ────────────────────────────
+try:
+    _CUDA_AVAILABLE = cv2.cuda.getCudaEnabledDeviceCount() > 0
+except (cv2.error, AttributeError):
+    _CUDA_AVAILABLE = False
+print(f"[drone_map] warp backend: {'CUDA (GPU)' if _CUDA_AVAILABLE else 'CPU'}")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Shared low-level helpers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1940,7 +1947,14 @@ class MapReconstructor:
         H_roi = T_shift @ H
 
         # ── warp only into the ROI — frame-sized, not canvas-sized ───────────
-        warped_roi = cv2.warpPerspective(img, H_roi, (roi_w, roi_h))
+        if _CUDA_AVAILABLE:
+            _gpu_src = cv2.cuda_GpuMat()
+            _gpu_src.upload(img)
+            warped_roi = cv2.cuda.warpPerspective(
+                _gpu_src, H_roi.astype(np.float32), (roi_w, roi_h)
+            ).download()
+        else:
+            warped_roi = cv2.warpPerspective(img, H_roi, (roi_w, roi_h))
         mask_new = warped_roi.sum(axis=2) > 0
 
         # ── blend directly into the canvas slice ─────────────────────────────

@@ -37,6 +37,7 @@ internals or modifies them.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from typing import List, Optional, Tuple
 
@@ -327,6 +328,8 @@ def compute_consistency(
         The full stages dict from the bbox-mode pass (so the caller has
         the cleaned image, masks, etc., for downstream debug).
     """
+    from .processing.transfer_obstacles import extract_blobs, build_clean_masks
+
     cons_cfg = cons_cfg or ConsistencyConfig()
     base_cfg = _ensure_grid_safe_colors(base_cfg)
 
@@ -334,54 +337,66 @@ def compute_consistency(
         if progress_cb is not None:
             progress_cb(stage, frac, msg)
 
-    # ── Pass 1: bbox mode (the reference projection) ────────────────────
-    _emit("consistency", 0.05, "Pass 1/3: bbox-mode projection")
+    # ── Build all four pass configs upfront ─────────────────────────────
     cfg_bbox = replace(base_cfg, project_mode="bbox")
-    final_bbox, stages_bbox = run_pipeline(
-        reconstructed_path, background_path,
-        cfg=cfg_bbox, verbose=verbose,
-    )
-
-    # ── Pass 2: grid mode (independent projection) ──────────────────────
-    _emit("consistency", 0.40, "Pass 2/3: grid-mode projection")
     cfg_grid = replace(base_cfg, project_mode="grid")
-    _final_grid, stages_grid = run_pipeline(
-        reconstructed_path, background_path,
-        cfg=cfg_grid, verbose=verbose,
-    )
-
-    # ── Pass 3 + 4: perturbation passes ─────────────────────────────────
     base_iters = base_cfg.close_iterations
     perturb_iters = [
         max(0, base_iters + cons_cfg.close_iters_perturbation[0]),
         base_iters + cons_cfg.close_iters_perturbation[1],
     ]
-    perturb_blobs: List[List[Blob]] = []
-    for k, it in enumerate(perturb_iters):
-        _emit("consistency", 0.60 + 0.15 * k,
-              f"Pass {3 + k}/4: perturbation close_iters={it}")
-        cfg_p = replace(base_cfg, project_mode="bbox", close_iterations=it)
-        _f, stages_p = run_pipeline(
-            reconstructed_path, background_path,
-            cfg=cfg_p, verbose=verbose,
-        )
-        # Re-use stages_p's blob overlay rather than re-extracting — but
-        # the stages dict only stores the overlay image, not the Blob
-        # objects themselves. We need them, so do one more extraction
-        # against the perturbed cleaned mask.
-        from .processing.transfer_obstacles import extract_blobs, build_clean_masks
-        pink, _green = build_clean_masks(stages_p["wall_masked"], cfg_p,
-                                         verbose=False)
-        perturb_blobs.append(extract_blobs(pink, cfg_p, verbose=False))
+    cfg_perturb = [
+        replace(base_cfg, project_mode="bbox", close_iterations=it)
+        for it in perturb_iters
+    ]
+    all_cfgs = [cfg_bbox, cfg_grid] + cfg_perturb
+    pass_labels = [
+        "bbox",
+        "grid",
+        f"perturb(close_iters={perturb_iters[0]})",
+        f"perturb(close_iters={perturb_iters[1]})",
+    ]
 
-    # ── Recover Blob lists from bbox and grid passes the same way ──────
-    from .processing.transfer_obstacles import extract_blobs, build_clean_masks
-    pink_bbox, _ = build_clean_masks(stages_bbox["wall_masked"], cfg_bbox,
-                                     verbose=False)
-    blobs_bbox = extract_blobs(pink_bbox, cfg_bbox, verbose=False)
-    pink_grid, _ = build_clean_masks(stages_grid["wall_masked"], cfg_grid,
-                                     verbose=False)
-    blobs_grid = extract_blobs(pink_grid, cfg_grid, verbose=False)
+    # ── Run all passes in parallel ───────────────────────────────────────
+    _emit("consistency", 0.05, "Running 4 passes in parallel")
+    if verbose:
+        print(f"[consistency] Running {len(all_cfgs)} passes in parallel...")
+
+    pipeline_results: List = [None] * len(all_cfgs)
+
+    def _run_pass(idx: int):
+        result = run_pipeline(
+            reconstructed_path, background_path,
+            cfg=all_cfgs[idx], verbose=False,
+        )
+        if verbose:
+            print(f"[consistency]   pass '{pass_labels[idx]}' done")
+        return idx, result
+
+    with ThreadPoolExecutor(max_workers=len(all_cfgs)) as pool:
+        futures = {pool.submit(_run_pass, i): i for i in range(len(all_cfgs))}
+        for fut in as_completed(futures):
+            idx, result = fut.result()
+            pipeline_results[idx] = result
+
+    final_bbox,  stages_bbox  = pipeline_results[0]
+    _final_grid, stages_grid  = pipeline_results[1]
+
+    # ── Extract blobs from each pass result ─────────────────────────────
+    if verbose:
+        print("[consistency] Extracting blobs...")
+
+    pink_bbox, _ = build_clean_masks(stages_bbox["wall_masked"], cfg_bbox, verbose=False)
+    blobs_bbox   = extract_blobs(pink_bbox, cfg_bbox, verbose=False)
+
+    pink_grid, _ = build_clean_masks(stages_grid["wall_masked"], cfg_grid, verbose=False)
+    blobs_grid   = extract_blobs(pink_grid, cfg_grid, verbose=False)
+
+    perturb_blobs: List[List[Blob]] = []
+    for k, cfg_p in enumerate(cfg_perturb):
+        _, stages_p = pipeline_results[2 + k]
+        pink, _ = build_clean_masks(stages_p["wall_masked"], cfg_p, verbose=False)
+        perturb_blobs.append(extract_blobs(pink, cfg_p, verbose=False))
 
     # Filter to only the obstacles that were actually drawn in bbox mode
     # (i.e. not 'unknown' and not dropped by drop_unknown).
@@ -392,6 +407,9 @@ def compute_consistency(
     ]
 
     # ── Build the per-obstacle records and score them ───────────────────
+    _emit("consistency", 0.80, "Scoring obstacles")
+    if verbose:
+        print("[consistency] Scoring obstacles...")
     cell_w = _estimate_cell_width_px(stages_bbox)
     max_match_dist = cell_w * 1.5   # be lenient when matching across passes
 
@@ -495,4 +513,6 @@ def compute_consistency(
         obstacles.append(rec)
 
     _emit("consistency", 1.0, f"Scored {len(obstacles)} obstacle(s)")
+    if verbose:
+        print(f"[consistency] Done — scored {len(obstacles)} obstacle(s)")
     return final_bbox, obstacles, stages_bbox

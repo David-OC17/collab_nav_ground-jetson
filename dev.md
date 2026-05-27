@@ -71,16 +71,16 @@ ros2 param set /build_arena_map_server transfer.background_path /abs/path/backgr
 python3 src/arena_map_builder/arena_map_builder/example_client.py /abs/path/video.mp4
 ```
 
-## Arena marker localizer
+## Arena marker localizer   
 
-```bash
+```bash\
 # Terminal 1
 source install/setup.sh
 
 # Pass yaml file explicitly, currently not finding default.yaml on its own
 WS_YAML=$(find /path/to/workspace -name "default.yaml" -path "*arena_marker_localizer*" -not -path "*build*" | head -1)
 echo "Using YAML: $WS_YAML"
-ros2 launch arena_marker_localizer marker_localizer.launch.py params_file:=$WS_YAML
+
 
 # Terminal 2
 source install/setup.sh
