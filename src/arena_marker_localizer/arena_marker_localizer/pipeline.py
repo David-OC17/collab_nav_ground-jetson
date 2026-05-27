@@ -16,6 +16,9 @@ End-to-end Python pipeline:
 
 from __future__ import annotations
 
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -91,6 +94,17 @@ class PipelineConfig:
     resolution_m_per_cell: float = 0.05
     grid_width_cells:  int = 80
     grid_height_cells: int = 80
+
+    # ── Parallel processing ───────────────────────────────────────────
+    max_workers: int = 4
+    """Number of parallel threads for frame processing. Each thread
+    holds its own MultiDictDetector instance. Set to 1 to disable
+    parallelism (useful for debugging)."""
+
+    frame_stride: int = 1
+    """Process every Nth video frame. 1 = every frame. 2 = every other
+    frame (halves the workload at 30 fps, still yields ample observations
+    for aggregation at min_observations=50)."""
 
     # ── Diagnostics ────────────────────────────────────────────────────
     verbose: bool = False
@@ -193,55 +207,93 @@ def run_pipeline(
         raise IOError(f"Cannot open video: {video_path!r}")
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    detector = MultiDictDetector(cfg.dictionaries)
-    observations: Dict[int, _MarkerObservations] = {}
-    dict_name_by_id: Dict[int, str] = {}
+    # ── Thread-local detector: one MultiDictDetector per worker thread ──
+    # ArucoDetector has internal mutable buffers; sharing across threads
+    # is unsafe. Each thread creates its own instance on first use.
+    _tl = threading.local()
 
-    stats = dict(read=0, quality_fail=0, no_marker=0, accepted=0,
-                 csv_short=0, pnp_fail=0)
+    def _get_detector() -> MultiDictDetector:
+        if not hasattr(_tl, "det"):
+            _tl.det = MultiDictDetector(cfg.dictionaries)
+        return _tl.det
 
-    for i in range(n_total):
-        ok, frame = cap.read()
-        if not ok:
-            break
-        stats["read"] += 1
-
-        if i >= len(drone_poses):
-            stats["csv_short"] += 1
-            continue
-        dp = drone_poses[i]
-
+    def _process_frame(frame: np.ndarray, dp: DronePose) -> dict:
         passed, _blur, _art = frame_passes(frame, cfg.quality)
         if not passed:
-            stats["quality_fail"] += 1
-            continue
+            return {"kind": "quality_fail"}
 
-        detections = detector.detect(frame, intrinsics)
+        detections = _get_detector().detect(frame, intrinsics)
         if not detections:
-            stats["no_marker"] += 1
-            continue
+            return {"kind": "no_marker"}
 
-        # Build T_opti_from_drone for this frame.
         T_opti_drone = opti_transform_from_pose(
             dp.pos_xyz, dp.yaw_rad, cfg.optitrack_axis,
         )
-
+        obs_list = []
+        n_pnp_fail = 0
         for det in detections:
             if det.reproj_err > cfg.max_reproj_err_px:
-                stats["pnp_fail"] += 1
+                n_pnp_fail += 1
                 continue
-
             T_map_marker = marker_in_map(
                 det.T_cam_marker, T_opti_drone,
                 T_drone_from_cam, T_map_from_opti,
             )
-            pos = T_map_marker[:3, 3]
+            pos = T_map_marker[:3, 3].copy()
             _r, _p, yaw = R_to_euler_zyx(T_map_marker[:3, :3])
+            obs_list.append((det.marker_id, pos, yaw, det.dict_name))
 
-            obs = observations.setdefault(det.marker_id, _MarkerObservations())
-            obs.add(pos, yaw, det.dict_name, cfg.max_obs_per_marker)
-            dict_name_by_id[det.marker_id] = det.dict_name
-            stats["accepted"] += 1
+        if obs_list:
+            return {"kind": "detected", "obs": obs_list, "pnp_fail": n_pnp_fail}
+        return {"kind": "no_marker", "pnp_fail": n_pnp_fail}
+
+    observations: Dict[int, _MarkerObservations] = {}
+    dict_name_by_id: Dict[int, str] = {}
+    stats = dict(read=0, quality_fail=0, no_marker=0, accepted=0,
+                 csv_short=0, pnp_fail=0)
+
+    n_workers = max(1, cfg.max_workers)
+    max_inflight = n_workers * 2     # bound frames held in memory
+    stride = max(1, cfg.frame_stride)
+    pending: List[Future] = []
+
+    def _drain_one() -> None:
+        result = pending.pop(0).result()
+        kind = result["kind"]
+        if kind == "quality_fail":
+            stats["quality_fail"] += 1
+        elif kind == "no_marker":
+            stats["no_marker"] += 1
+            stats["pnp_fail"] += result.get("pnp_fail", 0)
+        else:
+            stats["pnp_fail"] += result.get("pnp_fail", 0)
+            for marker_id, pos, yaw, dict_name in result["obs"]:
+                obs = observations.setdefault(marker_id, _MarkerObservations())
+                obs.add(pos, yaw, dict_name, cfg.max_obs_per_marker)
+                dict_name_by_id[marker_id] = dict_name
+                stats["accepted"] += 1
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for i in range(n_total):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            stats["read"] += 1
+
+            if i >= len(drone_poses):
+                stats["csv_short"] += 1
+                continue
+
+            if stride > 1 and i % stride != 0:
+                continue
+
+            while len(pending) >= max_inflight:
+                _drain_one()
+
+            pending.append(pool.submit(_process_frame, frame, drone_poses[i]))
+
+        while pending:
+            _drain_one()
 
     cap.release()
 

@@ -65,9 +65,14 @@ def dct_artifact_ratio(gray: np.ndarray, block: int = 8) -> float:
 
 def frame_passes(frame_bgr: np.ndarray, cfg: QualityConfig
                  ) -> Tuple[bool, float, float]:
-    """Return (ok, blur_score, artifact_score)."""
+    """Return (ok, blur_score, artifact_score).
+
+    artifact_score is -1.0 when the blur gate already rejected the frame
+    (the more expensive Sobel-based check is skipped in that case).
+    """
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    blur     = laplacian_variance(gray)
+    blur = laplacian_variance(gray)
+    if blur < cfg.blur_thresh:
+        return False, blur, -1.0
     artifact = dct_artifact_ratio(gray)
-    ok = (blur >= cfg.blur_thresh) and (artifact <= cfg.artifact_thresh)
-    return ok, blur, artifact
+    return artifact <= cfg.artifact_thresh, blur, artifact

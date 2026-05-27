@@ -72,6 +72,7 @@ class MultiDictDetector:
 
         self._detectors = []   # one per dict (for the modern API)
         self._legacy_dicts = []
+        self._obj_pts: List[np.ndarray] = []
         for dc in self._dicts:
             d = cv2.aruco.getPredefinedDictionary(aruco_dict_id(dc.name))
             if self._has_new_api:
@@ -80,6 +81,13 @@ class MultiDictDetector:
                 self._detectors.append(detector)
             else:
                 self._legacy_dicts.append(d)
+            half = dc.marker_size_m / 2.0
+            self._obj_pts.append(np.array([
+                [-half,  half, 0.0],
+                [ half,  half, 0.0],
+                [ half, -half, 0.0],
+                [-half, -half, 0.0],
+            ], dtype=np.float64))
 
     def detect(self, frame_bgr: np.ndarray,
                intrinsics: CameraIntrinsics) -> List[Detection]:
@@ -97,15 +105,7 @@ class MultiDictDetector:
             if ids is None or len(ids) == 0:
                 continue
 
-            # Marker object frame (planar, centred on the marker face).
-            # +X right, +Y up, marker lies in the Z=0 plane, normal +Z.
-            half = dc.marker_size_m / 2.0
-            obj_pts = np.array([
-                [-half,  half, 0.0],
-                [ half,  half, 0.0],
-                [ half, -half, 0.0],
-                [-half, -half, 0.0],
-            ], dtype=np.float64)
+            obj_pts = self._obj_pts[i]
 
             for j, marker_id in enumerate(ids.flatten()):
                 img_pts = corners[j].reshape(4, 2).astype(np.float64)

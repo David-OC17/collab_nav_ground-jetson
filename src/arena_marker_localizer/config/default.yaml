@@ -63,4 +63,15 @@ marker_localizer_service:
       output_path: "/tmp/marker_localizer_debug.png"
       px_per_cell: 12
 
+    # ── Parallel processing ────────────────────────────────────────────
+    # max_workers: number of threads processing frames in parallel.
+    #   Jetson Orin Nano has 6 cores; 5 leaves one free for the main
+    #   thread (frame decoding + result merging) and the OS.
+    # frame_stride: process every Nth frame. At 30 fps, stride=2 gives
+    #   ~15 frames/s of observations — still well above min_observations=50
+    #   for a 3-minute flight (~2700 observations at stride=2).
+    processing:
+      max_workers: 5
+      frame_stride: 1
+
     verbose: false

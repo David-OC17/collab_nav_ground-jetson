@@ -121,6 +121,10 @@ class MarkerLocalizerService(Node):
                                "/tmp/marker_localizer_debug.png")
         self.declare_parameter("debug.px_per_cell", 12)
 
+        # ── Parallel processing ────────────────────────────────────────
+        self.declare_parameter("processing.max_workers",  4)
+        self.declare_parameter("processing.frame_stride", 1)
+
         self.declare_parameter("verbose", False)
 
         # ── Covariance for pose_with_covariance ────────────────────────
@@ -195,6 +199,8 @@ class MarkerLocalizerService(Node):
                 convergence_eps  = float(self._get("aggregation.convergence_eps")),
             ),
             max_obs_per_marker = int(self._get("max_obs_per_marker")),
+            max_workers  = int(self._get("processing.max_workers")),
+            frame_stride = int(self._get("processing.frame_stride")),
             resolution_m_per_cell = float(self._get("grid.resolution_m_per_cell")),
             grid_width_cells  = math.ceil(
                 float(self._get("arena.width_m"))  / float(self._get("grid.resolution_m_per_cell"))
