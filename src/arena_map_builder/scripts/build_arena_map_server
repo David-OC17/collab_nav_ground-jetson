@@ -64,6 +64,8 @@ from arena_map_builder.occupancy import (
     occupancy_to_grid_array,
 )
 
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
+
 
 # ===========================================================================
 # The node
@@ -93,6 +95,15 @@ class BuildArenaMapServer(Node):
             cancel_callback=self.cancel_callback,
             callback_group=self._cb_group,
         )
+
+        # Publish occupancy grid
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self._map_pub = self.create_publisher(OccupancyGrid, '/drone/map', map_qos)
 
         self.get_logger().info(
             "build_arena_map action server ready on /build_arena_map"
@@ -493,6 +504,9 @@ class BuildArenaMapServer(Node):
         # ── 6) Done ────────────────────────────────────────────────────
         self._emit_feedback(goal_handle, "done", 1.0,
                             f"OccupancyGrid ready ({width}x{height} cells)")
+        # Publish occupancy grid 
+        self._map_pub.publish(msg)
+        
         goal_handle.succeed()
 
         result = BuildArenaMap.Result()

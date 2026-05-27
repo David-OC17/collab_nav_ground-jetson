@@ -8,7 +8,7 @@ orchestrator:
   rasp:
     ip: "10.42.0.50"
     user: "root"
-    password: "root"                         # Set before running
+    password: "root"                       # Set before running
     amr_service: "amr_bringup"             # systemd service name
     amr_service_start_timeout_sec: 15.0    # How long to wait for active state
     ping_count: 3
@@ -24,16 +24,16 @@ orchestrator:
   # ── OptiTrack ───────────────────────────────────────────────────────────
   optitrack:
     topic: "/optitrack/rigid_body"
-    expected_frame_id: "drone113"           # header.frame_id must match this
-    max_stamp_age_sec: 1.0               # Message must be this fresh
+    expected_frame_id: "drone113"       # header.frame_id must match this
+    max_stamp_age_sec: 1.0              # Message must be this fresh
     check_timeout_sec: 30.0             # How long to wait for a message
-    retry_delay_sec: 3.0                 # Delay before re-checking after launching client
+    retry_delay_sec: 3.0                # Delay before re-checking after launching client
 
   # ── Tello WiFi connection ────────────────────────────────────────────────
   tello_wifi:
-    interface: "wlx14ebb67dae0b"           # WiFi adapter ifname
-    ssid: "TELLO-594992"                   # Tello access-point SSID
-    scan_retries: 3                        # Scan attempts before giving up
+    interface: "wlx14ebb67dae0b"          # WiFi adapter ifname
+    ssid: "TELLO-594992"                  # Tello access-point SSID
+    scan_retries: 3                       # Scan attempts before giving up
     connect_timeout_sec: 30.0             # Timeout for nmcli connect call
 
   # ── Tello drone ─────────────────────────────────────────────────────────
@@ -45,19 +45,21 @@ orchestrator:
     battery_min_pct: 60.0               # Minimum battery % (0-100 scale)
     camera_timeout_sec: 30.0
     battery_timeout_sec: 10.0
-    # State transition timeouts
-    state1_timeout_sec: 60.0            # Stabilize
-    state2_timeout_sec: 300.0           # Trajectory
-    state3_timeout_sec: 30.0            # Going Back
-    state4_timeout_sec: 60.0            # Landing
-    driver_startup_delay_sec: 30.0       # Fixed wait after tello_driver launch before preflight
+    # State transition timeouts — each is the max time allowed to REACH that
+    # state from the previous one (i.e. the duration limit of the preceding phase).
+    state1_timeout_sec: 100.0  # max time to reach state 1 (takeoff + fly to home)
+    state2_timeout_sec: 60.0   # max time to reach state 2 (stabilise at home)
+    state3_timeout_sec: 300.0  # max time to reach state 3 = MAX TRAJECTORY DURATION
+    state4_timeout_sec: 90.0   # max time to reach state 4 (return home + land)
+    driver_startup_delay_sec: 15.0      # Fixed wait after tello_driver launch before preflight
     land_wait_sec: 40.0                  # Time to keep tello_driver alive after /land is sent
-    video_filename_topic: "/drone/video_filename"
-    telemetry_filename_topic: "/drone/telemetry_filename"
-
   # ── Video output files ───────────────────────────────────────────────────
   video:
-    file_appear_timeout_sec: 180.0       # Time allowed for file-path topics to arrive after landing
+    dir: "/home/jetson/collab_nav_ground-jetson/video"  # Directory where the drone controller writes outputs
+    video_filename: "scan.mp4"
+    telemetry_filename: "telemetry.csv"
+    file_appear_timeout_sec: 180.0       # Max time to wait for files to appear and be fresh after landing
+    max_age_sec: 300.0                   # Files must have been written within this many seconds
 
   # ── ArUco pose publication ───────────────────────────────────────────────
   aruco:
@@ -83,18 +85,32 @@ orchestrator:
 
   # ── Arena marker localizer ───────────────────────────────────────────────
   marker_localizer:
-    workspace_path: "/CHANGEME/path/to/workspace"  # Used to find default.yaml
+    workspace_path: "/home/jetson/collab_nav_ground-jetson"  # Used to find default.yaml
     service_name: "/localize_markers"
     service_timeout_sec: 300.0
     server_ready_timeout_sec: 60.0
 
   # ── Arena map builder ────────────────────────────────────────────────────
   map_builder:
-    background_image_path: "/CHANGEME/path/to/background.png"
+    background_image_path: "/home/jetson/collab_nav_ground-jetson/src/arena_map_builder/config/background.png"
     action_name: "build_arena_map"
     action_timeout_sec: 300.0
     server_ready_timeout_sec: 30.0
     drone_map_topic: "/drone/map"
+
+  # ── Rosbag recording ────────────────────────────────────────────────────
+  rosbag:
+    enabled: false
+    output_dir: "/tmp/mission_orchestrator_logs"  # bag folder created here
+    topics: []                                    # empty = record all topics (-a)
+    # topics:
+    #   - /imu/data_raw
+    #   - /optitrack/rigid_body
+    #   - /scan
+    #   - /drone/state
+    #   - /aruco/amr/pose
+    #   - /aruco/goal/pose
+    #   - /drone/map
 
   # ── Logging ─────────────────────────────────────────────────────────────
   logging:

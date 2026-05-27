@@ -107,3 +107,53 @@ sudo nmcli device wifi connect "TELLO-594992" ifname wlx14ebb67dae0b
 ros2 launch tello_driver tello_driver.launch.py
 ros2 launch tello_pos_control tello_map.launch.py
 ```
+
+## Killing nodes
+
+Using the symlink to the shell script:
+```bash
+# Configure
+sudo ln -s /home/jetson/collab_nav_ground-jetson/scripts/kill_ros2_nodes.sh \
+           /usr/local/bin/kill_ros2_nodes
+
+# Kill everything in the default TARGETS list (local + RPi)
+kill_ros2_nodes
+
+# Kill a single node (checked on both Jetson and RPi)
+kill_ros2_nodes --node driver_node
+
+# Kill several specific nodes
+kill_ros2_nodes --node driver_node --node ekf_node --node odometry_node
+
+# Both --node syntaxes work
+kill_ros2_nodes --node=driver_node --node=ekf_node
+
+# Skip the RPi entirely (local Jetson only)
+kill_ros2_nodes --no-rasp
+
+# Local only, specific node
+kill_ros2_nodes --no-rasp --node orchestrator_node
+
+# Override retry/timing behaviour via env vars
+MAX_RETRIES=10 kill_ros2_nodes --node driver_node
+TERM_GRACE_SEC=5 KILL_RETRY_SEC=2 kill_ros2_nodes
+MAX_RETRIES=3 TERM_GRACE_SEC=1 kill_ros2_nodes --node tello_driver_node --no-rasp
+
+# Override RPi credentials (e.g. different deployment)
+RASP_HOST=10.42.0.51 RASP_PASS=mypass kill_ros2_nodes --node driver_node
+
+# Check exit code to know if everything was killed
+kill_ros2_nodes --node driver_node
+echo "Exit code: $?"   # 0 = all dead, 1 = something survived
+```
+
+## Testing orchestrator partial pipeline
+
+```bash
+# For scan10
+python3 src/mission_orchestrator/scripts/run_hw_test_s10_s20.py \
+    --file-path /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10 \
+    --aruco-ids '[1, 3]' \
+    --touch-files \
+    --trajectory-planner=false
+```

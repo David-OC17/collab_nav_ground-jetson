@@ -15,7 +15,7 @@ Stages
  07  Drone preflight: verify /camera/image_raw live, /battery_state ≥ min %
  08  Launch tello_map (drone takes off and executes scanning routine)
  09  Observe drone state transitions 1→2→3→4 with per-stage timeouts
-10  Wait for /drone/video_filename and /drone/telemetry_filename topic messages
+10  Wait for scan.mp4 and telemetry.csv to appear in the configured video dir, fresh within max_age_sec
 11  Verify scan.mp4 integrity via ffmpeg
 12  Launch trajectory_planner
 13  Launch map_fusion
@@ -62,7 +62,7 @@ from rclpy.qos import (
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import BatteryState, Image, Imu
-from std_msgs.msg import Int32, String
+from std_msgs.msg import Int32
 
 from arena_map_builder_msgs.action import BuildArenaMap
 from arena_marker_localizer_interfaces.srv import LocalizeMarkers
@@ -119,6 +119,7 @@ class MissionOrchestratorNode(Node):
 
         # Subprocess handles
         self._processes: Dict[str, subprocess.Popen] = {}
+        self._rosbag_proc: Optional[subprocess.Popen] = None
 
         # SSH state
         self._ssh: Optional[paramiko.SSHClient] = None
@@ -135,17 +136,13 @@ class MissionOrchestratorNode(Node):
         self._optitrack_last_msg: Optional[PoseStamped] = None
         self._optitrack_lock = threading.Lock()
 
-        self._drone_state_events: Dict[int, threading.Event] = {
-            s: threading.Event() for s in (-1, 0, 1, 2, 3, 4)
-        }
         self._drone_state: Optional[int] = None
+        self._drone_state_cond = threading.Condition(threading.Lock())
 
         self._camera_event = threading.Event()
         self._battery_event = threading.Event()
         self._battery_pct: Optional[float] = None
 
-        self._video_filename_event = threading.Event()
-        self._telemetry_filename_event = threading.Event()
         self._video_path: Optional[str] = None
         self._telemetry_path: Optional[str] = None
 
@@ -216,10 +213,6 @@ class MissionOrchestratorNode(Node):
             cfg['drone']['camera_topic'], self._camera_cb, best_effort)
         self.create_subscription(BatteryState,
             cfg['drone']['battery_topic'], self._battery_cb, 10)
-        self.create_subscription(String,
-            cfg['drone']['video_filename_topic'], self._video_filename_cb, 10)
-        self.create_subscription(String,
-            cfg['drone']['telemetry_filename_topic'], self._telemetry_filename_cb, 10)
         self.create_subscription(OccupancyGrid,
             cfg['map_builder']['drone_map_topic'], self._drone_map_cb, latched)
 
@@ -246,16 +239,17 @@ class MissionOrchestratorNode(Node):
             self._imu_ready_event.set()
 
     def _optitrack_cb(self, msg: PoseStamped) -> None:
+        if msg.header.frame_id != self._cfg['optitrack']['expected_frame_id']:
+            return
         with self._optitrack_lock:
             self._optitrack_last_msg = msg
         self._optitrack_event.set()
 
     def _drone_state_cb(self, msg: Int32) -> None:
         state = int(msg.data)
-        self._drone_state = state
-        evt = self._drone_state_events.get(state)
-        if evt is not None:
-            evt.set()
+        with self._drone_state_cond:
+            self._drone_state = state
+            self._drone_state_cond.notify_all()
         self._log.debug(f"Drone state → {state}")
 
     def _camera_cb(self, _msg: Image) -> None:
@@ -263,18 +257,7 @@ class MissionOrchestratorNode(Node):
 
     def _battery_cb(self, msg: BatteryState) -> None:
         self._battery_pct = float(msg.percentage)
-        if self._battery_pct >= self._cfg['drone']['battery_min_pct']:
-            self._battery_event.set()
-
-    def _video_filename_cb(self, msg: String) -> None:
-        self._video_path = msg.data
-        self._video_filename_event.set()
-        self._log.debug(f"Received video_filename: {msg.data!r}")
-
-    def _telemetry_filename_cb(self, msg: String) -> None:
-        self._telemetry_path = msg.data
-        self._telemetry_filename_event.set()
-        self._log.debug(f"Received telemetry_filename: {msg.data!r}")
+        self._battery_event.set()
 
     def _drone_map_cb(self, _msg: OccupancyGrid) -> None:
         self._drone_map_event.set()
@@ -391,10 +374,42 @@ class MissionOrchestratorNode(Node):
             pass
         self._ssh = None
 
+    def _start_rosbag(self) -> None:
+        cfg_rb = self._cfg.get('rosbag', {})
+        if not cfg_rb.get('enabled', False):
+            return
+
+        output_dir = cfg_rb.get('output_dir', '/tmp/mission_orchestrator_logs')
+        topics: List[str] = cfg_rb.get('topics') or []
+
+        os.makedirs(output_dir, exist_ok=True)
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        bag_path = os.path.join(output_dir, f'mission_{ts}')
+
+        cmd = ['ros2', 'bag', 'record', '-o', bag_path]
+        if topics:
+            cmd.extend(topics)
+            self._log.info(f"  Recording {len(topics)} topic(s): {topics}")
+        else:
+            cmd.append('-a')
+            self._log.info("  Recording all topics (-a)")
+
+        self._rosbag_proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._log.info(f"Rosbag recording started → {bag_path}  (pid={self._rosbag_proc.pid})")
+
+    def _stop_rosbag(self) -> None:
+        if self._rosbag_proc is None:
+            return
+        _kill_proc(self._rosbag_proc, 'rosbag', self._log)
+        self._rosbag_proc = None
+
     def _abort(self) -> None:
         """Kill all processes and close SSH.  Idempotent."""
         self._log.error("══════ MISSION ABORT ══════")
         self._abort_drone()
+        self._stop_rosbag()
         for name, proc in list(self._processes.items()):
             _kill_proc(proc, name, self._log)
         self._teardown_ssh()
@@ -595,14 +610,18 @@ class MissionOrchestratorNode(Node):
                 f"{cfg_d['camera_timeout_sec']}s")
         self._log.info(f"  Camera OK: {cfg_d['camera_topic']} is live")
 
-        # Battery
-        self._log.info(f"  Waiting for battery ≥ {cfg_d['battery_min_pct']}% …")
+        # Battery — abort immediately if below threshold (replacing the battery
+        # requires a manual restart, so waiting serves no purpose)
+        self._log.info(f"  Waiting for battery reading …")
         if not self._battery_event.wait(timeout=cfg_d['battery_timeout_sec']):
-            pct = self._battery_pct
-            pct_str = f"{pct:.1f}%" if pct is not None else "unknown"
             raise MissionAbortError(
-                f"Battery check failed: {pct_str} < {cfg_d['battery_min_pct']}%")
-        self._log.info(f"  Battery OK: {self._battery_pct:.1f}%")
+                f"Battery topic did not publish within {cfg_d['battery_timeout_sec']}s")
+        pct = self._battery_pct
+        if pct < cfg_d['battery_min_pct']:
+            raise MissionAbortError(
+                f"Battery too low: {pct:.1f}% < {cfg_d['battery_min_pct']}% — "
+                f"replace battery and restart")
+        self._log.info(f"  Battery OK: {pct:.1f}%")
 
         # Confirm drone state is -1 (before takeoff)
         if self._drone_state is not None and self._drone_state != -1:
@@ -620,6 +639,21 @@ class MissionOrchestratorNode(Node):
         self._log.info(f"  tello_map launched (pid={proc.pid})")
         self._log.info("╚══ Stage 08 OK")
 
+    def _wait_drone_state(self, target: int, timeout_sec: float) -> bool:
+        """Block until /drone/state is exactly *target*, or *timeout_sec* elapses.
+
+        Uses the current reported state, not a cached event — so it correctly
+        waits even if the target state was briefly published before this call.
+        """
+        deadline = time.monotonic() + timeout_sec
+        with self._drone_state_cond:
+            while self._drone_state != target:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._drone_state_cond.wait(timeout=remaining)
+            return True
+
     def _stage_09_observe_drone_states(self) -> None:
         self._log.info("╔══ Stage 09: Monitor drone state transitions")
         cfg_d = self._cfg['drone']
@@ -636,42 +670,62 @@ class MissionOrchestratorNode(Node):
             name = state_names[state]
             tmo = timeouts[state]
             self._log.info(f"  Waiting for state {state} ({name}), timeout={tmo}s …")
-            if not self._drone_state_events[state].wait(timeout=tmo):
-                self._log.error(f"  TIMEOUT in state {state} ({name})")
+            if not self._wait_drone_state(state, tmo):
+                self._log.error(f"  TIMEOUT waiting for state {state} ({name})")
                 self._abort_drone()
                 raise MissionAbortError(f"Drone timeout in state {state} ({name})")
             self._log.info(f"  → State {state} ({name}) reached")
 
         self._log.info("╚══ Stage 09 OK: Drone mission complete (state 4)")
 
-    def _stage_10_wait_video_topics(self) -> None:
-        self._log.info("╔══ Stage 10: Wait for video file-path topics")
-        cfg_d = self._cfg['drone']
+    def _stage_10_wait_video_files(self) -> None:
+        self._log.info("╔══ Stage 10: Wait for video and telemetry files")
         cfg_v = self._cfg['video']
+        video_dir = cfg_v['dir']
+        video_path = os.path.join(video_dir, cfg_v['video_filename'])
+        telemetry_path = os.path.join(video_dir, cfg_v['telemetry_filename'])
         timeout = cfg_v['file_appear_timeout_sec']
+        max_age = cfg_v['max_age_sec']
 
         self._log.info(
-            f"  Waiting for {cfg_d['video_filename_topic']} (timeout={timeout}s) …")
-        if not self._video_filename_event.wait(timeout=timeout):
-            raise MissionAbortError(
-                f"No message on {cfg_d['video_filename_topic']} after {timeout}s")
+            f"  Expecting {video_path!r} and {telemetry_path!r} "
+            f"(timeout={timeout}s, max_age={max_age}s)")
 
-        self._log.info(
-            f"  Waiting for {cfg_d['telemetry_filename_topic']} (timeout={timeout}s) …")
-        if not self._telemetry_filename_event.wait(timeout=timeout):
-            raise MissionAbortError(
-                f"No message on {cfg_d['telemetry_filename_topic']} after {timeout}s")
+        deadline = time.monotonic() + timeout
+        while True:
+            now = time.time()
+            errors = []
+            for label, path in ((cfg_v['video_filename'], video_path),
+                                (cfg_v['telemetry_filename'], telemetry_path)):
+                if not os.path.isfile(path):
+                    errors.append(f"{label} not found")
+                    continue
+                age = now - os.path.getmtime(path)
+                if age > max_age:
+                    errors.append(f"{label} too old ({age:.0f}s > {max_age}s)")
+                    continue
+                if os.path.getsize(path) == 0:
+                    errors.append(f"{label} is empty")
 
-        self._log.info(f"  video_path:    {self._video_path!r}")
-        self._log.info(f"  telemetry_path:{self._telemetry_path!r}")
+            if not errors:
+                break
 
-        for label, path in (('scan.mp4', self._video_path), ('telemetry.csv', self._telemetry_path)):
-            if not path or not os.path.isfile(path):
-                raise MissionAbortError(f"{label} path does not exist: {path!r}")
+            if time.monotonic() >= deadline:
+                raise MissionAbortError(
+                    f"Video files not ready after {timeout}s: {'; '.join(errors)}")
+
+            self._log.info(f"  Not ready ({'; '.join(errors)}) — retrying in 5s …")
+            time.sleep(5.0)
+
+        self._video_path = video_path
+        self._telemetry_path = telemetry_path
+
+        now = time.time()
+        for label, path in ((cfg_v['video_filename'], video_path),
+                            (cfg_v['telemetry_filename'], telemetry_path)):
             size_kb = os.path.getsize(path) / 1024
-            if size_kb == 0:
-                raise MissionAbortError(f"{label} is empty: {path!r}")
-            self._log.info(f"  {label}: {size_kb:.1f} KB — OK")
+            age = now - os.path.getmtime(path)
+            self._log.info(f"  {label}: {size_kb:.1f} KB, age={age:.0f}s — OK")
 
         self._log.info("╚══ Stage 10 OK")
 
@@ -726,7 +780,7 @@ class MissionOrchestratorNode(Node):
     def _stage_14_launch_oradar(self) -> None:
         self._log.info("╔══ Stage 14: Launch oradar lidar")
         proc = subprocess.Popen(
-            ['ros2', 'launch', 'oradar_ros', 'ms200_scan.launch.py'],
+            ['ros2', 'launch', 'oradar_lidar', 'ms200_scan.launch.py'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self._processes['oradar'] = proc
@@ -900,6 +954,7 @@ class MissionOrchestratorNode(Node):
 
     def run(self) -> None:
         self._log.info("━━━━━━━━━━━━━━━━  MISSION START  ━━━━━━━━━━━━━━━━")
+        self._start_rosbag()
         try:
             self._stage_01_ping()
             self._stage_02_ssh_connect()
@@ -911,7 +966,7 @@ class MissionOrchestratorNode(Node):
             self._stage_07_drone_preflight()
             self._stage_08_launch_tello_map()
             self._stage_09_observe_drone_states()
-            self._stage_10_wait_video_topics()
+            self._stage_10_wait_video_files()
             self._stage_11_verify_video_integrity()
             self._stage_12_launch_trajectory_planner()
             self._stage_13_launch_map_fusion()
@@ -987,6 +1042,7 @@ def main(args=None) -> None:
     finally:
         if not node._mission_complete:
             node._abort()
+        node._stop_rosbag()   # always stop recording on exit
         node._teardown_ssh()  # always stop AMR service on exit
         executor.shutdown(timeout_sec=5.0)
         node.destroy_node()
