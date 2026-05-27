@@ -26,6 +26,8 @@ setup(
     entry_points={
         'console_scripts': [
             'astar_planner = trajectory_planner.astar_planner:main',
+            'astar_planner2 = trajectory_planner.astar_planner2:main',
+            'spline_follower = trajectory_planner.spline_follower:main',
             'trajectory_follower_sim  = trajectory_planner.trajectory_follower_sim:main',
         ],
     },
