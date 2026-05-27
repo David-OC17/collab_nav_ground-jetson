@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 """
-Hardware smoke-test: stages 05-11.
+Hardware smoke-test: drone-only pipeline (stages 01-06 + 11).
 
-Skips stages 01-04 (RPi ping, SSH, AMR bringup, IMU) — the AMR does not need
-to be running.  Stages 05-11 run for real:
+Skips stages 07-10 (RPi ping, SSH, AMR bringup, IMU) — the AMR does not need
+to be running.  The following stages run for real:
 
-  05   Check OptiTrack (rigid-body pose topic)
-  05b  Connect Tello WiFi
-  06   Launch tello_driver
-  07   Drone preflight (camera + battery)
-  08   Launch tello_map
-  09   Observe drone state machine (1 → 2 → 3 → 4)
-  10   Wait for video/telemetry file-path topics
+  01   Check OptiTrack (rigid-body pose topic)
+  01b  Connect Tello WiFi
+  02   Launch tello_driver
+  03   Drone preflight (camera + battery)
+  04   Launch tello_map
+  05   Observe drone state machine (1 → 2 → 3 → 4)
+  06   Wait for video/telemetry file-path topics
   11   Verify video integrity with ffmpeg
 
-Stages 12-20 are no-ops.  On success the script stays alive as a ROS 2
-observer, leaving tello_driver and tello_map running for inspection.
+Stages 07-10 (RPi/AMR/IMU) and 12-20 are no-ops.  On success the script
+stays alive as a ROS 2 observer, leaving tello_driver and tello_map running.
 
 Press Ctrl+C to abort the drone (land + kill processes) and exit.
 
 Usage (from workspace root, after sourcing install/setup.bash):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s05_s11.py
+    python3 src/mission_orchestrator/scripts/run_hw_test_s01_s06_s11.py
 
 With a custom config:
-    python3 src/mission_orchestrator/scripts/run_hw_test_s05_s11.py \\
+    python3 src/mission_orchestrator/scripts/run_hw_test_s01_s06_s11.py \\
         --config /abs/path/to/orchestrator_params.yaml
 """
 
@@ -52,31 +52,31 @@ _DEFAULT_CONFIG = os.path.normpath(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Restricted orchestrator: stages 01-04 no-ops; 05-11 real; 12-20 no-ops
+# Restricted orchestrator: stages 07-10 no-ops; 01-06+11 real; 12-20 no-ops
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _HwTestOrchestrator(MissionOrchestratorNode):
-    """Stages 01-04 and 12-20 are no-ops; stages 05-11 run normally."""
+    """Stages 07-10 (RPi/AMR/IMU) and 12-20 are no-ops; drone stages 01-06 and 11 run normally."""
 
-    # ── No-op: RPi / AMR pipeline ────────────────────────────────────────────
+    # ── No-op: RPi / AMR pipeline (now stages 07-10) ───────────────────────────
 
-    def _stage_01_ping(self) -> None:
+    def _stage_07_ping(self) -> None:
         pass
 
-    def _stage_02_ssh_connect(self) -> None:
+    def _stage_08_ssh_connect(self) -> None:
         pass
 
-    def _stage_03_launch_amr(self) -> None:
+    def _stage_09_launch_amr(self) -> None:
         pass
 
-    def _stage_04_wait_imu_ready(self) -> None:
+    def _stage_10_wait_imu_ready(self) -> None:
         pass
 
     # ── No-op: post-scan pipeline ─────────────────────────────────────────────
 
     def _stage_12_launch_trajectory_planner(self) -> None:
         self._log.info("══════════════════════════════════════════════════")
-        self._log.info("  Stages 05-11 PASSED")
+        self._log.info("  Drone stages 01-06 + 11 PASSED")
         self._log.info("  tello_driver and tello_map are still running.")
         self._log.info("  Press Ctrl+C to abort the drone and exit.")
         self._log.info("══════════════════════════════════════════════════")
@@ -112,7 +112,7 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Hardware smoke-test: mission orchestrator stages 05-11.')
+        description='Hardware smoke-test: drone-only pipeline (stages 01-06 + 11); skips RPi/AMR/IMU (07-10).')
     parser.add_argument(
         '--config', default=_DEFAULT_CONFIG,
         help='Path to orchestrator_params.yaml (default: config/ inside this package)')

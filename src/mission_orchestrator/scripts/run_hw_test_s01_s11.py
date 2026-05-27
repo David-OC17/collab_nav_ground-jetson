@@ -2,10 +2,12 @@
 """
 Hardware smoke-test: stages 01-11.
 
-Runs the full mission orchestrator pipeline from stage 01 (ping RPi)
-through stage 11 (ffmpeg video integrity check).  Stages 12-20 are
-no-ops.  On success the script spins as a ROS 2 observer, leaving
+Runs the full mission orchestrator pipeline from stage 01 (OptiTrack
+check) through stage 11 (ffmpeg video integrity check).  Stages 12-20
+are no-ops.  On success the script spins as a ROS 2 observer, leaving
 tello_driver and tello_map running so you can inspect the system state.
+
+Stage order: drone pipeline (01-06), RPi/AMR/IMU (07-10), video verify (11).
 
 Press Ctrl+C to stop the AMR service on the RPi and exit.
 
@@ -46,7 +48,7 @@ _DEFAULT_CONFIG = os.path.normpath(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _HwTestOrchestrator(MissionOrchestratorNode):
-    """Stages 01-11 run normally; stages 12-20 are no-ops."""
+    """Stages 01-11 run normally (drone first, then RPi/AMR/IMU); stages 12-20 are no-ops."""
 
     def _stage_12_launch_trajectory_planner(self) -> None:
         self._log.info("══════════════════════════════════════════════════")
@@ -86,7 +88,7 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Hardware smoke-test: mission orchestrator stages 01-11.')
+        description='Hardware smoke-test: mission orchestrator stages 01-11 (drone first, then RPi/AMR/IMU).')
     parser.add_argument(
         '--config', default=_DEFAULT_CONFIG,
         help='Path to orchestrator_params.yaml (default: config/ inside this package)')

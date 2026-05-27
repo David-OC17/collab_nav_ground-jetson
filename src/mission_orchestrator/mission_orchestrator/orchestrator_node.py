@@ -5,17 +5,17 @@ End-to-end mission sequencer for the collab_nav ground-robot + drone system.
 
 Stages
 ──────
- 01  Ping Raspberry Pi
- 02  SSH connect to Raspberry Pi
- 03  Start amr_bringup systemd service on Raspberry Pi; verify active
- 04  Wait for /imu/data_raw to publish 200 messages (IMU running at 100 Hz)
- 05  Check /optitrack/rigid_body presence + header; launch client if absent
- 05b Connect to Tello WiFi (nmcli scan + connect on wlx14ebb67dae0b)
- 06  Launch tello_driver
- 07  Drone preflight: verify /camera/image_raw live, /battery_state ≥ min %
- 08  Launch tello_map (drone takes off and executes scanning routine)
- 09  Observe drone state transitions 1→2→3→4 with per-stage timeouts
-10  Wait for scan.mp4 and telemetry.csv to appear in the configured video dir, fresh within max_age_sec
+ 01  Check /optitrack/rigid_body presence + header; launch client if absent
+ 01b Connect to Tello WiFi (nmcli scan + connect on wlx14ebb67dae0b)
+ 02  Launch tello_driver
+ 03  Drone preflight: verify /camera/image_raw live, /battery_state ≥ min %
+ 04  Launch tello_map (drone takes off and executes scanning routine)
+ 05  Observe drone state transitions 1→2→3→4 with per-stage timeouts
+ 06  Wait for scan.mp4 and telemetry.csv to appear in the configured video dir, fresh within max_age_sec
+ 07  Ping Raspberry Pi
+ 08  SSH connect to Raspberry Pi
+ 09  Start amr_bringup systemd service on Raspberry Pi; verify active
+10  Wait for /imu/data_raw to publish 200 messages (IMU running at 100 Hz)
 11  Verify scan.mp4 integrity via ffmpeg
 12  Launch trajectory_planner
 13  Launch map_fusion
@@ -419,8 +419,8 @@ class MissionOrchestratorNode(Node):
     # Stages
     # ────────────────────────────────────────────────────────────────────────
 
-    def _stage_01_ping(self) -> None:
-        self._log.info("╔══ Stage 01: Ping Raspberry Pi")
+    def _stage_07_ping(self) -> None:
+        self._log.info("╔══ Stage 07: Ping Raspberry Pi")
         cfg_r = self._cfg['rasp']
         ip = cfg_r['ip']
         cmd = ['ping', '-c', str(cfg_r['ping_count']),
@@ -428,10 +428,10 @@ class MissionOrchestratorNode(Node):
         result = subprocess.run(cmd, capture_output=True)
         if result.returncode != 0:
             raise MissionAbortError(f"Raspberry Pi {ip} is not reachable")
-        self._log.info(f"╚══ Stage 01 OK: Raspberry Pi {ip} reachable")
+        self._log.info(f"╚══ Stage 07 OK: Raspberry Pi {ip} reachable")
 
-    def _stage_02_ssh_connect(self) -> None:
-        self._log.info("╔══ Stage 02: SSH connect to Raspberry Pi")
+    def _stage_08_ssh_connect(self) -> None:
+        self._log.info("╔══ Stage 08: SSH connect to Raspberry Pi")
         cfg_r = self._cfg['rasp']
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -442,7 +442,7 @@ class MissionOrchestratorNode(Node):
             timeout=cfg_r['ssh_connect_timeout_sec'],
         )
         self._ssh = client
-        self._log.info(f"╚══ Stage 02 OK: SSH connected to {cfg_r['user']}@{cfg_r['ip']}")
+        self._log.info(f"╚══ Stage 08 OK: SSH connected to {cfg_r['user']}@{cfg_r['ip']}")
 
     def _ssh_run(self, cmd: str) -> tuple[int, str, str]:
         """Run a command over SSH; return (exit_code, stdout, stderr)."""
@@ -450,8 +450,8 @@ class MissionOrchestratorNode(Node):
         exit_code = out.channel.recv_exit_status()
         return exit_code, out.read().decode().strip(), err.read().decode().strip()
 
-    def _stage_03_launch_amr(self) -> None:
-        self._log.info("╔══ Stage 03: Start AMR bringup service on Raspberry Pi")
+    def _stage_09_launch_amr(self) -> None:
+        self._log.info("╔══ Stage 09: Start AMR bringup service on Raspberry Pi")
         cfg_r = self._cfg['rasp']
         svc = cfg_r['amr_service']
         timeout = cfg_r['amr_service_start_timeout_sec']
@@ -479,20 +479,20 @@ class MissionOrchestratorNode(Node):
                     f"(state={state!r}).\nJournal tail:\n{journal}")
             time.sleep(1.0)
 
-        self._log.info(f"╚══ Stage 03 OK: {svc} is active")
+        self._log.info(f"╚══ Stage 09 OK: {svc} is active")
 
-    def _stage_04_wait_imu_ready(self) -> None:
+    def _stage_10_wait_imu_ready(self) -> None:
         n = self._cfg['imu']['message_count']
         timeout = self._cfg['imu']['timeout_sec']
-        self._log.info(f"╔══ Stage 04: Waiting for {n} messages on {self._cfg['imu']['topic']}")
+        self._log.info(f"╔══ Stage 10: Waiting for {n} messages on {self._cfg['imu']['topic']}")
         if not self._imu_ready_event.wait(timeout=timeout):
             raise MissionAbortError(
                 f"IMU did not publish {n} messages within {timeout}s "
                 f"(received {self._imu_msg_count})")
-        self._log.info(f"╚══ Stage 04 OK: IMU ready ({self._imu_msg_count} messages received)")
+        self._log.info(f"╚══ Stage 10 OK: IMU ready ({self._imu_msg_count} messages received)")
 
-    def _stage_05_check_optitrack(self) -> None:
-        self._log.info("╔══ Stage 05: Check OptiTrack")
+    def _stage_01_check_optitrack(self) -> None:
+        self._log.info("╔══ Stage 01: Check OptiTrack")
         if not self._wait_optitrack_message():
             self._log.warning("  No message — launching optitrack_client and retrying …")
             proc = subprocess.Popen(['ros2', 'run', 'optitrack_client', 'optitrack_client'])
@@ -502,7 +502,7 @@ class MissionOrchestratorNode(Node):
             if not self._wait_optitrack_message():
                 raise MissionAbortError("OptiTrack did not come up after launching client")
         self._verify_optitrack_header()
-        self._log.info("╚══ Stage 05 OK: OptiTrack verified")
+        self._log.info("╚══ Stage 01 OK: OptiTrack verified")
 
     def _wait_optitrack_message(self) -> bool:
         self._optitrack_event.clear()
@@ -533,8 +533,8 @@ class MissionOrchestratorNode(Node):
 
         self._log.info(f"  OptiTrack OK — frame_id='{msg.header.frame_id}', age={age:.3f}s")
 
-    def _stage_05b_connect_tello_wifi(self) -> None:
-        self._log.info("╔══ Stage 05b: Connect to Tello WiFi")
+    def _stage_01b_connect_tello_wifi(self) -> None:
+        self._log.info("╔══ Stage 01b: Connect to Tello WiFi")
         cfg_w = self._cfg['tello_wifi']
         iface = cfg_w['interface']
         ssid = cfg_w['ssid']
@@ -583,10 +583,10 @@ class MissionOrchestratorNode(Node):
                 f"{result.stderr.strip() or result.stdout.strip()}")
 
         self._log.info(f"  {result.stdout.strip()}")
-        self._log.info("╚══ Stage 05b OK: Tello WiFi connected")
+        self._log.info("╚══ Stage 01b OK: Tello WiFi connected")
 
-    def _stage_06_launch_tello_driver(self) -> None:
-        self._log.info("╔══ Stage 06: Launch tello_driver")
+    def _stage_02_launch_tello_driver(self) -> None:
+        self._log.info("╔══ Stage 02: Launch tello_driver")
         proc = subprocess.Popen(
             ['ros2', 'launch', 'tello_driver', 'tello_driver.launch.py'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -596,10 +596,10 @@ class MissionOrchestratorNode(Node):
         delay = float(self._cfg['drone'].get('driver_startup_delay_sec', 15.0))
         self._log.info(f"  Waiting {delay}s for tello_driver to finish configuring …")
         time.sleep(delay)
-        self._log.info("╚══ Stage 06 OK")
+        self._log.info("╚══ Stage 02 OK")
 
-    def _stage_07_drone_preflight(self) -> None:
-        self._log.info("╔══ Stage 07: Drone preflight checks")
+    def _stage_03_drone_preflight(self) -> None:
+        self._log.info("╔══ Stage 03: Drone preflight checks")
         cfg_d = self._cfg['drone']
 
         # Camera
@@ -627,17 +627,17 @@ class MissionOrchestratorNode(Node):
         if self._drone_state is not None and self._drone_state != -1:
             raise MissionAbortError(
                 f"Expected drone state -1 (before takeoff), got {self._drone_state}")
-        self._log.info("╚══ Stage 07 OK: Drone is ready for takeoff")
+        self._log.info("╚══ Stage 03 OK: Drone is ready for takeoff")
 
-    def _stage_08_launch_tello_map(self) -> None:
-        self._log.info("╔══ Stage 08: Launch tello_map (drone take-off + scan)")
+    def _stage_04_launch_tello_map(self) -> None:
+        self._log.info("╔══ Stage 04: Launch tello_map (drone take-off + scan)")
         proc = subprocess.Popen(
             ['ros2', 'launch', 'tello_pos_control', 'tello_map.launch.py'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self._processes['tello_map'] = proc
         self._log.info(f"  tello_map launched (pid={proc.pid})")
-        self._log.info("╚══ Stage 08 OK")
+        self._log.info("╚══ Stage 04 OK")
 
     def _wait_drone_state(self, target: int, timeout_sec: float) -> bool:
         """Block until /drone/state is exactly *target*, or *timeout_sec* elapses.
@@ -654,8 +654,8 @@ class MissionOrchestratorNode(Node):
                 self._drone_state_cond.wait(timeout=remaining)
             return True
 
-    def _stage_09_observe_drone_states(self) -> None:
-        self._log.info("╔══ Stage 09: Monitor drone state transitions")
+    def _stage_05_observe_drone_states(self) -> None:
+        self._log.info("╔══ Stage 05: Monitor drone state transitions")
         cfg_d = self._cfg['drone']
 
         state_names = {1: 'Stabilize', 2: 'Trajectory', 3: 'Going Back', 4: 'Landing'}
@@ -676,10 +676,10 @@ class MissionOrchestratorNode(Node):
                 raise MissionAbortError(f"Drone timeout in state {state} ({name})")
             self._log.info(f"  → State {state} ({name}) reached")
 
-        self._log.info("╚══ Stage 09 OK: Drone mission complete (state 4)")
+        self._log.info("╚══ Stage 05 OK: Drone mission complete (state 4)")
 
-    def _stage_10_wait_video_files(self) -> None:
-        self._log.info("╔══ Stage 10: Wait for video and telemetry files")
+    def _stage_06_wait_video_files(self) -> None:
+        self._log.info("╔══ Stage 06: Wait for video and telemetry files")
         cfg_v = self._cfg['video']
         video_dir = cfg_v['dir']
         video_path = os.path.join(video_dir, cfg_v['video_filename'])
@@ -727,7 +727,7 @@ class MissionOrchestratorNode(Node):
             age = now - os.path.getmtime(path)
             self._log.info(f"  {label}: {size_kb:.1f} KB, age={age:.0f}s — OK")
 
-        self._log.info("╚══ Stage 10 OK")
+        self._log.info("╚══ Stage 06 OK")
 
     def _stage_11_verify_video_integrity(self) -> None:
         self._log.info("╔══ Stage 11: Verify scan.mp4 integrity via ffmpeg")
@@ -956,17 +956,17 @@ class MissionOrchestratorNode(Node):
         self._log.info("━━━━━━━━━━━━━━━━  MISSION START  ━━━━━━━━━━━━━━━━")
         self._start_rosbag()
         try:
-            self._stage_01_ping()
-            self._stage_02_ssh_connect()
-            self._stage_03_launch_amr()
-            self._stage_04_wait_imu_ready()
-            self._stage_05_check_optitrack()
-            self._stage_05b_connect_tello_wifi()
-            self._stage_06_launch_tello_driver()
-            self._stage_07_drone_preflight()
-            self._stage_08_launch_tello_map()
-            self._stage_09_observe_drone_states()
-            self._stage_10_wait_video_files()
+            self._stage_01_check_optitrack()
+            self._stage_01b_connect_tello_wifi()
+            self._stage_02_launch_tello_driver()
+            self._stage_03_drone_preflight()
+            self._stage_04_launch_tello_map()
+            self._stage_05_observe_drone_states()
+            self._stage_06_wait_video_files()
+            self._stage_07_ping()
+            self._stage_08_ssh_connect()
+            self._stage_09_launch_amr()
+            self._stage_10_wait_imu_ready()
             self._stage_11_verify_video_integrity()
             self._stage_12_launch_trajectory_planner()
             self._stage_13_launch_map_fusion()

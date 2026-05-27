@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Hardware smoke-test: stages 10-20.
+Hardware smoke-test: post-scan pipeline (stages 06 + 11-20).
 
-Skips stages 01-09 (RPi ping, SSH, AMR bringup, IMU, OptiTrack, Tello WiFi,
-tello_driver, drone preflight, drone flight + scan).  Assumes scan.mp4 and
-telemetry.csv already exist in the configured video directory from a prior run.
+Skips the drone pipeline (stages 01-05) and the RPi/AMR/IMU pipeline
+(stages 07-10).  Assumes scan.mp4 and telemetry.csv already exist in the
+configured video directory from a prior run.
 
-Stages 10-20 run for real:
+Stages that run for real:
 
-  10   Wait for scan.mp4 and telemetry.csv in the configured video dir
+  06   Wait for scan.mp4 and telemetry.csv in the configured video dir
   11   Verify scan.mp4 integrity via ffmpeg
   12   Launch trajectory_planner  (skip with --trajectory-planner=false)
   13   Launch map_fusion
@@ -24,25 +24,29 @@ On success the script stays alive as a ROS 2 observer, keeping all spawned
 processes running.  Press Ctrl+C to stop and exit.
 
 Usage (from workspace root, after sourcing install/setup.bash):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s10_s20.py
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py
 
 When the files on disk are older than max_age_sec (typical for re-tests):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s10_s20.py --touch-files
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --touch-files
 
 Use a specific directory for scan.mp4 / telemetry.csv (overrides video.dir in YAML):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s10_s20.py --file-path /data/run42
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --file-path /data/run42
 
 Override ArUco marker IDs (AMR then goal):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s10_s20.py --aruco-ids '[3, 7]'
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --aruco-ids '[3, 7]'
 
 Skip trajectory_planner (stage 12):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s10_s20.py --trajectory-planner=false
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --trajectory-planner=false
+
+Note on stage numbering: old stage 10 (wait for video files) is now stage 06 in
+the new execution order.  The drone pipeline (01-05) and RPi/AMR/IMU pipeline
+(07-10) are all skipped by this script.
 
 Record a rosbag of all topics during the run:
-    python3 src/mission_orchestrator/scripts/run_hw_test_s10_s20.py --rosbag
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --rosbag
 
 With a custom config:
-    python3 src/mission_orchestrator/scripts/run_hw_test_s10_s20.py \\
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py \\
         --config /abs/path/to/orchestrator_params.yaml
 """
 
@@ -73,46 +77,47 @@ _DEFAULT_CONFIG = os.path.normpath(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Restricted orchestrator: stages 01-09 no-ops; 10-20 real
+# Restricted orchestrator: drone (01-05) and RPi/AMR/IMU (07-10) no-ops;
+# stage 06 + 11-20 real
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _HwTestOrchestrator(MissionOrchestratorNode):
-    """Stages 01-09 are no-ops; stages 10-20 run normally (stage 12 is flag-gated)."""
+    """Drone stages 01-05 and RPi/AMR/IMU stages 07-10 are no-ops; stage 06 + 11-20 run normally."""
 
     skip_trajectory_planner: bool = False
 
-    # ── No-op: RPi / AMR pipeline ────────────────────────────────────────────
+    # ── No-op: drone pipeline (01-05) ────────────────────────────────────────
 
-    def _stage_01_ping(self) -> None:
+    def _stage_01_check_optitrack(self) -> None:
         pass
 
-    def _stage_02_ssh_connect(self) -> None:
+    def _stage_01b_connect_tello_wifi(self) -> None:
         pass
 
-    def _stage_03_launch_amr(self) -> None:
+    def _stage_02_launch_tello_driver(self) -> None:
         pass
 
-    def _stage_04_wait_imu_ready(self) -> None:
+    def _stage_03_drone_preflight(self) -> None:
         pass
 
-    # ── No-op: drone pipeline ─────────────────────────────────────────────────
-
-    def _stage_05_check_optitrack(self) -> None:
+    def _stage_04_launch_tello_map(self) -> None:
         pass
 
-    def _stage_05b_connect_tello_wifi(self) -> None:
+    def _stage_05_observe_drone_states(self) -> None:
         pass
 
-    def _stage_06_launch_tello_driver(self) -> None:
+    # ── No-op: RPi / AMR / IMU pipeline (07-10) ─────────────────────────────
+
+    def _stage_07_ping(self) -> None:
         pass
 
-    def _stage_07_drone_preflight(self) -> None:
+    def _stage_08_ssh_connect(self) -> None:
         pass
 
-    def _stage_08_launch_tello_map(self) -> None:
+    def _stage_09_launch_amr(self) -> None:
         pass
 
-    def _stage_09_observe_drone_states(self) -> None:
+    def _stage_10_wait_imu_ready(self) -> None:
         pass
 
     # ── Flag-gated: trajectory_planner ───────────────────────────────────────
@@ -130,14 +135,14 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Hardware smoke-test: mission orchestrator stages 10-20.')
+        description='Hardware smoke-test: post-scan pipeline (stage 06 + stages 11-20).')
     parser.add_argument(
         '--config', default=_DEFAULT_CONFIG,
         help='Path to orchestrator_params.yaml (default: config/ inside this package)')
     parser.add_argument(
         '--touch-files', action='store_true',
         help=(
-            'Touch scan.mp4 and telemetry.csv before stage 10 runs, updating '
+            'Touch scan.mp4 and telemetry.csv before stage 06 runs, updating '
             'their mtime to now so the freshness check passes.  Use this when '
             'the files on disk are older than video.max_age_sec.'
         ),
@@ -220,7 +225,7 @@ def main() -> None:
 
     try:
         node.run()
-        # Stages 10-20 done; stay alive as observer
+        # Stage 06 + stages 11-20 done; stay alive as observer
         while rclpy.ok():
             time.sleep(1.0)
     except KeyboardInterrupt:
