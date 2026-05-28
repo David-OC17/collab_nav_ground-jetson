@@ -112,6 +112,17 @@ orchestrator:
     #   - /aruco/goal/pose
     #   - /drone/map
 
+  # ── Observer (post-handoff periodic state logging) ──────────────────────
+  observer:
+    rate_hz: 1.0                         # Log frequency once mission stages complete
+    topics:
+      - /amr/reference
+      - /amr/ekf/odom
+      - /aruco/amr/pose
+      - /aruco/goal/pose
+      - /amr/vel_raw
+      - /amr/imu/data_raw
+
   # ── Logging ─────────────────────────────────────────────────────────────
   logging:
     log_dir: "/tmp/mission_orchestrator_logs"

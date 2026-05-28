@@ -256,8 +256,11 @@ class SplineFollower(Node):
         Step 4 is done AFTER publishing so the reference corresponds exactly
         to the current arc-length, not a look-ahead position.
         """
+        if self.cs_x is None:
+            return
+
         # ── Idle: no path or goal already reached ─────────────────────────
-        if self.cs_x is None or self.goal_reached:
+        if self.goal_reached:
             self._publish_zero()
             return
 

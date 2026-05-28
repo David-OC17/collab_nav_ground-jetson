@@ -14,8 +14,8 @@ def generate_launch_description():
                               description='OccupancyGrid input topic'),
         DeclareLaunchArgument('goal_topic', default_value='/aruco/goal/pose',
                               description='Goal PoseWithCovarianceStamped topic'),
-        DeclareLaunchArgument('pose_topic', default_value='/amr/ekf/pose',
-                              description='Robot pose Odometry topic'),
+        DeclareLaunchArgument('pose_topic', default_value='/amr/ekf/odom',
+                              description='Robot pose EKF Odometry topic'),
 
         DeclareLaunchArgument('inflation_radius',         default_value='0.20',
                               description='Obstacle inflation radius [m]'),

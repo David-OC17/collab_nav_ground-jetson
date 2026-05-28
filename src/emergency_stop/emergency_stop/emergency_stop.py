@@ -22,7 +22,7 @@ class EmergencyStopNode(Node):
 
         # Subscriptions — add more triggers here as needed
         self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
-        self.create_subscription(Odometry, '/ekf/odom', self._odom_cb, 10)
+        self.create_subscription(Odometry, '/amr/ekf/odom', self._odom_cb, 10)
 
         # Publishers
         self._pub_stop   = self.create_publisher(Bool, '/amr/emergency_stop', 10)

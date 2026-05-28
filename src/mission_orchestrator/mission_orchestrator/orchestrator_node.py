@@ -60,8 +60,8 @@ from rclpy.qos import (
     HistoryPolicy,
 )
 
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from nav_msgs.msg import OccupancyGrid
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import BatteryState, Image, Imu
 from std_msgs.msg import Bool, Int32
 
@@ -101,6 +101,54 @@ def _kill_proc(
         proc.kill()
         proc.wait()
         log.info(f"Process '{name}' killed (SIGKILL).")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Observer: message formatters + topic registry
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _yaw_from_quat(q) -> float:
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def _fmt_odometry(msg: Odometry) -> str:
+    pos = msg.pose.pose.position
+    yaw = _yaw_from_quat(msg.pose.pose.orientation)
+    v   = msg.twist.twist.linear.x
+    w   = msg.twist.twist.angular.z
+    return (f"x={pos.x:7.3f}  y={pos.y:7.3f}  θ={math.degrees(yaw):7.2f}°"
+            f"  v={v:6.3f}  ω={w:6.3f}")
+
+
+def _fmt_pose_with_cov(msg: PoseWithCovarianceStamped) -> str:
+    pos = msg.pose.pose.position
+    yaw = _yaw_from_quat(msg.pose.pose.orientation)
+    return f"x={pos.x:7.3f}  y={pos.y:7.3f}  θ={math.degrees(yaw):7.2f}°"
+
+
+def _fmt_twist(msg: Twist) -> str:
+    return f"v={msg.linear.x:6.3f}  ω={msg.angular.z:6.3f}"
+
+
+def _fmt_imu(msg) -> str:  # sensor_msgs/Imu
+    a = msg.linear_acceleration
+    w = msg.angular_velocity
+    return (f"ax={a.x:6.3f}  ay={a.y:6.3f}  az={a.z:6.3f}"
+            f"  ωz={w.z:6.3f}")
+
+
+# Registry entry: (qos_key, display_label, msg_type, formatter)
+# qos_key: 'latched' for TRANSIENT_LOCAL topics, 'default' for everything else.
+_OBSERVER_REGISTRY: Dict[str, tuple] = {
+    '/amr/reference':   ('default', 'ref',       Odometry,                _fmt_odometry),
+    '/amr/ekf/odom':    ('default', 'ekf/odom',  Odometry,                _fmt_odometry),
+    '/aruco/amr/pose':  ('latched', 'amr_pose',  PoseWithCovarianceStamped, _fmt_pose_with_cov),
+    '/aruco/goal/pose': ('latched', 'goal_pose', PoseWithCovarianceStamped, _fmt_pose_with_cov),
+    '/amr/vel_raw':     ('default', 'vel_raw',   Twist,                   _fmt_twist),
+    '/imu/data_raw':    ('default', 'imu',       Imu,                     _fmt_imu),
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -153,6 +201,11 @@ class MissionOrchestratorNode(Node):
         self._estop_triggered: bool = False
 
         self._drone_map_event = threading.Event()
+
+        # Observer state (populated by _start_observer after mission handoff)
+        self._observer_cache: Dict[str, object] = {}
+        self._observer_lock = threading.Lock()
+        self._observer_topics: List[str] = []
 
         self._init_ros_interfaces()
         self._log.info("MissionOrchestratorNode initialised.")
@@ -1010,6 +1063,76 @@ class MissionOrchestratorNode(Node):
         self._log.info("╚══ Stage 20 OK: /drone/map live")
 
     # ────────────────────────────────────────────────────────────────────────
+    # Observer: post-handoff periodic state logging
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _start_observer(self) -> None:
+        cfg_obs = self._cfg.get('observer', {})
+        rate_hz = float(cfg_obs.get('rate_hz', 0.5))
+        topic_list = list(cfg_obs.get('topics', list(_OBSERVER_REGISTRY.keys())))
+
+        valid   = [t for t in topic_list if t in _OBSERVER_REGISTRY]
+        unknown = [t for t in topic_list if t not in _OBSERVER_REGISTRY]
+        if unknown:
+            self._log.warning(f"[observer] Unknown topics (skipped): {unknown}")
+        if not valid:
+            self._log.warning("[observer] No recognisable topics — observer disabled.")
+            return
+
+        latched = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        default = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+
+        for topic in valid:
+            qos_key, _, msg_type, _ = _OBSERVER_REGISTRY[topic]
+            qos = latched if qos_key == 'latched' else default
+            self.create_subscription(
+                msg_type, topic,
+                lambda msg, t=topic: self._observer_cb(t, msg),
+                qos,
+            )
+
+        self._observer_topics = valid
+        self.create_timer(1.0 / rate_hz, self._observer_tick)
+        self._log.info(
+            f"[observer] Started — {len(valid)} topic(s) at {rate_hz} Hz.")
+
+    def _observer_cb(self, topic: str, msg) -> None:
+        with self._observer_lock:
+            self._observer_cache[topic] = msg
+
+    def _observer_tick(self) -> None:
+        with self._observer_lock:
+            cache = dict(self._observer_cache)
+
+        if not self._observer_topics:
+            return
+
+        label_w = max(len(_OBSERVER_REGISTRY[t][1]) for t in self._observer_topics)
+        lines = ['[observer]']
+        for topic in self._observer_topics:
+            _, label, _, fmt_fn = _OBSERVER_REGISTRY[topic]
+            msg = cache.get(topic)
+            if msg is None:
+                content = '(no data yet)'
+            else:
+                try:
+                    content = fmt_fn(msg)
+                except Exception as exc:
+                    content = f'(format error: {exc})'
+            lines.append(f"  {label:<{label_w}}: {content}")
+        self._log.info('\n'.join(lines))
+
+    # ────────────────────────────────────────────────────────────────────────
     # Main orchestration loop
     # ────────────────────────────────────────────────────────────────────────
 
@@ -1045,6 +1168,7 @@ class MissionOrchestratorNode(Node):
                 "━━━━━━  MISSION ORCHESTRATION COMPLETE  ━━━━━━\n"
                 "map_fusion and trajectory_planner are now operating autonomously.\n"
                 "Press Ctrl+C to exit.")
+            self._start_observer()
 
         except MissionAbortError as exc:
             self._log.error(f"MISSION ABORTED: {exc}")

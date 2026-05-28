@@ -86,9 +86,9 @@ class AStarPlanner2(Node):
         # ------------------------------------------------------------------
 
         # Topics
-        self.declare_parameter('map_topic',        '/fusion/map')
+        self.declare_parameter('map_topic',        '/drone/map')
         self.declare_parameter('goal_topic',       '/aruco/goal/pose')
-        self.declare_parameter('pose_topic',       '/aruco/amr/pose')
+        self.declare_parameter('pose_topic',       '/amr/ekf/odom')
         self.declare_parameter('map_frame',        'map')
         self.declare_parameter('robot_base_frame', 'base_link')
 

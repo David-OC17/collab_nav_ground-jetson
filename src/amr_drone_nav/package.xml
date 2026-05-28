@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>amr_drone_nav</name>
+  <version>0.1.0</version>
+  <description>
+    Nav2 bring-up for AMR + drone map fusion in a 4x4 m arena.
+    Provides global costmap with drone + SLAM static layers, plus an
+    ArUco-based alignment node publishing world->slam_map.
+  </description>
+  <maintainer email="sebastian@example.com">Sebastian</maintainer>
+  <license>MIT</license>
+
+  <!-- Build / package tooling -->
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- Runtime deps for the Python nodes -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
+  <!-- Runtime deps for the Nav2 stack launched by this package -->
+  <exec_depend>nav2_planner</exec_depend>
+  <exec_depend>nav2_smac_planner</exec_depend>
+  <exec_depend>nav2_costmap_2d</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+
+  <!-- Optional helpers for the runbook -->
+  <exec_depend>tf2_tools</exec_depend>
+
+  <!-- Test deps -->
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -1,0 +1,72 @@
+# nav2_params.yaml — Global-costmap-only prototype for AMR + Drone fusion
+# Distro: ROS 2 Humble, Nav2 Humble
+# Arena: 4×4 m, frame `world`, resolution 0.05 m/cell
+
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 1.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.10
+      use_astar: true        # A* en lugar de Dijkstra
+      allow_unknown: false   # no planear a través de celdas desconocidas
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      # ── Frame y robot ───────────────────────────────────────────────
+      global_frame: world
+      robot_base_frame: base_footprint
+      use_sim_time: false
+      robot_radius: 0.15       # metros — medir y ajustar al ROSMASTER2 real
+
+      # ── Dimensiones del master grid (explícitas para evitar auto-resize) ──
+      resolution: 0.05         # m/cell
+      width: 4               # metros → 80 celdas
+      height: 4              # metros → 80 celdas
+      origin_x: 0.0            # esquina inferior-izquierda en frame world
+      origin_y: 0.0            # ajustar si el origen de OptiTrack es el centro
+      rolling_window: false      # master fijo
+
+      # ── Comportamiento general ───────────────────────────────────────
+      track_unknown_space: false       # distingue desconocido (-1) de libre (0)
+      always_send_full_costmap: true  # publica grid completo en cada ciclo
+
+      # ── Frecuencias ─────────────────────────────────────────────────
+      update_frequency: 1.0    # Hz — qué tan seguido se recalcula el master
+      publish_frequency: 1.0   # Hz — qué tan seguido se publica /global_costmap/costmap
+
+      # ── Layers (orden importa: drone base, SLAM overwrite, inflación) ──
+      plugins: ["drone_layer", "slam_layer", "inflation_layer"]
+
+      drone_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        enabled: true
+        map_subscribe_transient_local: true
+        subscribe_to_updates: true    # drone map es estático (una sola publicación)
+        map_topic: /drone/map
+        combination_method: 1          # Maximum — establece la base del costmap
+
+      slam_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        enabled: true                  # requiere que /map esté siendo publicado
+        map_subscribe_transient_local: true
+        subscribe_to_updates: true     # slam_toolbox publica actualizaciones continuas
+        map_topic: /map
+        combination_method: 1          # Overwrite — SLAM gana donde tiene datos
+        unknown_cost_value: -1
+        lethal_cost_treshold: 100
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        inflation_radius: 0.15         # metros de falloff alrededor de celdas letales
+        cost_scaling_factor: 3.0       # caída exponencial — aumentar = más agresivo
+
+lifecycle_manager_navigation:
+  ros__parameters:
+    autostart: true
+    node_names:
+      - planner_server
+    bond_timeout: 4.0

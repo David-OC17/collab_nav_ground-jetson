@@ -140,6 +140,9 @@ def aggregate(
 
     pos = _geometric_median(surviving, cfg)
     yaw = _circular_median_angle(surviving_y)
+
+
+    
     return AggregatedPose(
         position_m=pos, yaw_rad=yaw,
         n_observations=int(keep.sum()), rejected=False,
