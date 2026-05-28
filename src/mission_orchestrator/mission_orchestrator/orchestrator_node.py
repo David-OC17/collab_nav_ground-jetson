@@ -15,12 +15,12 @@ Stages
  07  Ping Raspberry Pi
  08  SSH connect to Raspberry Pi
  09  Start amr_bringup systemd service on Raspberry Pi; verify active
- 09b Launch emergency_stop node; verify next 10 /amr/emergency_stop messages are False
 10  Wait for /imu/data_raw to publish 200 messages (IMU running at 100 Hz)
 11  Verify scan.mp4 integrity via ffmpeg
 12  Launch trajectory_planner
 13  Launch map_fusion
 14  Launch oradar lidar
+ 14b Launch emergency_stop node; verify next 10 /amr/emergency_stop messages are False
 15  Launch arena_marker_localizer service node + wait for readiness
 16  Call /localize_markers service → parse marker poses
 17  Publish /aruco/amr/pose and /aruco/goal/pose as PoseWithCovarianceStamped
@@ -503,8 +503,8 @@ class MissionOrchestratorNode(Node):
 
         self._log.info(f"╚══ Stage 09 OK: {svc} is active")
 
-    def _stage_09b_launch_emergency_stop(self) -> None:
-        self._log.info("╔══ Stage 09b: Launch emergency_stop node")
+    def _stage_14b_launch_emergency_stop(self) -> None:
+        self._log.info("╔══ Stage 14b: Launch emergency_stop node")
         cfg_es = self._cfg.get('emergency_stop', {})
         topic = cfg_es.get('topic', '/amr/emergency_stop')
         n_samples = int(cfg_es.get('check_count', 10))
@@ -540,7 +540,7 @@ class MissionOrchestratorNode(Node):
                 "check AMR safety state before proceeding")
 
         self._log.info(
-            f"╚══ Stage 09b OK: {n_samples} messages on {topic} all False")
+            f"╚══ Stage 14b OK: {n_samples} messages on {topic} all False")
 
     def _stage_10_wait_imu_ready(self) -> None:
         n = self._cfg['imu']['message_count']
@@ -815,7 +815,7 @@ class MissionOrchestratorNode(Node):
     def _stage_12_launch_trajectory_planner(self) -> None:
         self._log.info("╔══ Stage 12: Launch trajectory_planner")
         proc = subprocess.Popen(
-            ['ros2', 'launch', 'trajectory_planner', 'trajectory_planner_launch.py'],
+            ['ros2', 'launch', 'trajectory_planner', 'planner_launch.py'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self._processes['trajectory_planner'] = proc
@@ -1027,12 +1027,12 @@ class MissionOrchestratorNode(Node):
             self._stage_07_ping()
             self._stage_08_ssh_connect()
             self._stage_09_launch_amr()
-            self._stage_09b_launch_emergency_stop()
             self._stage_10_wait_imu_ready()
             self._stage_11_verify_video_integrity()
             self._stage_12_launch_trajectory_planner()
             self._stage_13_launch_map_fusion()
             self._stage_14_launch_oradar()
+            self._stage_14b_launch_emergency_stop()
             self._stage_15_launch_marker_localizer()
             markers = self._stage_16_call_localize_markers()
             self._stage_17_publish_aruco_poses(markers)

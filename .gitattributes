@@ -2,3 +2,4 @@ src/drone_map_create/src/drone_map_create/data/** filter=lfs diff=lfs merge=lfs 
 src/arena_map_builder/data/** filter=lfs diff=lfs merge=lfs -text
 video/scan.mp4 filter=lfs diff=lfs merge=lfs -text
 video/telemetry.csv filter=lfs diff=lfs merge=lfs -text
+src/mission_orchestrator/recorded_data/scan10 filter=lfs diff=lfs merge=lfs -text

@@ -17,9 +17,9 @@ orchestrator:
 
   # ── IMU readiness ───────────────────────────────────────────────────────
   imu:
-    topic: "/imu/data_raw"
+    topic: "/amr/imu/data_raw"
     message_count: 200                  # Number of messages to wait for
-    timeout_sec: 30.0
+    timeout_sec: 60.0
 
   # ── OptiTrack ───────────────────────────────────────────────────────────
   optitrack:
@@ -70,7 +70,7 @@ orchestrator:
 
   # ── trajectory_planner ──────────────────────────────────────────────────
   trajectory_planner:
-    ready_topic: "/trajectory_planner/path"  # topic the node advertises on startup
+    ready_topic: "/trajectory_planner2/path"  # topic the node advertises on startup
     ready_timeout_sec: 30.0
 
   # ── map_fusion ──────────────────────────────────────────────────────────

@@ -63,6 +63,9 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
     def _stage_14_launch_oradar(self) -> None:
         pass
 
+    def _stage_14b_launch_emergency_stop(self) -> None:
+        pass
+
     def _stage_15_launch_marker_localizer(self) -> None:
         pass
 

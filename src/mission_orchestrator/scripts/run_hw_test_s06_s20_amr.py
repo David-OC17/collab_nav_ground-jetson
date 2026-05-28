@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Hardware smoke-test: post-scan pipeline (stages 06 + 11-20).
+Hardware smoke-test: AMR bringup + post-scan pipeline (stages 06-20, no drone).
 
-Skips the drone pipeline (stages 01-05) and the RPi/AMR/IMU pipeline
-(stages 07-10).  Assumes scan.mp4 and telemetry.csv already exist in the
-configured video directory from a prior run.
-
-Stages that run for real:
+Skips the drone pipeline (stages 01-05).  All RPi/AMR/IMU stages run for real:
 
   06   Wait for scan.mp4 and telemetry.csv in the configured video dir
+  07   Ping Raspberry Pi
+  08   SSH connect to Raspberry Pi
+  09   Start amr_bringup systemd service on Raspberry Pi
+  09b  Launch emergency_stop node; verify /amr/emergency_stop is clear
+  10   Wait for /imu/data_raw (IMU running)
   11   Verify scan.mp4 integrity via ffmpeg
   12   Launch trajectory_planner  (skip with --trajectory-planner=false)
   13   Launch map_fusion
@@ -20,33 +21,32 @@ Stages that run for real:
   19   Call BuildArenaMap action
   20   Publish /drone/map
 
+Use this script to test the full ground-robot pipeline against a pre-recorded
+drone scan, without needing to fly the drone again.
+
 On success the script stays alive as a ROS 2 observer, keeping all spawned
-processes running.  Press Ctrl+C to stop and exit.
+processes running.  Press Ctrl+C to stop the AMR service and exit.
 
 Usage (from workspace root, after sourcing install/setup.bash):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20_amr.py
 
 When the files on disk are older than max_age_sec (typical for re-tests):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --touch-files
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20_amr.py --touch-files
 
 Use a specific directory for scan.mp4 / telemetry.csv (overrides video.dir in YAML):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --file-path /data/run42
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20_amr.py --file-path /data/run42
 
 Override ArUco marker IDs (AMR then goal):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --aruco-ids '[3, 7]'
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20_amr.py --aruco-ids '[3, 7]'
 
 Skip trajectory_planner (stage 12):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --trajectory-planner=false
-
-Note on stage numbering: old stage 10 (wait for video files) is now stage 06 in
-the new execution order.  The drone pipeline (01-05) and RPi/AMR/IMU pipeline
-(07-10) are all skipped by this script.
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20_amr.py --trajectory-planner=false
 
 Record a rosbag of all topics during the run:
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --rosbag
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20_amr.py --rosbag
 
 With a custom config:
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py \\
+    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20_amr.py \\
         --config /abs/path/to/orchestrator_params.yaml
 """
 
@@ -77,12 +77,11 @@ _DEFAULT_CONFIG = os.path.normpath(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Restricted orchestrator: drone (01-05) and RPi/AMR/IMU (07-10) no-ops;
-# stage 06 + 11-20 real
+# Restricted orchestrator: drone (01-05) no-ops; stages 06-20 real
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _HwTestOrchestrator(MissionOrchestratorNode):
-    """Drone stages 01-05 and RPi/AMR/IMU stages 07-10 are no-ops; stage 06 + 11-20 run normally."""
+    """Drone stages 01-05 are no-ops; stages 06-20 (including AMR bringup) run normally."""
 
     skip_trajectory_planner: bool = False
 
@@ -106,22 +105,6 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
     def _stage_05_observe_drone_states(self) -> None:
         pass
 
-    # ── No-op: RPi / AMR / IMU pipeline (07-10) ─────────────────────────────
-
-    def _stage_07_ping(self) -> None:
-        pass
-
-    def _stage_08_ssh_connect(self) -> None:
-        pass
-
-    def _stage_09_launch_amr(self) -> None:
-        pass
-
-    def _stage_10_wait_imu_ready(self) -> None:
-        pass
-
-    # ── No-op: emergency_stop requires AMR (not running in this script) ─────────
-
     def _stage_14b_launch_emergency_stop(self) -> None:
         pass
 
@@ -140,7 +123,7 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Hardware smoke-test: post-scan pipeline (stage 06 + stages 11-20).')
+        description='Hardware smoke-test: AMR bringup + post-scan pipeline (stages 06-20, no drone).')
     parser.add_argument(
         '--config', default=_DEFAULT_CONFIG,
         help='Path to orchestrator_params.yaml (default: config/ inside this package)')
@@ -230,7 +213,7 @@ def main() -> None:
 
     try:
         node.run()
-        # Stage 06 + stages 11-20 done; stay alive as observer
+        # Stages 06-20 done; stay alive as observer
         while rclpy.ok():
             time.sleep(1.0)
     except KeyboardInterrupt:
@@ -239,8 +222,7 @@ def main() -> None:
         if not node._mission_complete:
             node._abort()
         node._stop_rosbag()
-        # _teardown_ssh is a no-op here (SSH was never opened)
-        node._teardown_ssh()
+        node._teardown_ssh()  # stops the AMR service and closes the SSH connection
         executor.shutdown(timeout_sec=5.0)
         node.destroy_node()
         if rclpy.ok():

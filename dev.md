@@ -1,7 +1,7 @@
 # LiDAR mapping - apt packages only
 
 ```bash
-colcon build --symlink-install --packages-select amr_optitrack arena_map_builder_msgs  arena_marker_localizer_interfaces local_costmap trajectory_planner arena_map_builder  arena_marker_localizer map_fusion oradar_lidar optitrack_client tello_driver tello_pos_control tello_msgs
+colcon build --symlink-install --packages-select amr_optitrack arena_map_builder_msgs  arena_marker_localizer_interfaces local_costmap trajectory_planner arena_map_builder  arena_marker_localizer map_fusion oradar_lidar optitrack_client tello_driver tello_pos_control tello_msgs emergency_stop
 ```
 
 In Jetson:
@@ -20,7 +20,7 @@ In Rasp:
 ros2 launch ekf_amr ekf_launch.py
 ros2 launch amr_bringup position_control_launch.py
 
-ros2 launch amr_bringup launch_rasp.py
+ros2 launch amr_bringup rasp_launch.py
 ```
 
 ## Arena map builder
@@ -73,7 +73,7 @@ python3 src/arena_map_builder/arena_map_builder/example_client.py /abs/path/vide
 
 ## Arena marker localizer   
 
-```bash\
+```bash
 # Terminal 1
 source install/setup.sh
 
@@ -88,6 +88,12 @@ source install/setup.sh
 ros2 service call /localize_markers arena_marker_localizer_interfaces/srv/LocalizeMarkers \
   "{video_path: '/absolute/path/to/your/video.mp4',
     optitrack_csv: '/absolute/path/to/your/optitrack.csv'}"
+```
+
+## Emergency stop AMR 
+
+```bash
+ros2 launch amr_safety emergency_stop.launch.py
 ```
 
 ## Drone init
@@ -151,9 +157,24 @@ echo "Exit code: $?"   # 0 = all dead, 1 = something survived
 
 ```bash
 # For scan10
-python3 src/mission_orchestrator/scripts/run_hw_test_s10_s20.py \
+python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py \
     --file-path /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10 \
     --aruco-ids '[1, 3]' \
     --touch-files \
     --trajectory-planner=false
+
+python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20_amr.py \
+    --file-path /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10 \
+    --aruco-ids '[0, 2]' \
+    --touch-files \
+    --trajectory-planner=false
+```
+
+Test planning and control loop that executes after orchestrator's handoff:
+```bash
+# Once per scan (slow — runs map builder + localizer):
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 10
+
+# Many times (fast — only AMR bringup + planning):
+python3 src/mission_orchestrator/scripts/run_hw_test_amr_nav.py --scan-id 10
 ```
