@@ -9,9 +9,9 @@ Plans a collision-free path on a fused occupancy grid using A* with:
   - Smart replanning: only replan when truly necessary
 
 Subscribes:
-  - /fusion/map              (nav_msgs/OccupancyGrid)               — fused occupancy grid
+  - /fusion/map              (nav_msgs/OccupancyGrid)                  — fused occupancy grid
   - /aruco/goal/pose         (geometry_msgs/PoseWithCovarianceStamped) — navigation goal
-  - /aruco/amr/pose          (geometry_msgs/PoseWithCovarianceStamped) — robot pose (continuous)
+  - /aruco/amr/pose          (nav_msgs/Odometry)                       — robot pose (continuous)
 
 Publishes:
   - /trajectory_planner2/path  (nav_msgs/Path)  — A* path waypoints
@@ -61,7 +61,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
-from nav_msgs.msg import OccupancyGrid, Path
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 
 # ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ class AStarPlanner2(Node):
         self.goal_sub = self.create_subscription(
             PoseWithCovarianceStamped, self.goal_topic, self._goal_callback, reliable_qos)
         self.pose_sub = self.create_subscription(
-            PoseWithCovarianceStamped, self.pose_topic, self._pose_callback, reliable_qos)
+            Odometry, self.pose_topic, self._pose_callback, reliable_qos)
 
         # ------------------------------------------------------------------
         # Publishers
@@ -330,7 +330,7 @@ class AStarPlanner2(Node):
         if self.map_received and self.pose_received:
             self._rate_limited_plan('new goal received')
 
-    def _pose_callback(self, msg: PoseWithCovarianceStamped):
+    def _pose_callback(self, msg: Odometry):
 
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y

@@ -15,7 +15,7 @@ def generate_launch_description():
         DeclareLaunchArgument('goal_topic', default_value='/aruco/goal/pose',
                               description='Goal PoseWithCovarianceStamped topic'),
         DeclareLaunchArgument('pose_topic', default_value='/amr/ekf/pose',
-                              description='Robot pose PoseWithCovarianceStamped topic'),
+                              description='Robot pose Odometry topic'),
 
         DeclareLaunchArgument('inflation_radius',         default_value='0.20',
                               description='Obstacle inflation radius [m]'),
