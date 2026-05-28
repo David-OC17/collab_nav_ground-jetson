@@ -69,6 +69,9 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
     def _stage_09_launch_amr(self) -> None:
         pass
 
+    def _stage_09b_launch_emergency_stop(self) -> None:
+        pass
+
     def _stage_10_wait_imu_ready(self) -> None:
         pass
 

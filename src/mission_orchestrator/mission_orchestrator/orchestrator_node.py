@@ -15,6 +15,7 @@ Stages
  07  Ping Raspberry Pi
  08  SSH connect to Raspberry Pi
  09  Start amr_bringup systemd service on Raspberry Pi; verify active
+ 09b Launch emergency_stop node; verify next 10 /amr/emergency_stop messages are False
 10  Wait for /imu/data_raw to publish 200 messages (IMU running at 100 Hz)
 11  Verify scan.mp4 integrity via ffmpeg
 12  Launch trajectory_planner
@@ -62,7 +63,7 @@ from rclpy.qos import (
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import BatteryState, Image, Imu
-from std_msgs.msg import Int32
+from std_msgs.msg import Bool, Int32
 
 from arena_map_builder_msgs.action import BuildArenaMap
 from arena_marker_localizer_interfaces.srv import LocalizeMarkers
@@ -146,6 +147,11 @@ class MissionOrchestratorNode(Node):
         self._video_path: Optional[str] = None
         self._telemetry_path: Optional[str] = None
 
+        self._estop_event = threading.Event()
+        self._estop_lock = threading.Lock()
+        self._estop_count: int = 0
+        self._estop_triggered: bool = False
+
         self._drone_map_event = threading.Event()
 
         self._init_ros_interfaces()
@@ -213,6 +219,9 @@ class MissionOrchestratorNode(Node):
             cfg['drone']['camera_topic'], self._camera_cb, best_effort)
         self.create_subscription(BatteryState,
             cfg['drone']['battery_topic'], self._battery_cb, 10)
+        self.create_subscription(Bool,
+            cfg.get('emergency_stop', {}).get('topic', '/amr/emergency_stop'),
+            self._emergency_stop_cb, 10)
         self.create_subscription(OccupancyGrid,
             cfg['map_builder']['drone_map_topic'], self._drone_map_cb, latched)
 
@@ -258,6 +267,19 @@ class MissionOrchestratorNode(Node):
     def _battery_cb(self, msg: BatteryState) -> None:
         self._battery_pct = float(msg.percentage)
         self._battery_event.set()
+
+    def _emergency_stop_cb(self, msg: Bool) -> None:
+        if self._estop_event.is_set():
+            return
+        with self._estop_lock:
+            if self._estop_event.is_set():
+                return
+            if msg.data:
+                self._estop_triggered = True
+            self._estop_count += 1
+            n = self._cfg.get('emergency_stop', {}).get('check_count', 10)
+            if self._estop_triggered or self._estop_count >= n:
+                self._estop_event.set()
 
     def _drone_map_cb(self, _msg: OccupancyGrid) -> None:
         self._drone_map_event.set()
@@ -480,6 +502,45 @@ class MissionOrchestratorNode(Node):
             time.sleep(1.0)
 
         self._log.info(f"╚══ Stage 09 OK: {svc} is active")
+
+    def _stage_09b_launch_emergency_stop(self) -> None:
+        self._log.info("╔══ Stage 09b: Launch emergency_stop node")
+        cfg_es = self._cfg.get('emergency_stop', {})
+        topic = cfg_es.get('topic', '/amr/emergency_stop')
+        n_samples = int(cfg_es.get('check_count', 10))
+        startup_timeout = float(cfg_es.get('startup_timeout_sec', 15.0))
+
+        proc = subprocess.Popen(
+            ['ros2', 'launch', 'emergency_stop', 'emergency_stop.launch.py'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._processes['emergency_stop'] = proc
+        self._log.info(f"  emergency_stop launched (pid={proc.pid})")
+
+        # Reset collection state before we start counting messages
+        with self._estop_lock:
+            self._estop_count = 0
+            self._estop_triggered = False
+        self._estop_event.clear()
+
+        # At 10 Hz, n_samples messages arrive in n_samples/10 s; add startup margin
+        total_timeout = startup_timeout + n_samples / 10.0 + 2.0
+        self._log.info(
+            f"  Waiting for {n_samples} messages on {topic} "
+            f"(timeout={total_timeout:.0f}s) …")
+
+        if not self._estop_event.wait(timeout=total_timeout):
+            raise MissionAbortError(
+                f"emergency_stop: received only {self._estop_count}/{n_samples} "
+                f"messages on {topic} within {total_timeout:.0f}s")
+
+        if self._estop_triggered:
+            raise MissionAbortError(
+                f"emergency_stop: ACTIVE signal detected on {topic} — "
+                "check AMR safety state before proceeding")
+
+        self._log.info(
+            f"╚══ Stage 09b OK: {n_samples} messages on {topic} all False")
 
     def _stage_10_wait_imu_ready(self) -> None:
         n = self._cfg['imu']['message_count']
@@ -966,6 +1027,7 @@ class MissionOrchestratorNode(Node):
             self._stage_07_ping()
             self._stage_08_ssh_connect()
             self._stage_09_launch_amr()
+            self._stage_09b_launch_emergency_stop()
             self._stage_10_wait_imu_ready()
             self._stage_11_verify_video_integrity()
             self._stage_12_launch_trajectory_planner()

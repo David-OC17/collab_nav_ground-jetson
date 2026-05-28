@@ -1,0 +1,4 @@
+emergency_stop:
+  ros__parameters:
+    min_obstacle_distance_m: 0.3
+    max_linear_speed_mps: 1
