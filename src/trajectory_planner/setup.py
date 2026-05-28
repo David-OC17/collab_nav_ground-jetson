@@ -9,7 +9,10 @@ setup(
     data_files=[
     ('share/ament_index/resource_index/packages', ['resource/trajectory_planner']),
     ('share/trajectory_planner', ['package.xml']),
-    ('share/trajectory_planner/launch', ['launch/trajectory_planner_launch.py']),
+    ('share/trajectory_planner/launch', [
+        'launch/trajectory_planner_launch.py',
+        'launch/planner_launch.py',
+    ]),
     ('share/trajectory_planner/config', ['config/trajectory_planner.rviz']),
 ],
     install_requires=['setuptools'],
