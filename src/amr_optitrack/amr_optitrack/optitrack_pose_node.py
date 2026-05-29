@@ -60,19 +60,20 @@ class OptiTrackPoseNode(Node):
             self._last_time = now
             return
 
-        # Current pose
-        x   = msg.pose.position.x
-        y   = msg.pose.position.y
-        yaw = self._quat_to_yaw(msg.pose.orientation)
+        # Current pose (rotated -90° around Z)
+        x, y, rot_q = self._rotate_z_neg90(
+            msg.pose.position.x, msg.pose.position.y, msg.pose.orientation)
+        yaw = self._quat_to_yaw(rot_q)
 
-        # Last pose
-        x0  = self._last_msg.pose.position.x
-        y0  = self._last_msg.pose.position.y
+        # Last pose (rotated -90° around Z)
+        x0, y0, rot_q0 = self._rotate_z_neg90(
+            self._last_msg.pose.position.x, self._last_msg.pose.position.y,
+            self._last_msg.pose.orientation)
 
         # Raw velocity in world frame
         dx_w = (x - x0) / dt
         dy_w = (y - y0) / dt
-        dth  = self._wrap(yaw - self._quat_to_yaw(self._last_msg.pose.orientation)) / dt
+        dth  = self._wrap(yaw - self._quat_to_yaw(rot_q0)) / dt
 
         # Rotate world-frame velocity → body frame
         c =  math.cos(yaw)
@@ -86,12 +87,12 @@ class OptiTrackPoseNode(Node):
         self._vy = a * vy_raw + (1.0 - a) * self._vy
         self._wz = a * dth   + (1.0 - a) * self._wz
 
-        self._publish(msg, x, y)
+        self._publish(msg, x, y, rot_q)
 
         self._last_msg  = msg
         self._last_time = now
 
-    def _publish(self, msg: PoseStamped, x: float, y: float):
+    def _publish(self, msg: PoseStamped, x: float, y: float, orientation):
         odom = Odometry()
         odom.header.stamp    = msg.header.stamp
         odom.header.frame_id = 'odom'
@@ -99,13 +100,30 @@ class OptiTrackPoseNode(Node):
 
         odom.pose.pose.position.x  = x
         odom.pose.pose.position.y  = y
-        odom.pose.pose.orientation = msg.pose.orientation
+        odom.pose.pose.orientation = orientation
 
         odom.twist.twist.linear.x  = self._vx
         odom.twist.twist.linear.y  = self._vy
         odom.twist.twist.angular.z = self._wz
 
         self._pub.publish(odom)
+
+    @staticmethod
+    def _rotate_z_neg90(x: float, y: float, q):
+        """Rotate position and orientation by -90 deg around Z.
+
+        Position: [x', y'] = R(-90°) * [x, y]  →  x' = y, y' = -x
+        Orientation: q' = q_rot(-90°,Z) * q,
+                     where q_rot = (w=√2/2, x=0, y=0, z=-√2/2)
+        """
+        from geometry_msgs.msg import Quaternion
+        s = math.sqrt(2.0) / 2.0
+        new_q = Quaternion()
+        new_q.w =  s * (q.w + q.z)
+        new_q.x =  s * (q.x + q.y)
+        new_q.y =  s * (q.y - q.x)
+        new_q.z =  s * (q.z - q.w)
+        return y, -x, new_q
 
     @staticmethod
     def _quat_to_yaw(q) -> float:
