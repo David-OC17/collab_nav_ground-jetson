@@ -15,6 +15,7 @@ install(PROGRAMS
   scripts/check_sync
   scripts/calibrate_extrinsics
   scripts/calibrate_bias
+  scripts/transform_telemetry
   DESTINATION lib/${PROJECT_NAME}
 )
 

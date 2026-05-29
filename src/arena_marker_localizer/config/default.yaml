@@ -21,13 +21,23 @@ marker_localizer_service:
 
     # ── Static transform: drone-body-frame from camera-frame ──
     #    (camera mounting position + rotation from OpenCV camera to body)
+    # Manually set
+    # T_drone_from_cam:
+    #   x: 0.035 # cm
+    #   y: 0.0
+    #   z: 0.0
+    #   roll: 3.14159 # flip camera +Z to point along drone -Z
+    #   pitch: 0.0
+    #   yaw: 0.0
+    
+    # Calibrated from video
     T_drone_from_cam:
-      x: 0.035 # cm
-      y: 0.0
-      z: 0.0
-      roll: 3.14159 # flip camera +Z to point along drone -Z
-      pitch: 0.0
-      yaw: 0.0
+      x    : -0.0350000
+      y    : 0.000000
+      z    : 0.000000
+      roll : 2.209156   # 126.575 deg
+      pitch: -0.118407   # -6.784 deg
+      yaw  : 0.045956   # 2.633 deg
 
     # ── Static transform: map-frame from OptiTrack-frame ──
     #    (where the OccupancyGrid origin sits in the OptiTrack frame)
@@ -37,7 +47,7 @@ marker_localizer_service:
       z: 0.0
       roll: 0.0
       pitch: 0.0
-      yaw: 1.570795
+      yaw: 1.570795 # 90.000 deg
 
     optitrack:
       yaw_axis: "z"     # "z" or "y"

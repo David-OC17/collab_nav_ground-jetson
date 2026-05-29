@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""
+transform_telemetry -- apply a T_drone_from_cam transform to a telemetry CSV.
+
+For each row in the input CSV the script computes:
+
+    T_opti_from_cam = T_opti_from_drone(row)  @  T_drone_from_cam
+
+and writes the resulting camera position (x, y, z) and yaw back to the
+same CSV format.  This is useful to pre-bake the extrinsic calibration so
+that the pipeline can be run with T_drone_from_cam = identity.
+
+Input CSV format  (produced by pos_controller_node / record_scan):
+    timestamp_sec,frame_id,pos_x,pos_y,pos_z,yaw
+
+Output: <input_dir>/telemetry-transformed.csv  (same format)
+
+Usage:
+    transform_telemetry --csv telemetry.csv \\
+        --x 0.035 --y 0.0 --z 0.0 \\
+        --roll 2.209156 --pitch -0.118407 --yaw 0.045956
+"""
+
+import argparse
+import csv
+import math
+import os
+import sys
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Geometry helpers (mirrors transforms.py without the ROS dependency)
+# ---------------------------------------------------------------------------
+
+def _euler_zyx_to_R(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    cr, sr = math.cos(roll),  math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw),   math.sin(yaw)
+    Rx = np.array([[1,  0,   0 ],
+                   [0,  cr, -sr],
+                   [0,  sr,  cr]], dtype=np.float64)
+    Ry = np.array([[ cp, 0, sp],
+                   [  0, 1,  0],
+                   [-sp, 0, cp]], dtype=np.float64)
+    Rz = np.array([[cy, -sy, 0],
+                   [sy,  cy, 0],
+                   [ 0,   0, 1]], dtype=np.float64)
+    return Rz @ Ry @ Rx
+
+
+def _R_to_yaw(R: np.ndarray) -> float:
+    """Extract the yaw (Z-axis rotation) from a ZYX rotation matrix."""
+    return math.atan2(R[1, 0], R[0, 0])
+
+
+def _make_T(x: float, y: float, z: float, R: np.ndarray) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[0, 3] = x
+    T[1, 3] = y
+    T[2, 3] = z
+    return T
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Apply T_drone_from_cam to each row of a telemetry CSV."
+    )
+    ap.add_argument("--csv", required=True,
+                    help="Path to the input telemetry.csv file.")
+    ap.add_argument("--x",     type=float, default=0.0, help="T x offset [m]")
+    ap.add_argument("--y",     type=float, default=0.0, help="T y offset [m]")
+    ap.add_argument("--z",     type=float, default=0.0, help="T z offset [m]")
+    ap.add_argument("--roll",  type=float, default=0.0, help="T roll  [rad]")
+    ap.add_argument("--pitch", type=float, default=0.0, help="T pitch [rad]")
+    ap.add_argument("--yaw",   type=float, default=0.0, help="T yaw   [rad]")
+    args = ap.parse_args()
+
+    if not os.path.isfile(args.csv):
+        sys.exit(f"ERROR: file not found: {args.csv!r}")
+
+    # Build the fixed T_drone_from_cam
+    T_dfc = _make_T(
+        args.x, args.y, args.z,
+        _euler_zyx_to_R(args.roll, args.pitch, args.yaw),
+    )
+
+    out_path = os.path.join(
+        os.path.dirname(os.path.abspath(args.csv)),
+        "telemetry-transformed.csv",
+    )
+
+    rows_in = rows_out = 0
+    with open(args.csv, newline="") as fin, open(out_path, "w", newline="") as fout:
+        reader = csv.DictReader(fin)
+        writer = csv.writer(fout)
+        writer.writerow(["timestamp_sec", "frame_id",
+                         "pos_x", "pos_y", "pos_z", "yaw"])
+
+        for row in reader:
+            rows_in += 1
+            try:
+                t_sec    = float(row["timestamp_sec"])
+                frame_id = int(row["frame_id"])
+                px       = float(row["pos_x"])
+                py       = float(row["pos_y"])
+                pz       = float(row["pos_z"])
+                drone_yaw = float(row["yaw"])
+            except (KeyError, ValueError) as e:
+                sys.exit(f"ERROR: malformed row {rows_in}: {e}")
+
+            # T_opti_from_drone uses yaw-only rotation (pitch=roll=0),
+            # matching the assumption in the pipeline.
+            T_opti_drone = _make_T(px, py, pz,
+                                   _euler_zyx_to_R(0.0, 0.0, drone_yaw))
+
+            T_opti_cam = T_opti_drone @ T_dfc
+
+            new_pos = T_opti_cam[:3, 3]
+            new_yaw = _R_to_yaw(T_opti_cam[:3, :3])
+
+            writer.writerow([
+                f"{t_sec:.3f}", frame_id,
+                f"{new_pos[0]:.3f}", f"{new_pos[1]:.3f}", f"{new_pos[2]:.3f}",
+                f"{new_yaw:.3f}",
+            ])
+            rows_out += 1
+
+    print(f"Transformed {rows_out}/{rows_in} rows")
+    print(f"  input  : {args.csv}")
+    print(f"  output : {out_path}")
+
+
+if __name__ == "__main__":
+    main()
