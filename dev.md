@@ -90,6 +90,28 @@ ros2 service call /localize_markers arena_marker_localizer_interfaces/srv/Locali
     optitrack_csv: '/absolute/path/to/your/optitrack.csv'}"
 ```
 
+Scripts:
+```bash
+# Calibrate extrinsincs
+calibrate_extrinsics \
+  --video /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10/scan.mp4 \
+  --csv   /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10/telemetry.csv \
+  --gt    calib_gt.yaml \
+  --config     src/arena_marker_localizer/config/default.yaml \
+  --intrinsics src/arena_marker_localizer/config/calibration.yaml
+
+# Check sync
+src/arena_marker_localizer/scripts/check_sync --video /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10/scan.mp4 --csv /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10/telemetry.csv
+
+# Calibrate bias (can use multiple videos)
+calibrate_bias \
+  --video scan10.mp4 --csv scan10.csv \
+  --gt    ground_truth.yaml \
+  --config     src/arena_marker_localizer/config/default.yaml \
+  --intrinsics src/arena_marker_localizer/config/calibration.yaml \
+  --out   corrected_T_map_from_opti.yaml
+```
+
 ## Emergency stop AMR 
 
 ```bash
@@ -191,4 +213,26 @@ uv run python benchmark_stitching.py --sift-only
 uv run python benchmark_stitching.py --provider cuda
 
 uv run python benchmark_stitching.py --provider trt --ort-only
+```
+
+## Making static drone videos
+
+```bash
+ros2 run optitrack_client optitrack_client
+
+ros2 launch tello_driver tello_driver.launch.py
+```
+
+```bash
+ros2 run tello_pos_control record_scan \
+    --ros-args -p duration_sec:=120.0
+
+# Custom output directory + undistortion (for calibration sessions)
+ros2 run tello_pos_control record_scan --ros-args \
+    -p output_dir:=/home/jetson/scans/calib01 \
+    -p duration_sec:=60.0 \
+    -p calibration_file:=/path/to/calibration.yaml
+
+# Run until Ctrl+C
+ros2 run tello_pos_control record_scan
 ```

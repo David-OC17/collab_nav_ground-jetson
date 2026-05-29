@@ -106,6 +106,15 @@ class PipelineConfig:
     frame (halves the workload at 30 fps, still yields ample observations
     for aggregation at min_observations=50)."""
 
+    # ── Velocity gate ─────────────────────────────────────────────────
+    max_drone_velocity_m_s: float = 0.0
+    """Drop frames where the drone speed exceeds this threshold [m/s].
+    0.0 = disabled (keep all frames).
+    When the drone is translating it maintains a pitch/roll proportional
+    to speed; dropping fast frames reduces the systematic position error
+    that results from ignoring pitch/roll in the transform chain.
+    Recommended starting value: 0.15 m/s."""
+
     # ── Diagnostics ────────────────────────────────────────────────────
     verbose: bool = False
 
@@ -251,10 +260,26 @@ def run_pipeline(
             return {"kind": "detected", "obs": obs_list, "pnp_fail": n_pnp_fail}
         return {"kind": "no_marker", "pnp_fail": n_pnp_fail}
 
+    # ── Precompute per-frame drone speed ─────────────────────────────
+    # Central differences for interior frames; forward/backward at edges.
+    # Speed is in m/s using OptiTrack timestamps for Δt.
+    n_poses = len(drone_poses)
+    drone_speed_m_s: List[float] = [0.0] * n_poses
+    for _i in range(n_poses):
+        _i0 = max(0, _i - 1)
+        _i1 = min(n_poses - 1, _i + 1)
+        dt = drone_poses[_i1].timestamp_sec - drone_poses[_i0].timestamp_sec
+        if dt > 1e-9:
+            drone_speed_m_s[_i] = float(
+                np.linalg.norm(drone_poses[_i1].pos_xyz - drone_poses[_i0].pos_xyz) / dt
+            )
+
+    vel_thresh = cfg.max_drone_velocity_m_s
+
     observations: Dict[int, _MarkerObservations] = {}
     dict_name_by_id: Dict[int, str] = {}
     stats = dict(read=0, quality_fail=0, no_marker=0, accepted=0,
-                 csv_short=0, pnp_fail=0)
+                 csv_short=0, pnp_fail=0, vel_filtered=0)
 
     n_workers = max(1, cfg.max_workers)
     max_inflight = n_workers * 2     # bound frames held in memory
@@ -291,6 +316,10 @@ def run_pipeline(
             if stride > 1 and i % stride != 0:
                 continue
 
+            if vel_thresh > 0.0 and drone_speed_m_s[i] > vel_thresh:
+                stats["vel_filtered"] += 1
+                continue
+
             while len(pending) >= max_inflight:
                 _drain_one()
 
@@ -302,7 +331,8 @@ def run_pipeline(
     cap.release()
 
     if cfg.verbose:
-        print(f"  Pipeline stats: {stats}")
+        pct_vel = (100.0 * stats["vel_filtered"] / max(1, stats["read"]))
+        print(f"  Pipeline stats: {stats}  ({pct_vel:.1f}% dropped by velocity gate)")
         print(f"  Unique marker IDs observed: {sorted(observations.keys())}")
 
     # ── 3) Aggregate per marker ───────────────────────────────────────

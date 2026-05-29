@@ -73,5 +73,9 @@ marker_localizer_service:
     processing:
       max_workers: 5
       frame_stride: 1
+      # Drop frames where OptiTrack speed exceeds this [m/s]. 0.0 = disabled.
+      # At 0.15 m/s a typical multirotor tilts ~3-4 deg; at 2 m altitude that
+      # is ~10 cm of systematic marker position error per frame.
+      max_drone_velocity_m_s: 0.15
 
     verbose: false

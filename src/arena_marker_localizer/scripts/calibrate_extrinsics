@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""
+calibrate_extrinsics -- calibrate T_drone_from_cam from a static session.
+
+The drone is held fixed on a stable mount with one or more ArUco markers at
+precisely known map-frame positions visible to the camera.  The script
+optimises all six parameters of T_drone_from_cam (x, y, z, roll, pitch, yaw)
+so that the full pipeline transform chain reproduces the known marker
+positions as closely as possible.
+
+Setup
+─────
+1. Fix the drone on a stable, level mount.
+2. Have OptiTrack running while recording a short video.
+3. Measure the (x, y, z, yaw) of each visible ArUco marker in the MAP frame.
+4. Create a ground-truth YAML (see format below) with the known positions.
+
+Usage
+─────
+  calibrate_extrinsics \\
+      --video   calib.mp4                  \\
+      --csv     calib.csv                  \\
+      --gt      calib_gt.yaml              \\
+      --config  config/default.yaml        \\
+      --intrinsics config/calibration.yaml
+
+Ground-truth YAML format (calib_gt.yaml)
+────────────────────────────────────────
+  markers:
+    5:
+      x: 1.20    # map frame, metres
+      y: 0.85
+      z: 0.0     # optional, default 0
+      yaw: 0.0   # optional, radians
+    12:
+      x: 2.40
+      y: 1.10
+
+Notes
+─────
+- More markers → better-conditioned optimisation. A single marker constrains
+  only some of the 6 DOF (enough for the dominant tilt correction).
+- The optimiser is initialised from the current config values, so the result
+  is best interpreted as a refinement rather than a full cold-start solution.
+- Results are printed in a form ready to paste into config/default.yaml.
+"""
+
+import argparse
+import math
+import sys
+
+import numpy as np
+import yaml
+import cv2
+
+try:
+    import scipy.optimize
+except ImportError:
+    sys.exit("ERROR: scipy is required. Install it with: pip install scipy")
+
+from arena_marker_localizer.intrinsics       import load_intrinsics
+from arena_marker_localizer.marker_detection import MultiDictDetector, DictionaryConfig
+from arena_marker_localizer.optitrack        import load_optitrack_csv
+from arena_marker_localizer.transforms       import (
+    StaticTransform6DoF, OptiTrackAxisConfig,
+    opti_transform_from_pose,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_ros_yaml(path: str) -> dict:
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    return raw.get("marker_localizer_service", {}).get("ros__parameters", raw)
+
+
+def _parse_static(p: dict, prefix: str) -> StaticTransform6DoF:
+    s = p.get(prefix, {})
+    return StaticTransform6DoF(
+        x=float(s.get("x", 0.0)), y=float(s.get("y", 0.0)),
+        z=float(s.get("z", 0.0)), roll=float(s.get("roll", 0.0)),
+        pitch=float(s.get("pitch", 0.0)), yaw=float(s.get("yaw", 0.0)),
+    )
+
+
+def _parse_dicts(p: dict) -> list:
+    out = []
+    for entry in p.get("dictionaries", ["DICT_4X4_50:0.135"]):
+        name, size = entry.split(":")
+        out.append(DictionaryConfig(name=name.strip(), marker_size_m=float(size.strip())))
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Detection collection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _collect_detections(video_path: str,
+                        detector: MultiDictDetector,
+                        intrinsics,
+                        max_reproj_err_px: float,
+                        stride: int = 1) -> dict:
+    """
+    Return {marker_id: [T_cam_marker, ...]} for every accepted detection.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        sys.exit(f"ERROR: cannot open video {video_path!r}")
+    n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    result: dict = {}
+    for i in range(n_total):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if stride > 1 and i % stride != 0:
+            continue
+        for det in detector.detect(frame, intrinsics):
+            if det.reproj_err <= max_reproj_err_px:
+                result.setdefault(det.marker_id, []).append(det.T_cam_marker)
+    cap.release()
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optimisation cost
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cost(params: np.ndarray,
+          detections_by_marker: dict,
+          T_opti_from_drone: np.ndarray,
+          T_map_from_opti: np.ndarray,
+          gt_xy: dict) -> float:
+    """
+    Mean squared XY map-frame position error across all detections of all
+    known markers.  params = [x, y, z, roll, pitch, yaw] of T_drone_from_cam.
+    """
+    x, y, z, roll, pitch, yaw = params
+    T_dfc = StaticTransform6DoF(
+        x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw
+    ).as_matrix()
+    base = T_map_from_opti @ T_opti_from_drone @ T_dfc
+
+    total = 0.0
+    n = 0
+    for mid, T_list in detections_by_marker.items():
+        if mid not in gt_xy:
+            continue
+        gxy = gt_xy[mid]
+        for T_cm in T_list:
+            est = (base @ T_cm)[:2, 3]
+            diff = est - gxy
+            total += float(np.dot(diff, diff))
+            n += 1
+    return total / max(1, n)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Calibrate T_drone_from_cam from a static calibration session."
+    )
+    ap.add_argument("--video",      required=True, help="Calibration video.")
+    ap.add_argument("--csv",        required=True,
+                    help="OptiTrack CSV recorded while drone is static.")
+    ap.add_argument("--gt",         required=True,
+                    help="Ground-truth YAML with known marker positions.")
+    ap.add_argument("--config",     required=True,
+                    help="Pipeline config YAML (config/default.yaml).")
+    ap.add_argument("--intrinsics", default=None,
+                    help="Camera intrinsics YAML (overrides the config value).")
+    ap.add_argument("--max-reproj-err", type=float, default=4.0, dest="max_reproj",
+                    help="Reprojection error gate for detections [px]. Default: 4.0.")
+    ap.add_argument("--stride", type=int, default=1,
+                    help="Use every Nth video frame. Default: 1.")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    # ── Config ─────────────────────────────────────────────────────────
+    cfg_p = _load_ros_yaml(args.config)
+    intrinsics_path = args.intrinsics or str(cfg_p.get("intrinsics_path", ""))
+    if not intrinsics_path:
+        sys.exit("ERROR: intrinsics_path not set in config; pass --intrinsics.")
+
+    intrinsics      = load_intrinsics(intrinsics_path)
+    T_map_from_opti = _parse_static(cfg_p, "T_map_from_opti").as_matrix()
+    init_dfc        = _parse_static(cfg_p, "T_drone_from_cam")
+    opti_cfg        = OptiTrackAxisConfig(
+        yaw_axis=str(cfg_p.get("optitrack", {}).get("yaw_axis", "z")),
+        x_dir=int(cfg_p.get("optitrack", {}).get("x_dir",    1)),
+        y_dir=int(cfg_p.get("optitrack", {}).get("y_dir",    1)),
+    )
+    flip = np.diag([float(opti_cfg.x_dir), float(opti_cfg.y_dir), 1.0, 1.0])
+    T_map_from_opti = T_map_from_opti @ flip
+
+    # ── Ground truth ───────────────────────────────────────────────────
+    with open(args.gt) as f:
+        gt_raw = yaml.safe_load(f)
+    gt_xy: dict = {}
+    for mid_str, vals in gt_raw.get("markers", {}).items():
+        gt_xy[int(mid_str)] = np.array([float(vals["x"]), float(vals["y"])])
+
+    if not gt_xy:
+        sys.exit("ERROR: no markers found in ground-truth YAML.")
+    print(f"Ground truth: {len(gt_xy)} marker(s): {sorted(gt_xy.keys())}")
+
+    # ── Drone mean pose from CSV (drone is static; average all rows) ───
+    drone_poses = load_optitrack_csv(args.csv)
+    if not drone_poses:
+        sys.exit(f"ERROR: CSV is empty: {args.csv!r}")
+
+    mean_pos = np.mean([dp.pos_xyz for dp in drone_poses], axis=0)
+    mean_yaw = math.atan2(
+        np.mean([math.sin(dp.yaw_rad) for dp in drone_poses]),
+        np.mean([math.cos(dp.yaw_rad) for dp in drone_poses]),
+    )
+    T_opti_from_drone = opti_transform_from_pose(mean_pos, mean_yaw, opti_cfg)
+
+    if args.verbose:
+        print(f"Drone mean position : {mean_pos}  yaw : {math.degrees(mean_yaw):.2f} deg")
+        print(f"Drone pose spread   : std = "
+              f"{np.std([dp.pos_xyz for dp in drone_poses], axis=0)}")
+
+    # ── Detect markers ─────────────────────────────────────────────────
+    detector   = MultiDictDetector(_parse_dicts(cfg_p))
+    detections = _collect_detections(
+        args.video, detector, intrinsics, args.max_reproj, args.stride
+    )
+
+    if args.verbose:
+        for mid, lst in sorted(detections.items()):
+            print(f"  Detected marker {mid}: {len(lst)} frame(s)")
+
+    known_detected = sorted(set(detections) & set(gt_xy))
+    if not known_detected:
+        sys.exit(
+            "ERROR: none of the ground-truth markers were detected in the video.\n"
+            f"  Ground-truth IDs : {sorted(gt_xy.keys())}\n"
+            f"  Detected IDs     : {sorted(detections.keys())}"
+        )
+    print(f"Known markers detected: {known_detected}  "
+          f"({sum(len(detections[m]) for m in known_detected)} total detections)")
+
+    if len(known_detected) == 1:
+        print("[NOTE] Only 1 known marker visible — 6 DOF are not fully constrained.\n"
+              "       The optimiser will minimise positional error but the result\n"
+              "       may not be unique.  Add more known markers for a better fit.")
+
+    # ── Optimise ───────────────────────────────────────────────────────
+    x0 = np.array([
+        init_dfc.x, init_dfc.y, init_dfc.z,
+        init_dfc.roll, init_dfc.pitch, init_dfc.yaw,
+    ])
+
+    bounds = [
+        (-0.5, 0.5), (-0.5, 0.5), (-0.5, 0.5),        # x, y, z  [m]
+        (-math.pi, math.pi), (-math.pi, math.pi),       # roll, pitch
+        (-math.pi, math.pi),                            # yaw
+    ]
+
+    init_rms = math.sqrt(_cost(x0, detections, T_opti_from_drone,
+                               T_map_from_opti, gt_xy)) * 100
+    print(f"\nInitial RMS XY error : {init_rms:.1f} cm")
+
+    result = scipy.optimize.minimize(
+        _cost, x0,
+        args=(detections, T_opti_from_drone, T_map_from_opti, gt_xy),
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"maxiter": 5000, "ftol": 1e-14, "gtol": 1e-10},
+    )
+
+    final_rms = math.sqrt(result.fun) * 100
+    print(f"Final  RMS XY error : {final_rms:.1f} cm")
+    if not result.success:
+        print(f"[WARN] Optimiser: {result.message}")
+
+    ox, oy, oz, oroll, opitch, oyaw = result.x
+
+    print(f"\n{'─'*60}")
+    print("Optimised T_drone_from_cam  (paste into config/default.yaml):")
+    print(f"{'─'*60}")
+    print(f"    T_drone_from_cam:")
+    print(f"      x    : {ox:.6f}")
+    print(f"      y    : {oy:.6f}")
+    print(f"      z    : {oz:.6f}")
+    print(f"      roll : {oroll:.6f}   # {math.degrees(oroll):.3f} deg")
+    print(f"      pitch: {opitch:.6f}   # {math.degrees(opitch):.3f} deg")
+    print(f"      yaw  : {oyaw:.6f}   # {math.degrees(oyaw):.3f} deg")
+    print(f"{'─'*60}")
+
+    if args.verbose:
+        labels = ["x", "y", "z", "roll", "pitch", "yaw"]
+        print("\nDelta from initial config:")
+        for lbl, v0, v1 in zip(labels, x0, result.x):
+            print(f"  {lbl:6s}: {v0:+.6f} → {v1:+.6f}  (Δ {v1-v0:+.6f})")
+
+
+if __name__ == "__main__":
+    main()

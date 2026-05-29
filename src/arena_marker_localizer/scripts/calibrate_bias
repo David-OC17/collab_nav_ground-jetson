@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""
+calibrate_bias -- post-hoc 2-D rigid correction for ArUco marker localisation.
+
+Runs the full localisation pipeline on one or more (video, CSV) pairs,
+compares the estimated positions of known markers against ground-truth
+measurements, and fits a 2-D rigid transform (Δx, Δy, Δθ) that best maps
+estimates to ground truth.
+
+The correction is absorbed into T_map_from_opti and the resulting values
+are written to a YAML file ready to paste into config/default.yaml.
+
+When more than one video is given, the per-marker position estimates are
+combined as a weighted mean (weighted by n_observations) before fitting.
+
+Usage
+─────
+  calibrate_bias \\
+      --video v1.mp4 --csv c1.csv          \\
+      --video v2.mp4 --csv c2.csv          \\
+      --gt    ground_truth.yaml            \\
+      --config  config/default.yaml        \\
+      --intrinsics config/calibration.yaml \\
+      --out   corrected_T_map_from_opti.yaml
+
+Ground-truth YAML format
+────────────────────────
+  # Known marker positions in the MAP frame (metres / radians).
+  # Minimum 1 marker (pure translation fit). 2+ markers enable rotation.
+  markers:
+    3:
+      x: 1.200
+      y: 0.850
+    7:
+      x: 2.100
+      y: 1.500
+
+Notes
+─────
+- The fitted correction absorbs ALL remaining systematic error into
+  T_map_from_opti.  Re-run this script whenever T_drone_from_cam or the
+  marker size changes, since those affect the bias.
+- At least 3 markers are recommended for a stable rotation estimate.
+  With 2 markers the rotation is determined but sensitive to noise.
+  With 1 marker only a translation is fitted (rotation forced to zero).
+"""
+
+import argparse
+import math
+import sys
+
+import numpy as np
+import yaml
+
+from arena_marker_localizer.pipeline import run_pipeline
+from arena_marker_localizer.aggregation import AggregationConfig
+from arena_marker_localizer.marker_detection import DictionaryConfig
+from arena_marker_localizer.quality import QualityConfig
+from arena_marker_localizer.transforms import (
+    StaticTransform6DoF, OptiTrackAxisConfig, R_to_euler_zyx,
+)
+from arena_marker_localizer.pipeline import PipelineConfig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_ros_yaml(path: str) -> dict:
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    return raw.get("marker_localizer_service", {}).get("ros__parameters", raw)
+
+
+def _parse_static(p: dict, prefix: str) -> StaticTransform6DoF:
+    s = p.get(prefix, {})
+    return StaticTransform6DoF(
+        x=float(s.get("x", 0.0)), y=float(s.get("y", 0.0)),
+        z=float(s.get("z", 0.0)), roll=float(s.get("roll", 0.0)),
+        pitch=float(s.get("pitch", 0.0)), yaw=float(s.get("yaw", 0.0)),
+    )
+
+
+def _build_pipeline_config(p: dict, intrinsics_path: str) -> PipelineConfig:
+    dicts = []
+    for entry in p.get("dictionaries", ["DICT_4X4_50:0.135"]):
+        name, size = entry.split(":")
+        dicts.append(DictionaryConfig(name=name.strip(), marker_size_m=float(size.strip())))
+
+    agg   = p.get("aggregation", {})
+    proc  = p.get("processing",  {})
+    grid  = p.get("grid",        {})
+    arena = p.get("arena",       {})
+    res   = float(grid.get("resolution_m_per_cell", 0.05))
+
+    return PipelineConfig(
+        intrinsics_path=intrinsics_path,
+        dictionaries=dicts,
+        quality=QualityConfig(
+            blur_thresh=float(p.get("quality", {}).get("blur_thresh", 60.0)),
+            artifact_thresh=float(p.get("quality", {}).get("artifact_thresh", 2.0)),
+        ),
+        T_drone_from_cam=_parse_static(p, "T_drone_from_cam"),
+        T_map_from_opti=_parse_static(p, "T_map_from_opti"),
+        optitrack_axis=OptiTrackAxisConfig(
+            yaw_axis=str(p.get("optitrack", {}).get("yaw_axis", "z")),
+            x_dir=int(p.get("optitrack", {}).get("x_dir", 1)),
+            y_dir=int(p.get("optitrack", {}).get("y_dir", 1)),
+        ),
+        max_reproj_err_px=float(p.get("max_reproj_err_px", 4.0)),
+        aggregation=AggregationConfig(
+            mad_k=float(agg.get("mad_k", 3.5)),
+            min_observations=int(agg.get("min_observations", 50)),
+            max_iterations=int(agg.get("max_iterations", 100)),
+            convergence_eps=float(agg.get("convergence_eps", 1e-5)),
+        ),
+        max_obs_per_marker=int(p.get("max_obs_per_marker", 200)),
+        max_workers=int(proc.get("max_workers", 4)),
+        frame_stride=int(proc.get("frame_stride", 1)),
+        max_drone_velocity_m_s=float(proc.get("max_drone_velocity_m_s", 0.0)),
+        resolution_m_per_cell=res,
+        grid_width_cells=math.ceil(float(arena.get("width_m", 4.0)) / res),
+        grid_height_cells=math.ceil(float(arena.get("height_m", 4.0)) / res),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2-D rigid transform fitting (closed-form Kabsch / Procrustes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fit_2d_rigid(estimated: np.ndarray, ground_truth: np.ndarray):
+    """
+    Fit R2, t such that  R2 @ estimated_i + t  ≈  ground_truth_i.
+    Both inputs are (N, 2).  Returns (R2 (2×2), theta_rad, t (2,)).
+    Guarantees det(R2) = +1 (no reflection).
+    """
+    p_bar = estimated.mean(axis=0)
+    q_bar = ground_truth.mean(axis=0)
+    P = estimated    - p_bar
+    Q = ground_truth - q_bar
+    H = P.T @ Q                                        # 2×2 cross-covariance
+    U, _, Vt = np.linalg.svd(H)
+    D  = np.diag([1.0, np.linalg.det(Vt.T @ U.T)])   # handles reflections
+    R2 = Vt.T @ D @ U.T
+    t  = q_bar - R2 @ p_bar
+    theta = math.atan2(R2[1, 0], R2[0, 0])
+    return R2, theta, t
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=(
+            "Estimate and correct systematic bias in ArUco marker localisation "
+            "using known ground-truth marker positions."
+        )
+    )
+    ap.add_argument("--video", required=True, action="append", dest="videos",
+                    metavar="VIDEO",
+                    help="Video path. Repeat flag for multiple videos.")
+    ap.add_argument("--csv", required=True, action="append", dest="csvs",
+                    metavar="CSV",
+                    help="OptiTrack CSV path. One per --video, same order.")
+    ap.add_argument("--gt", required=True,
+                    help="Ground-truth YAML with known marker positions.")
+    ap.add_argument("--config", required=True,
+                    help="Pipeline config YAML (config/default.yaml).")
+    ap.add_argument("--intrinsics", default=None,
+                    help="Camera intrinsics YAML (overrides the config value).")
+    ap.add_argument("--out", default="corrected_T_map_from_opti.yaml",
+                    help="Output YAML for the corrected T_map_from_opti. "
+                         "Default: corrected_T_map_from_opti.yaml")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    if len(args.videos) != len(args.csvs):
+        sys.exit("ERROR: number of --video and --csv arguments must match.")
+
+    pairs = list(zip(args.videos, args.csvs))
+
+    # ── Config ─────────────────────────────────────────────────────────
+    cfg_p = _load_ros_yaml(args.config)
+    intrinsics_path = args.intrinsics or str(cfg_p.get("intrinsics_path", ""))
+    if not intrinsics_path:
+        sys.exit("ERROR: intrinsics_path not set in config; pass --intrinsics.")
+
+    pipeline_cfg = _build_pipeline_config(cfg_p, intrinsics_path)
+
+    # ── Ground truth ───────────────────────────────────────────────────
+    with open(args.gt) as f:
+        gt_raw = yaml.safe_load(f)
+    gt: dict = {}
+    for mid_str, vals in gt_raw.get("markers", {}).items():
+        gt[int(mid_str)] = np.array([float(vals["x"]), float(vals["y"])])
+
+    if not gt:
+        sys.exit("ERROR: no markers found in ground-truth YAML.")
+
+    print(f"Ground truth : {len(gt)} marker(s): {sorted(gt.keys())}")
+    print(f"Videos       : {len(pairs)}")
+
+    # ── Run pipeline on each pair, accumulate estimates ────────────────
+    # {marker_id: [(xy, n_obs), ...]}  one entry per video where seen
+    accumulated: dict = {}
+
+    for idx, (video_path, csv_path) in enumerate(pairs):
+        print(f"\n[{idx+1}/{len(pairs)}] {video_path!r}")
+        try:
+            results, _ = run_pipeline(video_path, csv_path, pipeline_cfg)
+        except Exception as e:
+            print(f"  [WARN] pipeline failed: {e}  — skipping.")
+            continue
+
+        for mid, r in results.items():
+            xy = r.position_m[:2].copy()
+            accumulated.setdefault(mid, []).append((xy, r.n_observations))
+            if args.verbose:
+                print(f"  Marker {mid:3d}: ({xy[0]:.3f}, {xy[1]:.3f})  "
+                      f"n={r.n_observations}")
+
+    if not accumulated:
+        sys.exit("ERROR: pipeline produced no results from any video.")
+
+    # ── Weighted mean estimate per marker ──────────────────────────────
+    estimates: dict = {}
+    for mid, obs_list in accumulated.items():
+        total_w = sum(n for _, n in obs_list)
+        estimates[mid] = sum(xy * n for xy, n in obs_list) / total_w
+
+    # ── Match against ground truth ─────────────────────────────────────
+    common = sorted(set(estimates) & set(gt))
+    if not common:
+        sys.exit(
+            "ERROR: no overlap between pipeline results and ground-truth markers.\n"
+            f"  Estimated IDs : {sorted(estimates.keys())}\n"
+            f"  GT IDs        : {sorted(gt.keys())}"
+        )
+
+    est_pts = np.array([estimates[m] for m in common])  # (N, 2)
+    gt_pts  = np.array([gt[m]        for m in common])  # (N, 2)
+
+    # ── Per-marker residuals before correction ─────────────────────────
+    print(f"\nResiduals BEFORE correction  ({len(common)} marker(s)):")
+    pre_errs = []
+    for m, ep, gp in zip(common, est_pts, gt_pts):
+        e = np.linalg.norm(ep - gp)
+        pre_errs.append(e)
+        print(f"  Marker {m:3d}: est=({ep[0]:.3f}, {ep[1]:.3f})  "
+              f"gt=({gp[0]:.3f}, {gp[1]:.3f})  err={e*100:.1f} cm")
+    print(f"  RMS : {math.sqrt(np.mean(np.array(pre_errs)**2))*100:.1f} cm")
+
+    # ── Fit correction transform ───────────────────────────────────────
+    if len(common) == 1:
+        print(
+            "\n[NOTE] Only 1 matching marker — fitting a pure translation "
+            "(Δθ forced to zero)."
+        )
+        t     = gt_pts[0] - est_pts[0]
+        R2    = np.eye(2)
+        theta = 0.0
+    else:
+        R2, theta, t = _fit_2d_rigid(est_pts, gt_pts)
+
+    print(f"\nCorrection transform (2-D rigid):")
+    print(f"  Δx  : {t[0]*100:+.2f} cm")
+    print(f"  Δy  : {t[1]*100:+.2f} cm")
+    print(f"  Δθ  : {math.degrees(theta):+.3f} deg")
+
+    # ── Residuals after correction ─────────────────────────────────────
+    corrected = (R2 @ est_pts.T).T + t
+    post_errs = [np.linalg.norm(c - g) for c, g in zip(corrected, gt_pts)]
+
+    print(f"\nResiduals AFTER correction:")
+    for m, c, g, e in zip(common, corrected, gt_pts, post_errs):
+        print(f"  Marker {m:3d}: corr=({c[0]:.3f}, {c[1]:.3f})  "
+              f"gt=({g[0]:.3f}, {g[1]:.3f})  err={e*100:.1f} cm")
+    print(f"  RMS : {math.sqrt(np.mean(np.array(post_errs)**2))*100:.1f} cm")
+
+    # ── Absorb correction into T_map_from_opti ─────────────────────────
+    # T_new = T_correction @ T_old
+    T_correction = np.eye(4)
+    T_correction[:2, :2] = R2
+    T_correction[0, 3]   = t[0]
+    T_correction[1, 3]   = t[1]
+
+    T_old = _parse_static(cfg_p, "T_map_from_opti").as_matrix()
+    T_new = T_correction @ T_old
+
+    new_t                    = T_new[:3, 3]
+    new_roll, new_pitch, new_yaw = R_to_euler_zyx(T_new[:3, :3])
+
+    # ── Write output YAML ──────────────────────────────────────────────
+    out_data = {
+        "T_map_from_opti": {
+            "x":     round(float(new_t[0]),  6),
+            "y":     round(float(new_t[1]),  6),
+            "z":     round(float(new_t[2]),  6),
+            "roll":  round(float(new_roll),  6),
+            "pitch": round(float(new_pitch), 6),
+            "yaw":   round(float(new_yaw),   6),
+        }
+    }
+    with open(args.out, "w") as f:
+        yaml.dump(out_data, f, default_flow_style=False)
+
+    print(f"\nCorrected T_map_from_opti written to: {args.out!r}")
+    print("Replace the T_map_from_opti block in your config/default.yaml:")
+    print(f"\n    T_map_from_opti:")
+    print(f"      x    : {new_t[0]:.6f}")
+    print(f"      y    : {new_t[1]:.6f}")
+    print(f"      z    : {new_t[2]:.6f}")
+    print(f"      roll : {new_roll:.6f}   # {math.degrees(new_roll):.3f} deg")
+    print(f"      pitch: {new_pitch:.6f}   # {math.degrees(new_pitch):.3f} deg")
+    print(f"      yaw  : {new_yaw:.6f}   # {math.degrees(new_yaw):.3f} deg\n")
+
+
+if __name__ == "__main__":
+    main()

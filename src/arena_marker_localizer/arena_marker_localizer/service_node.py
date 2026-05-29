@@ -124,6 +124,7 @@ class MarkerLocalizerService(Node):
         # ── Parallel processing ────────────────────────────────────────
         self.declare_parameter("processing.max_workers",  4)
         self.declare_parameter("processing.frame_stride", 1)
+        self.declare_parameter("processing.max_drone_velocity_m_s", 0.0)
 
         self.declare_parameter("verbose", False)
 
@@ -201,6 +202,7 @@ class MarkerLocalizerService(Node):
             max_obs_per_marker = int(self._get("max_obs_per_marker")),
             max_workers  = int(self._get("processing.max_workers")),
             frame_stride = int(self._get("processing.frame_stride")),
+            max_drone_velocity_m_s = float(self._get("processing.max_drone_velocity_m_s")),
             resolution_m_per_cell = float(self._get("grid.resolution_m_per_cell")),
             grid_width_cells  = math.ceil(
                 float(self._get("arena.width_m"))  / float(self._get("grid.resolution_m_per_cell"))

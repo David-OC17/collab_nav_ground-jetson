@@ -12,6 +12,9 @@ ament_python_install_package(${PROJECT_NAME})
 
 install(PROGRAMS
   scripts/marker_localizer_service
+  scripts/check_sync
+  scripts/calibrate_extrinsics
+  scripts/calibrate_bias
   DESTINATION lib/${PROJECT_NAME}
 )
 
