@@ -173,8 +173,22 @@ python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20_amr.py \
 Test planning and control loop that executes after orchestrator's handoff:
 ```bash
 # Once per scan (slow — runs map builder + localizer):
-python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 10
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 10 --aruco-ids '[0, 2]'
 
 # Many times (fast — only AMR bringup + planning):
 python3 src/mission_orchestrator/scripts/run_hw_test_amr_nav.py --scan-id 10
+```
+
+## Benchmark LightGlue
+
+```bash
+cd src/LightGlue-ONNX
+
+uv run python benchmark_stitching.py --provider cpu
+
+uv run python benchmark_stitching.py --sift-only
+
+uv run python benchmark_stitching.py --provider cuda
+
+uv run python benchmark_stitching.py --provider trt --ort-only
 ```

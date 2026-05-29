@@ -86,7 +86,7 @@ from mission_orchestrator.scan_data_io import (  # noqa: E402
 _DEFAULT_CONFIG = os.path.normpath(
     os.path.join(_SCRIPTS_DIR, '..', 'config', 'orchestrator_params.yaml'))
 
-_POSE_TOPIC = '/amr/ekf/pose'   # nav_msgs/Odometry published by the EKF node
+_POSE_TOPIC = '/amr/ekf/odom'   # nav_msgs/Odometry published by the EKF node
 
 
 # ─────────────────────────────────────────────────────────────────────────────

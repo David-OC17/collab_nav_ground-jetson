@@ -45,6 +45,10 @@ class AggregatedPose:
     yaw_rad:         float
     n_observations:  int
     rejected:        bool         # True if min_observations not met
+    pos_var_x:      float = 1.0   # sample variance of inlier x positions [m²]
+    pos_var_y:      float = 1.0   # sample variance of inlier y positions [m²]
+    pos_cov_xy:     float = 0.0   # sample covariance of inlier (x,y) [m²]
+    yaw_var:        float = 1.0   # -2·ln(R_mean), circular dispersion [rad²]
 
 
 def _mad(values: np.ndarray) -> Tuple[float, float]:
@@ -97,35 +101,34 @@ def _geometric_median(points: np.ndarray, cfg: AggregationConfig) -> np.ndarray:
 
 
 def aggregate(
-    positions: np.ndarray,    # (N, 3)
-    yaws_rad:  np.ndarray,    # (N,)
-    cfg:       Optional[AggregationConfig] = None,
+    positions: np.ndarray,   # (N, 3)
+    yaws_rad:  np.ndarray,   # (N,)
+    cfg: Optional[AggregationConfig] = None,
 ) -> AggregatedPose:
-    """Run the full MAD-gate + geometric-median aggregation."""
-    cfg = cfg or AggregationConfig()
+
+    cfg       = cfg or AggregationConfig()
     positions = np.asarray(positions, dtype=np.float64)
     yaws_rad  = np.asarray(yaws_rad,  dtype=np.float64)
-    n_in = len(positions)
+    n_in      = len(positions)
+
     if n_in == 0:
         return AggregatedPose(
             position_m=np.zeros(3), yaw_rad=0.0,
             n_observations=0, rejected=True,
         )
 
-    # Per-axis MAD on x, y, z.
+    # ── MAD gate: x, y, z ────────────────────────────────────────────────
     keep = np.ones(n_in, dtype=bool)
     for i in range(3):
         m, mad = _mad(positions[:, i])
         if mad < 1e-9:
             continue
-        deviation = np.abs(positions[:, i] - m)
-        keep &= deviation <= cfg.mad_k * mad
+        keep &= np.abs(positions[:, i] - m) <= cfg.mad_k * mad
 
-    # Per-axis MAD on yaw — but yaw is angular, so compute residuals
-    # against the circular median first.
+    # ── MAD gate: yaw (circular) ─────────────────────────────────────────
     yaw_ref = _circular_median_angle(yaws_rad)
     yaw_res = np.abs(_angle_residuals(yaws_rad, yaw_ref))
-    mad_y = float(np.median(yaw_res))
+    mad_y   = float(np.median(yaw_res))
     if mad_y > 1e-9:
         keep &= yaw_res <= cfg.mad_k * mad_y
 
@@ -135,15 +138,43 @@ def aggregate(
             n_observations=int(keep.sum()), rejected=True,
         )
 
-    surviving = positions[keep]
-    surviving_y = yaws_rad[keep]
+    surviving   = positions[keep]    # (M, 3)
+    surviving_y = yaws_rad[keep]     # (M,)
 
+    # ── Robust pose estimate ─────────────────────────────────────────────
     pos = _geometric_median(surviving, cfg)
     yaw = _circular_median_angle(surviving_y)
 
+    # ── Position covariance: residuals from the geometric median ─────────
+    # Using residuals from pos (the geometric median) rather than the
+    # sample mean so the spread is centred on the actual estimate.
+    if len(surviving) > 1:
+        res = surviving - pos   # (M, 3)
+        dof = len(surviving) - 1
+        pos_var_x  = float(np.dot(res[:, 0], res[:, 0]) / dof)
+        pos_var_y  = float(np.dot(res[:, 1], res[:, 1]) / dof)
+        pos_cov_xy = float(np.dot(res[:, 0], res[:, 1]) / dof)
+    else:
+        pos_var_x  = 1.0
+        pos_var_y  = 1.0
+        pos_cov_xy = 0.0
 
-    
+    # ── Circular dispersion of yaw [rad²] ────────────────────────────────
+    # -2·ln(R_mean) is the von Mises analogue of variance in rad²,
+    # dimensionally consistent unlike the [0,1] circular variance.
+    R_mean  = math.sqrt(np.mean(np.sin(surviving_y))**2 +
+                        np.mean(np.cos(surviving_y))**2)
+    R_mean  = min(R_mean, 1.0 - 1e-9)   # guard log(0) when all yaws identical
+    yaw_var = float(-2.0 * math.log(R_mean))
+
     return AggregatedPose(
-        position_m=pos, yaw_rad=yaw,
-        n_observations=int(keep.sum()), rejected=False,
+        position_m=pos,
+        yaw_rad=yaw,
+        n_observations=int(keep.sum()),
+        rejected=False,
+        pos_var_x=pos_var_x,
+        pos_var_y=pos_var_y,
+        pos_cov_xy=pos_cov_xy,
+        yaw_var=yaw_var,
     )
+        

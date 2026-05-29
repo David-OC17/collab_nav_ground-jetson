@@ -9,7 +9,7 @@ marker_localizer_service:
 
     # ── ArUco dictionaries to scan, format "DICT_NAME:size_m" ──
     dictionaries:
-      - "DICT_4X4_50:0.10"
+      - "DICT_4X4_50:0.135"
 
     # ── Frame quality gates ──
     quality:
@@ -32,8 +32,8 @@ marker_localizer_service:
     # ── Static transform: map-frame from OptiTrack-frame ──
     #    (where the OccupancyGrid origin sits in the OptiTrack frame)
     T_map_from_opti:
-      x: 1.57 # cm
-      y: 1.57 # cm
+      x: 1.93 # cm
+      y: 1.91 # cm
       z: 0.0
       roll: 0.0
       pitch: 0.0

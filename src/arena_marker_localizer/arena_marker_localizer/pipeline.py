@@ -146,6 +146,10 @@ class MarkerResult:
     cell_x:         int
     cell_y:         int
     n_observations: int
+    pos_var_x:     float = 1.0  # ← Sample variance of inlier x positions [m²]
+    pos_var_y:     float = 1.0  # ← Sample variance of inlier y positions [m²]
+    pos_cov_xy:    float = 0.0  # ← Sample covariance of inlier (x,y) [m²]
+    yaw_var:       float = 1.0  # ← Circular dispersion of inlier yaws [rad²]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -321,6 +325,10 @@ def run_pipeline(
             cell_x=cell_x,
             cell_y=cell_y,
             n_observations=agg.n_observations,
+            pos_var_x=agg.pos_var_x,
+            pos_var_y=agg.pos_var_y,
+            pos_cov_xy=agg.pos_cov_xy,
+            yaw_var=agg.yaw_var,
         )
 
     return results, drone_poses

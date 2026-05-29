@@ -60,7 +60,7 @@ from rclpy.qos import (
     HistoryPolicy,
 )
 
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+from geometry_msgs.msg import Point, PoseStamped, PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import BatteryState, Image, Imu
 from std_msgs.msg import Bool, Int32
@@ -139,6 +139,10 @@ def _fmt_imu(msg) -> str:  # sensor_msgs/Imu
             f"  ωz={w.z:6.3f}")
 
 
+def _fmt_point(msg: Point) -> str:
+    return f"x={msg.x:7.3f}  y={msg.y:7.3f}  z={msg.z:7.3f}"
+
+
 # Registry entry: (qos_key, display_label, msg_type, formatter)
 # qos_key: 'latched' for TRANSIENT_LOCAL topics, 'default' for everything else.
 _OBSERVER_REGISTRY: Dict[str, tuple] = {
@@ -148,6 +152,7 @@ _OBSERVER_REGISTRY: Dict[str, tuple] = {
     '/aruco/goal/pose': ('latched', 'goal_pose', PoseWithCovarianceStamped, _fmt_pose_with_cov),
     '/amr/vel_raw':     ('default', 'vel_raw',   Twist,                   _fmt_twist),
     '/imu/data_raw':    ('default', 'imu',       Imu,                     _fmt_imu),
+    '/amr/error':       ('default', 'error',     Point,                   _fmt_point),
 }
 
 

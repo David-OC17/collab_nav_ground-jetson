@@ -64,7 +64,7 @@ orchestrator:
   # ── ArUco pose publication ───────────────────────────────────────────────
   aruco:
     amr_marker_id: 0                     # MarkerPose.id for the AMR
-    goal_marker_id: 1                    # MarkerPose.id for the goal
+    goal_marker_id: 2                    # MarkerPose.id for the goal
     amr_pose_topic: "/aruco/amr/pose"
     goal_pose_topic: "/aruco/goal/pose"
 
@@ -121,7 +121,7 @@ orchestrator:
       - /aruco/amr/pose
       - /aruco/goal/pose
       - /amr/vel_raw
-      - /amr/imu/data_raw
+      - /amr/error
 
   # ── Logging ─────────────────────────────────────────────────────────────
   logging:

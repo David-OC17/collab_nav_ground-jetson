@@ -238,37 +238,48 @@ class MarkerLocalizerService(Node):
             theta=float(r.yaw_rad),
         )
 
-        # ── pose_with_covariance ──
-        # Diagonal covariance scales with 1/n_observations so that more
-        # observations → tighter uncertainty estimate.
         n = max(1, int(r.n_observations))
-        base_var_pos = float(self._get("pose_cov.base_var_pos"))
-        base_var_yaw = float(self._get("pose_cov.base_var_yaw"))
+
+        MIN_COV_POS = 1e-4   # 1 cm² minimum per axis
+        MIN_COV_YAW = 1e-3   # ~0.032 rad minimum std dev
+
+        cov_xx  = max(r.pos_var_x / n, MIN_COV_POS)
+        cov_yy  = max(r.pos_var_y / n, MIN_COV_POS)
+        cov_xy  = r.pos_cov_xy / n   # off-diagonal: no floor
+        cov_yaw = max(r.yaw_var  / n, MIN_COV_YAW)
+
+        large = 1e6
+        cov36 = [0.0] * 36
+        cov36[0]  = cov_xx   # x–x
+        cov36[1]  = cov_xy   # x–y
+        cov36[6]  = cov_xy   # y–x
+        cov36[7]  = cov_yy   # y–y
+        cov36[14] = large     # z–z   (unknown)
+        cov36[21] = large     # roll  (unknown)
+        cov36[28] = large     # pitch (unknown)
+        cov36[35] = cov_yaw  # yaw–yaw
+
         frame_id = str(self._get("pose_cov.frame_id"))
 
-        cov_pos = base_var_pos / n
-        cov_yaw = base_var_yaw / n
-        large = 1e6  # very uncertain (unused axes in 2D)
-
-        cov36 = [0.0] * 36
-        cov36[0]  = cov_pos   # x–x
-        cov36[7]  = cov_pos   # y–y
-        cov36[14] = large      # z–z
-        cov36[21] = large      # roll–roll
-        cov36[28] = large      # pitch–pitch
-        cov36[35] = cov_yaw   # yaw–yaw
-
         pwcs = PoseWithCovarianceStamped()
-        pwcs.header.stamp = stamp
+        pwcs.header.stamp    = stamp
         pwcs.header.frame_id = frame_id
-        pwcs.pose.pose = msg.pose_3d
+        pwcs.pose.pose       = msg.pose_3d
         pwcs.pose.covariance = cov36
         msg.pose_with_covariance = pwcs
 
-        msg.cell_x = int(r.cell_x)
-        msg.cell_y = int(r.cell_y)
+        msg.cell_x         = int(r.cell_x)
+        msg.cell_y         = int(r.cell_y)
         msg.n_observations = int(r.n_observations)
+
+        self.get_logger().debug(
+            f'Marker {r.marker_id}: n={n} '
+            f'pos_var=({r.pos_var_x:.4f},{r.pos_var_y:.4f}) → '
+            f'cov_xx={cov_xx:.4f} cov_yy={cov_yy:.4f} m² | '
+            f'yaw_var={r.yaw_var:.4f} → cov_yaw={cov_yaw:.4f} rad²'
+        )
         return msg
+
 
     # -----------------------------------------------------------------------
     # Service callback
