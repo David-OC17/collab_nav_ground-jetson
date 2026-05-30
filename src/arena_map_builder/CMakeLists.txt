@@ -21,6 +21,10 @@ install(DIRECTORY config
   DESTINATION share/${PROJECT_NAME}/
   OPTIONAL
 )
+install(DIRECTORY data/models
+  DESTINATION share/${PROJECT_NAME}/data/
+  OPTIONAL
+)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

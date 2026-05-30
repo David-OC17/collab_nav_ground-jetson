@@ -93,15 +93,15 @@ ros2 service call /localize_markers arena_marker_localizer_interfaces/srv/Locali
 Scripts:
 ```bash
 # Calibrate extrinsincs
-calibrate_extrinsics \
-  --video /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10/scan.mp4 \
-  --csv   /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10/telemetry.csv \
-  --gt    calib_gt.yaml \
-  --config     src/arena_marker_localizer/config/default.yaml \
-  --intrinsics src/arena_marker_localizer/config/calibration.yaml
+src/arena_marker_localizer/scripts/calibrate_extrinsics \
+  --video /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/static_scans/video1/scan.mp4 \
+  --csv   /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/static_scans/video1/telemetry.csv \
+  --gt    /home/jetson/collab_nav_ground-jetson/src/arena_marker_localizer/config/calib_gt.yaml \
+  --config     /home/jetson/collab_nav_ground-jetson/src/arena_marker_localizer/config/default.yaml \
+  --intrinsics /home/jetson/collab_nav_ground-jetson/src/arena_marker_localizer/config/calibration.yaml
 
 # Check sync
-src/arena_marker_localizer/scripts/check_sync --video /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10/scan.mp4 --csv /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10/telemetry.csv
+src/arena_marker_localizer/scripts/check_sync --video /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/static_scans/video1/scan.mp4 --csv /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/static_scans/video1/telemetry.csv
 
 # Calibrate bias (can use multiple videos)
 calibrate_bias \
@@ -203,21 +203,28 @@ python3 src/mission_orchestrator/scripts/run_hw_test_amr_nav.py --scan-id 10
 
 ## Benchmark LightGlue
 
+See `src/LightGlue-ONNX/dev.md` for full setup instructions (environment, model export, troubleshooting).
+
 ```bash
 cd src/LightGlue-ONNX
 
-uv run python benchmark_stitching.py --provider cpu
-
+# SIFT baseline (~18 ms for 24 pairs)
 uv run python benchmark_stitching.py --sift-only
 
+# Unified SP+LG pipeline — Path A (re-runs SP per pair: ~6641 ms/frame, infeasible)
 uv run python benchmark_stitching.py --provider cuda
 
-uv run python benchmark_stitching.py --provider trt --ort-only
+# Split pipeline — Path B (extract once, match 24× with LG-only ONNX)
+uv run python benchmark_stitching.py --split --provider cuda
+uv run python benchmark_stitching.py --split --provider cpu
 ```
 
 ## Making static drone videos
 
 ```bash
+nmcli device wifi list ifname wlx14ebb67dae0b
+sudo nmcli device wifi connect "TELLO-594992" ifname wlx14ebb67dae0b
+
 ros2 run optitrack_client optitrack_client
 
 ros2 launch tello_driver tello_driver.launch.py
@@ -235,4 +242,13 @@ ros2 run tello_pos_control record_scan --ros-args \
 
 # Run until Ctrl+C
 ros2 run tello_pos_control record_scan
+```
+
+## Transform telemetry
+
+```bash
+transform_telemetry \
+  --csv /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/static_scans/video1/telemetry.csv \
+  --x 0.0 --y 0.0 --z 0.0 \
+  --roll 0.0 --pitch 0.0 --yaw 1.570795
 ```

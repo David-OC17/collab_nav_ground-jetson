@@ -142,7 +142,7 @@ class BuildArenaMapServer(Node):
         self.declare_parameter("stitch.reconstruct.processing_scale",          1.0)
         self.declare_parameter("stitch.reconstruct.max_keyframes",              20)
         self.declare_parameter("stitch.reconstruct.max_canvas_px",            8000)
-        self.declare_parameter("stitch.reconstruct.match_ratio",              0.95)
+        self.declare_parameter("stitch.reconstruct.match_ratio",              0.70)
         self.declare_parameter("stitch.reconstruct.mad_factor",                6.0)
         self.declare_parameter("stitch.reconstruct.feature_exclude_dilate_px",   5)
         self.declare_parameter("stitch.reconstruct.min_keypoint_bins",          10)
@@ -155,6 +155,12 @@ class BuildArenaMapServer(Node):
         self.declare_parameter("stitch.reconstruct.grid_hsv_h_hi",             130)
         self.declare_parameter("stitch.reconstruct.grid_hsv_s_lo",              50)
         self.declare_parameter("stitch.reconstruct.grid_hsv_v_lo",              50)
+
+        # Feature backend
+        self.declare_parameter("stitch.reconstruct.feature_backend",  "sift")
+        self.declare_parameter("stitch.reconstruct.sp_ort_provider",  "cuda")
+        self.declare_parameter("stitch.reconstruct.sp_onnx_path",     "")
+        self.declare_parameter("stitch.reconstruct.lg_onnx_path",     "")
 
         # ColorRangeMask lists — encoded as string arrays where each item is
         #   "name:h_lo,h_hi,s_lo,s_hi,v_lo,v_hi:B,G,R"
@@ -314,6 +320,8 @@ class BuildArenaMapServer(Node):
         )
 
     def _build_reconstruct_cfg(self) -> ReconstructConfig:
+        _sp_path = str(self._get("stitch.reconstruct.sp_onnx_path")) or None
+        _lg_path = str(self._get("stitch.reconstruct.lg_onnx_path")) or None
         return ReconstructConfig(
             canvas_margin             = int(self._get("stitch.reconstruct.canvas_margin")),
             min_inliers               = int(self._get("stitch.reconstruct.min_inliers")),
@@ -339,6 +347,10 @@ class BuildArenaMapServer(Node):
                 "stitch.reconstruct.color_masks"),
             feature_exclude_hsv       = self._parse_color_mask_list(
                 "stitch.reconstruct.feature_exclude_hsv"),
+            feature_backend           = str(self._get("stitch.reconstruct.feature_backend")),
+            sp_ort_provider           = str(self._get("stitch.reconstruct.sp_ort_provider")),
+            sp_onnx_path              = _sp_path,
+            lg_onnx_path              = _lg_path,
         )
 
     def _build_transfer_cfg(self) -> TransferConfig:
@@ -414,7 +426,7 @@ class BuildArenaMapServer(Node):
             extract_cfg=extract_cfg,
             reconstruct_cfg=reconstruct_cfg,
             save_path=stitched_path,
-            verbose=False,
+            verbose=True,  # TODO: revert after diagnostics
         )
         if stitched is None:
             return self._abort(goal_handle, "Stitching returned None.")

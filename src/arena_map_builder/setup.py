@@ -1,3 +1,6 @@
+import os
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'arena_map_builder'
@@ -10,6 +13,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/arena_map_builder']),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/data/models',
+            glob(os.path.join('data', 'models', '*.onnx'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

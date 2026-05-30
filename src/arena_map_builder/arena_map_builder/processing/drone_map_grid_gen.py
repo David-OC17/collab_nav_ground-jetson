@@ -184,8 +184,11 @@ def _keypoint_spread_ok(
     if len(kp) < min_filled:
         return False, f"too_few_kp={len(kp)}"
 
-    xs = np.fromiter((p.pt[0] for p in kp), dtype=np.float32, count=len(kp))
-    ys = np.fromiter((p.pt[1] for p in kp), dtype=np.float32, count=len(kp))
+    if isinstance(kp, np.ndarray):
+        xs, ys = kp[:, 0].astype(np.float32), kp[:, 1].astype(np.float32)
+    else:
+        xs = np.fromiter((p.pt[0] for p in kp), dtype=np.float32, count=len(kp))
+        ys = np.fromiter((p.pt[1] for p in kp), dtype=np.float32, count=len(kp))
 
     bx = np.clip((xs * bins / frame_w).astype(np.int32), 0, bins - 1)
     by = np.clip((ys * bins / frame_h).astype(np.int32), 0, bins - 1)
@@ -622,6 +625,7 @@ def _pairwise_H(
     grid_pts_cur: Optional[np.ndarray] = None,
     grid_match_dist: float = 25.0,
     grid_min_matches: int = 4,
+    lg_session=None,
 ) -> tuple:
     """
     Compute H mapping cur → ref coordinate space via similarity-RANSAC.
@@ -658,29 +662,48 @@ def _pairwise_H(
     ──────────────────────────────────────
     If grid_pts_ref and grid_pts_cur are supplied and enough matches are
     found, a second RANSAC pass refits the similarity on the combined set
-    of Stage-1 SIFT inliers + grid intersection correspondences, using a
+    of Stage-1 feature inliers + grid intersection correspondences, using a
     tighter reprojection threshold (2.0 px instead of 3.0 px).
 
     Grid intersections are subpixel-accurate geometric landmarks that are
     immune to descriptor ambiguity — they either match (within max_dist of
     the projected prediction) or don't, with no false positives.  Adding
     them tightens the rotation and scale estimate, which is where drift
-    accumulates most severely across hundreds of frames.
+    accumulates most severely across hundreds of frames.  Stage 2 is
+    complementary to both SIFT and SP+LG backends.
 
     The refined result is used only when it produces at least as many
     inliers as Stage 1 and passes all validation checks.
     """
     kp_r, des_r = feat_ref
     kp_c, des_c = feat_cur
-    if des_r is None or des_c is None or len(kp_r) < 8 or len(kp_c) < 8:
-        return None, 0
 
-    good = _match(des_r, des_c, norm, ratio=match_ratio, mutual=True)
-    if len(good) < 12:
-        return None, 0
-
-    pts_r = np.float32([kp_r[m.queryIdx].pt for m in good])
-    pts_c = np.float32([kp_c[m.trainIdx].pt for m in good])
+    # ── match point extraction ────────────────────────────────────────────
+    if lg_session is not None:
+        # SP+LG path: des is (kp_norm [1,K,2], descriptors [1,K,256]);
+        # kp is pixel-coord array (K,2).
+        kn_r, dn_r = des_r
+        kn_c, dn_c = des_c
+        if kp_r is None or kp_c is None or len(kp_r) < 8 or len(kp_c) < 8:
+            return None, 0, {}
+        matches, _ = lg_session.run(
+            None, {"kpts0": kn_r, "kpts1": kn_c, "desc0": dn_r, "desc1": dn_c}
+        )
+        n_raw = len(matches)
+        if n_raw < 8:
+            return None, 0, {}
+        pts_r = kp_r[matches[:, 0]].astype(np.float32)
+        pts_c = kp_c[matches[:, 1]].astype(np.float32)
+    else:
+        # SIFT path: des is numpy descriptor array; kp is list[cv2.KeyPoint].
+        if des_r is None or des_c is None or len(kp_r) < 8 or len(kp_c) < 8:
+            return None, 0, {}
+        good = _match(des_r, des_c, norm, ratio=match_ratio, mutual=True)
+        n_raw = len(good)
+        if n_raw < 12:
+            return None, 0, {}
+        pts_r = np.float32([kp_r[m.queryIdx].pt for m in good])
+        pts_c = np.float32([kp_c[m.trainIdx].pt for m in good])
 
     # ── Stage 1a: median/MAD displacement pre-filter ──────────────────────
     disp = pts_r - pts_c
@@ -688,8 +711,9 @@ def _pairwise_H(
     dev  = np.linalg.norm(disp - med, axis=1)
     mad  = float(np.median(dev)) + 1e-3
     keep = dev < mad_factor * mad
-    if int(keep.sum()) < 12:
-        return None, 0
+    n_mad = int(keep.sum())
+    if n_mad < 12:
+        return None, 0, {}
     pts_r = pts_r[keep]
     pts_c = pts_c[keep]
 
@@ -704,11 +728,11 @@ def _pairwise_H(
         refineIters=50,
     )
     if M is None:
-        return None, 0
+        return None, 0, {}
 
     n_in = int(mask.sum()) if mask is not None else 0
     if n_in < 8:
-        return None, 0
+        return None, 0, {}
 
     # Promote 2×3 affine → 3×3 so downstream warpPerspective /
     # composition / canvas-expansion code is unchanged.
@@ -716,16 +740,17 @@ def _pairwise_H(
 
     ok, reason = _validate_homography(H, frame_w, frame_h)
     if not ok:
-        return None, 0
+        return None, 0, {}
 
     cx, cy = frame_w / 2.0, frame_h / 2.0
     mapped = cv2.perspectiveTransform(np.float32([[[cx, cy]]]), H)[0][0]
     if abs(mapped[0]) > frame_w * 6 or abs(mapped[1]) > frame_h * 6:
-        return None, 0
+        return None, 0, {}
+
+    stats = {"n_raw": n_raw, "n_mad": n_mad, "n_in1": n_in, "n_grid": 0, "n_in2": 0}
 
     # ── Stage 2: grid intersection refinement ────────────────────────────
-    # Extract SIFT inlier correspondences so they can be combined with the
-    # grid matches for the refinement RANSAC.
+    # Extract feature inlier correspondences to combine with grid matches.
     if (
         grid_pts_ref is not None
         and grid_pts_cur is not None
@@ -733,17 +758,18 @@ def _pairwise_H(
         and len(grid_pts_cur) >= grid_min_matches
     ):
         inlier_bool = mask.ravel().astype(bool)
-        sift_inliers_r = pts_r[inlier_bool]   # (n_in, 2) in ref coords
-        sift_inliers_c = pts_c[inlier_bool]   # (n_in, 2) in cur coords
+        feat_inliers_r = pts_r[inlier_bool]   # (n_in, 2) in ref coords
+        feat_inliers_c = pts_c[inlier_bool]   # (n_in, 2) in cur coords
 
         g_ref, g_cur = _match_grid_intersections(
             grid_pts_ref, grid_pts_cur, H, max_dist=grid_match_dist
         )
+        stats["n_grid"] = len(g_ref)
 
         if len(g_ref) >= grid_min_matches:
-            # Combine SIFT inliers with grid matches.
-            combined_r = np.vstack([sift_inliers_r, g_ref])
-            combined_c = np.vstack([sift_inliers_c, g_cur])
+            # Combine feature inliers with grid intersection matches.
+            combined_r = np.vstack([feat_inliers_r, g_ref])
+            combined_c = np.vstack([feat_inliers_c, g_cur])
 
             # Refit with a tighter threshold — grid matches are accurate
             # enough that 2.0 px is achievable without over-rejecting.
@@ -759,6 +785,7 @@ def _pairwise_H(
 
             if M2 is not None and mask2 is not None:
                 n_in2 = int(mask2.sum())
+                stats["n_in2"] = n_in2
                 if n_in2 >= n_in:   # only upgrade if at least as good
                     H2 = np.vstack([M2, np.array([0.0, 0.0, 1.0], dtype=np.float64)])
                     ok2, _ = _validate_homography(H2, frame_w, frame_h)
@@ -771,7 +798,7 @@ def _pairwise_H(
                         H    = H2
                         n_in = n_in2
 
-    return H, n_in
+    return H, n_in, stats
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1129,6 +1156,81 @@ def _laplacian_pyramid_blend(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SuperPoint + LightGlue ONNX backend helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _default_sp_lg_paths():
+    """Resolve default SP+LG ONNX paths.
+
+    In a ROS install: share/arena_map_builder/data/models/ (installed by colcon).
+    Fallback for standalone use: sibling LightGlue-ONNX-Jetson/weights/ repo.
+    """
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        models_dir = os.path.join(
+            get_package_share_directory("arena_map_builder"), "data", "models"
+        )
+    except Exception:
+        here = os.path.dirname(os.path.abspath(__file__))
+        models_dir = os.path.normpath(
+            os.path.join(here, "..", "..", "..", "LightGlue-ONNX-Jetson", "weights")
+        )
+    return (
+        os.path.join(models_dir, "superpoint_only.onnx"),
+        os.path.join(models_dir, "lightglue_only.onnx"),
+    )
+
+
+def _make_sp_lg_sessions(sp_path: str, lg_path: str, provider: str):
+    """Create ORT inference sessions for the split SP+LG pipeline.
+
+    Lazy-imports onnxruntime so the module can be loaded without it when
+    the SIFT backend is used.
+    """
+    import onnxruntime as ort  # type: ignore
+
+    providers = (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if provider.lower() == "cuda"
+        else ["CPUExecutionProvider"]
+    )
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sp_sess = ort.InferenceSession(sp_path, sess_options=opts, providers=providers)
+    lg_sess = ort.InferenceSession(lg_path, sess_options=opts, providers=providers)
+    print(
+        f"[drone_map] SP+LG sessions loaded  "
+        f"provider={sp_sess.get_providers()[0]}  "
+        f"sp={os.path.basename(sp_path)}  lg={os.path.basename(lg_path)}"
+    )
+    return sp_sess, lg_sess
+
+
+def _sp_extract_feats(sp_session, img: np.ndarray):
+    """Extract SuperPoint features from a single BGR frame.
+
+    The exported model has a static batch-2 input shape [2, 1, H, W], so the
+    frame is duplicated and only index 0 of each output is used.
+
+    Returns
+    -------
+    kp_px   : (K, 2) float32   keypoint pixel coordinates (x, y)
+    kp_norm : (1, K, 2) float32  keypoints normalised to [-1, 1] for LightGlue
+    des     : (1, K, 256) float32  descriptors
+    """
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    pp = (gray.astype(np.float32) / 255.0)[np.newaxis, np.newaxis]      # (1,1,H,W)
+    pair = np.concatenate([pp, pp], axis=0)                              # (2,1,H,W)
+    kp_out, _, des_out = sp_session.run(None, {"images": pair})
+    kp_px = kp_out[0]                                                    # (K,2) px coords
+    kp_norm = (
+        2.0 * kp_px / np.array([w, h], dtype=np.float32) - 1.0
+    )[np.newaxis]                                                        # (1,K,2) in [-1,1]
+    return kp_px, kp_norm, des_out[0:1]                                  # (K,2),(1,K,2),(1,K,256)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Incremental map reconstruction
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1342,7 +1444,7 @@ class ReconstructConfig:
 
     # ── alignment-quality knobs (see _match, _pairwise_H) ────────────────────
 
-    match_ratio: float = 0.95
+    match_ratio: float = 0.70
     """Lowe's ratio threshold for inter-frame descriptor matching.
 
     Lower = stricter (fewer but more reliable matches).  0.70 is a good
@@ -1470,6 +1572,41 @@ class ReconstructConfig:
     """Minimum Value (brightness) for the blue tape colour mask.  Increase to
     exclude dark shadows that fall in the blue hue range."""
 
+    # ── feature backend ───────────────────────────────────────────────────────
+
+    feature_backend: str = "superpoint_lightglue"
+    """Feature extraction and matching backend.
+
+    "superpoint_lightglue" — SuperPoint extractor + LightGlue matcher via ONNX
+        Runtime (default). Produces higher-quality matches on textureless or
+        repetitive scenes. Requires onnxruntime-gpu and the exported ONNX files
+        in data/models/ (or sp_onnx_path / lg_onnx_path overrides).
+        Typical per-frame cost on Jetson Orin Nano 15W (CUDA):
+        ~72 ms extract + ~575 ms for 24 LG calls = ~647 ms total.
+
+    "sift" — classic SIFT + BFMatcher. Faster (~98 ms/frame) but less
+        accurate on scenes with repetitive structure (grid tape). No extra
+        dependencies beyond OpenCV.
+    """
+
+    sp_onnx_path: Optional[str] = None
+    """Path to superpoint_only.onnx.
+
+    None (default) resolves automatically: share/arena_map_builder/data/models/
+    in a ROS install, or sibling LightGlue-ONNX-Jetson/weights/ for standalone
+    use. Only used when feature_backend == "superpoint_lightglue".
+    """
+
+    lg_onnx_path: Optional[str] = None
+    """Path to lightglue_only.onnx. Same auto-resolve logic as sp_onnx_path."""
+
+    sp_ort_provider: str = "cuda"
+    """ORT execution provider for SP+LG sessions.
+
+    "cuda" — CUDA execution provider (recommended on Jetson, ~72 ms extract).
+    "cpu"  — CPU fallback (~350 ms extract, use only for debugging).
+    """
+
 
 class MapReconstructor:
     """
@@ -1499,7 +1636,32 @@ class MapReconstructor:
 
     def __init__(self, cfg: Optional[ReconstructConfig] = None):
         self.cfg = cfg or ReconstructConfig()
-        self.detector, self.norm = _make_detector()
+
+        if self.cfg.feature_backend == "superpoint_lightglue":
+            sp_path = self.cfg.sp_onnx_path
+            lg_path = self.cfg.lg_onnx_path
+            if sp_path is None or lg_path is None:
+                _sp_default, _lg_default = _default_sp_lg_paths()
+                sp_path = sp_path or _sp_default
+                lg_path = lg_path or _lg_default
+            self._sp_session, self._lg_session = _make_sp_lg_sessions(
+                sp_path, lg_path, self.cfg.sp_ort_provider
+            )
+            self.detector = None
+            self.norm = None
+            # Warmup: prime CUDA kernels so the first real frame isn't slow.
+            _dummy = np.zeros((2, 1, 480, 640), dtype=np.float32)
+            kp_w, _, des_w = self._sp_session.run(None, {"images": _dummy})
+            kn_w = np.zeros((1, kp_w.shape[1], 2), dtype=np.float32)
+            dn_w = des_w[0:1]
+            self._lg_session.run(
+                None, {"kpts0": kn_w, "kpts1": kn_w, "desc0": dn_w, "desc1": dn_w}
+            )
+            print("[drone_map] SP+LG warmup done.")
+        else:
+            self.detector, self.norm = _make_detector()
+            self._sp_session = None
+            self._lg_session = None
 
         self._canvas: Optional[np.ndarray] = None
         # When pre-allocation is active, the canvas is larger than needed.
@@ -1672,23 +1834,38 @@ class MapReconstructor:
             nh = max(1, int(img.shape[0] * s))
             img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
 
-        # img_stitch has masked colours replaced (e.g. yellow → white).
-        # img is kept unmasked so keypoint detection uses the full appearance.
+        # img_stitch has masked colours replaced (e.g. yellow → white) and is
+        # used only for warping onto the canvas.  Feature extraction always
+        # operates on the original unmasked img so no scene content is hidden.
         img_stitch = _apply_color_masks(img, self.cfg.color_masks)
         h, w = img.shape[:2]
 
-        feat_mask = _make_feature_mask(
-            img,
-            self.cfg.feature_exclude_hsv,
-            dilate_px=self.cfg.feature_exclude_dilate_px,
-        )
-        kp, des = _kp_des(self.detector, img, mask=feat_mask)
-        if feat_mask is not None:
-            del feat_mask
-        if des is None or len(kp) < 8:
+        if self._sp_session is not None:
+            # SP+LG path: SuperPoint does not support detection masks; the full
+            # image is used.  LightGlue's learned matching handles descriptor
+            # ambiguity better than the BFMatcher ratio test.
+            kp_px, kp_norm, des_sp = _sp_extract_feats(self._sp_session, img)
+            kp = kp_px                        # numpy (K, 2) pixel coords
+            des = (kp_norm, des_sp)           # packed for _pairwise_H SP path
+            if len(kp_px) < 8:
+                if verbose:
+                    print(f"  [skip] insufficient SP keypoints (n={len(kp_px)})")
+                return None
             if verbose:
-                print(f"  [skip] insufficient keypoints (n={0 if kp is None else len(kp)})")
-            return None
+                print(f"  [sp] kp={len(kp_px)}  img={img.shape[1]}×{img.shape[0]}")
+        else:
+            feat_mask = _make_feature_mask(
+                img,
+                self.cfg.feature_exclude_hsv,
+                dilate_px=self.cfg.feature_exclude_dilate_px,
+            )
+            kp, des = _kp_des(self.detector, img, mask=feat_mask)
+            if feat_mask is not None:
+                del feat_mask
+            if des is None or len(kp) < 8:
+                if verbose:
+                    print(f"  [skip] insufficient keypoints (n={0 if kp is None else len(kp)})")
+                return None
 
         if self.cfg.min_keypoint_bins > 0:
             ok, reason = _keypoint_spread_ok(
@@ -1763,7 +1940,7 @@ class MapReconstructor:
         max_overflow = int(math.hypot(w, h))
 
         def _match_candidate(ref):
-            H_pair, n_in = _pairwise_H(
+            H_pair, n_in, stats = _pairwise_H(
                 (ref["kp"], ref["des"]),
                 (kp, des),
                 self.norm,
@@ -1774,20 +1951,21 @@ class MapReconstructor:
                 grid_pts_cur=grid_pts,
                 grid_match_dist=self.cfg.grid_match_dist,
                 grid_min_matches=self.cfg.grid_min_intersections,
+                lg_session=self._lg_session,
             )
             if H_pair is None:
-                return None, 0, None
+                return None, 0, None, {}
             composed = ref["H"] @ H_pair
             ok, reason = _validate_composed_H(
                 composed, w, h, canvas_h_px, canvas_w_px, max_overflow
             )
             if not ok:
-                return None, n_in, reason
-            return composed, n_in, None
+                return None, n_in, reason, {}
+            return composed, n_in, None, stats
 
-        best_H, best_n = None, 0
+        best_H, best_n, best_stats = None, 0, {}
         with ThreadPoolExecutor(max_workers=max(1, len(candidates))) as pool:
-            for composed, n_in, reject_reason in pool.map(_match_candidate, candidates):
+            for composed, n_in, reject_reason, stats in pool.map(_match_candidate, candidates):
                 if composed is None:
                     if verbose and reject_reason is not None:
                         print(f"  [reject_composed] {reject_reason} (n_in={n_in})")
@@ -1795,6 +1973,14 @@ class MapReconstructor:
                 if n_in > best_n:
                     best_H = composed
                     best_n = n_in
+                    best_stats = stats
+
+        if verbose and best_stats:
+            s = best_stats
+            print(
+                f"  [diag] raw={s['n_raw']} mad={s['n_mad']} "
+                f"s1={s['n_in1']} grid={s['n_grid']} s2={s['n_in2']}"
+            )
 
         if best_H is None or best_n < self.cfg.min_inliers:
             self._n_failed += 1
