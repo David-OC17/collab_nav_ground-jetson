@@ -67,6 +67,15 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Generator, List, Optional, Tuple
 
+# Global-consistency back-end (fiducial loop closure + pose-graph optimisation).
+# Imported flexibly so the module works both as a ROS package and standalone.
+try:
+    from .fiducials import FiducialDetector, FiducialConfig
+    from .stitch_graph import StitchGraph, StitchGraphConfig
+except ImportError:  # running as a plain script / tests
+    from fiducials import FiducialDetector, FiducialConfig
+    from stitch_graph import StitchGraph, StitchGraphConfig
+
 # ── GPU warp backend (checked once at import time) ────────────────────────────
 try:
     _CUDA_AVAILABLE = cv2.cuda.getCudaEnabledDeviceCount() > 0
@@ -695,15 +704,20 @@ def _pairwise_H(
         pts_r = kp_r[matches[:, 0]].astype(np.float32)
         pts_c = kp_c[matches[:, 1]].astype(np.float32)
     else:
-        # SIFT path: des is numpy descriptor array; kp is list[cv2.KeyPoint].
+        # Ratio-test path: des is (N, D) descriptor array; kp is either
+        # list[cv2.KeyPoint] (SIFT) or ndarray (K, 2) px coords (SuperPoint).
         if des_r is None or des_c is None or len(kp_r) < 8 or len(kp_c) < 8:
             return None, 0, {}
         good = _match(des_r, des_c, norm, ratio=match_ratio, mutual=True)
         n_raw = len(good)
         if n_raw < 12:
             return None, 0, {}
-        pts_r = np.float32([kp_r[m.queryIdx].pt for m in good])
-        pts_c = np.float32([kp_c[m.trainIdx].pt for m in good])
+        if isinstance(kp_r, np.ndarray):
+            pts_r = kp_r[[m.queryIdx for m in good]].astype(np.float32)
+            pts_c = kp_c[[m.trainIdx for m in good]].astype(np.float32)
+        else:
+            pts_r = np.float32([kp_r[m.queryIdx].pt for m in good])
+            pts_c = np.float32([kp_c[m.trainIdx].pt for m in good])
 
     # ── Stage 1a: median/MAD displacement pre-filter ──────────────────────
     disp = pts_r - pts_c
@@ -1181,12 +1195,8 @@ def _default_sp_lg_paths():
     )
 
 
-def _make_sp_lg_sessions(sp_path: str, lg_path: str, provider: str):
-    """Create ORT inference sessions for the split SP+LG pipeline.
-
-    Lazy-imports onnxruntime so the module can be loaded without it when
-    the SIFT backend is used.
-    """
+def _make_ort_session(path: str, provider: str):
+    """Create a single ORT inference session. Lazy-imports onnxruntime."""
     import onnxruntime as ort  # type: ignore
 
     providers = (
@@ -1196,8 +1206,13 @@ def _make_sp_lg_sessions(sp_path: str, lg_path: str, provider: str):
     )
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sp_sess = ort.InferenceSession(sp_path, sess_options=opts, providers=providers)
-    lg_sess = ort.InferenceSession(lg_path, sess_options=opts, providers=providers)
+    return ort.InferenceSession(path, sess_options=opts, providers=providers)
+
+
+def _make_sp_lg_sessions(sp_path: str, lg_path: str, provider: str):
+    """Create ORT inference sessions for the split SP+LG pipeline."""
+    sp_sess = _make_ort_session(sp_path, provider)
+    lg_sess = _make_ort_session(lg_path, provider)
     print(
         f"[drone_map] SP+LG sessions loaded  "
         f"provider={sp_sess.get_providers()[0]}  "
@@ -1349,10 +1364,10 @@ class ReconstructConfig:
     lookback: int = 4
     """Number of recently placed frames to try matching against."""
 
-    keyframe_interval: int = 15
+    keyframe_interval: int = 10
     """Cache a long-range keyframe every N successfully placed frames."""
 
-    blend_mode: str = "feather"
+    blend_mode: str = "pyramid"
     """
     "feather"  – distance-weighted linear blend  (fast, default)
     "pyramid"  – Laplacian pyramid multi-band     (best quality, slower)
@@ -1362,7 +1377,7 @@ class ReconstructConfig:
     pyramid_levels: int = 4
     """Laplacian pyramid depth; only used when blend_mode='pyramid'."""
 
-    processing_scale: float = 1.0
+    processing_scale: float = 0.5
     """
     Resize every incoming frame by this factor before any processing.
 
@@ -1444,7 +1459,7 @@ class ReconstructConfig:
 
     # ── alignment-quality knobs (see _match, _pairwise_H) ────────────────────
 
-    match_ratio: float = 0.70
+    match_ratio: float = 0.80
     """Lowe's ratio threshold for inter-frame descriptor matching.
 
     Lower = stricter (fewer but more reliable matches).  0.70 is a good
@@ -1574,19 +1589,23 @@ class ReconstructConfig:
 
     # ── feature backend ───────────────────────────────────────────────────────
 
-    feature_backend: str = "superpoint_lightglue"
-    """Feature extraction and matching backend.
+    feature_extractor: str = "sift"
+    """Keypoint extractor.
 
-    "superpoint_lightglue" — SuperPoint extractor + LightGlue matcher via ONNX
-        Runtime (default). Produces higher-quality matches on textureless or
-        repetitive scenes. Requires onnxruntime-gpu and the exported ONNX files
-        in data/models/ (or sp_onnx_path / lg_onnx_path overrides).
-        Typical per-frame cost on Jetson Orin Nano 15W (CUDA):
-        ~72 ms extract + ~575 ms for 24 LG calls = ~647 ms total.
+    "superpoint" — SuperPoint via ONNX Runtime (default). Requires
+        onnxruntime-gpu and superpoint_only.onnx in data/models/.
+    "sift"       — classic OpenCV SIFT. No extra dependencies.
+    """
 
-    "sift" — classic SIFT + BFMatcher. Faster (~98 ms/frame) but less
-        accurate on scenes with repetitive structure (grid tape). No extra
-        dependencies beyond OpenCV.
+    feature_matcher: str = "ratio_test"
+    """Descriptor matcher.
+
+    "lightglue"  — LightGlue via ONNX Runtime (default). Learned matcher;
+        requires onnxruntime-gpu and lightglue_only.onnx in data/models/.
+        NOTE: the bundled model was exported for SuperPoint descriptors only;
+        pairing with feature_extractor="sift" will raise at init.
+    "ratio_test" — BFMatcher + Lowe ratio test + mutual check. Works with
+        both extractors (SIFT 128-d and SuperPoint 256-d).
     """
 
     sp_onnx_path: Optional[str] = None
@@ -1594,18 +1613,56 @@ class ReconstructConfig:
 
     None (default) resolves automatically: share/arena_map_builder/data/models/
     in a ROS install, or sibling LightGlue-ONNX-Jetson/weights/ for standalone
-    use. Only used when feature_backend == "superpoint_lightglue".
+    use. Only used when feature_extractor == "superpoint".
     """
 
     lg_onnx_path: Optional[str] = None
-    """Path to lightglue_only.onnx. Same auto-resolve logic as sp_onnx_path."""
+    """Path to lightglue_only.onnx. Same auto-resolve logic as sp_onnx_path.
+    Only used when feature_matcher == "lightglue"."""
 
     sp_ort_provider: str = "cuda"
-    """ORT execution provider for SP+LG sessions.
+    """ORT execution provider for SP / LG sessions.
 
     "cuda" — CUDA execution provider (recommended on Jetson, ~72 ms extract).
     "cpu"  — CPU fallback (~350 ms extract, use only for debugging).
     """
+
+    # ── global consistency: fiducial loop closure + pose-graph solve ──────────
+
+    use_pose_graph: bool = True
+    """Accumulate a keyframe pose graph during the online pass and run a global
+    least-squares solve when the stream stops, then re-render the map from the
+    optimised poses. This is what removes inter-pass discontinuities and the
+    bowing-grid distortion. The live (streaming) map is unaffected; the clean
+    map is produced by finalize()."""
+
+    use_fiducials: bool = True
+    """Detect ArUco markers per frame and use repeat sightings of the same ID
+    as zero-ambiguity loop-closure landmarks in the pose graph. Markers move
+    between runs and aren't surveyed, so they are NOT absolute anchors — but
+    within a run a shared ID ties the frames that see it (e.g. the forward and
+    backward lawnmower passes)."""
+
+    fiducial_dictionary: str = "DICT_4X4_50"
+    """ArUco dictionary name for the arena markers."""
+
+    pg_marker_weight: float = 15.0
+    """Weight of marker-corner constraints (subpixel-accurate → trusted most)."""
+    pg_odom_weight: float = 1.0
+    """Weight of consecutive-keyframe odometry edges (the online chain)."""
+    pg_loop_weight: float = 2.0
+    """Weight of direct keyframe↔keyframe overlap matches (feature loop closures)."""
+    pg_iterations: int = 10
+    """Huber IRLS iterations for the global solve."""
+    pg_huber_delta: float = 4.0
+    """Huber threshold (px) for robustness to bad loop closures."""
+
+    render_cache_dir: Optional[str] = None
+    """Directory for the per-frame render cache used by finalize()'s second
+    pass. None → a temp dir is created and removed automatically. The cache
+    holds one PNG per placed frame so the corrected map can be re-rendered
+    without keeping frames in RAM (preserves the streaming memory profile, and
+    works for live feeds where re-streaming the source isn't possible)."""
 
 
 class MapReconstructor:
@@ -1637,30 +1694,56 @@ class MapReconstructor:
     def __init__(self, cfg: Optional[ReconstructConfig] = None):
         self.cfg = cfg or ReconstructConfig()
 
-        if self.cfg.feature_backend == "superpoint_lightglue":
-            sp_path = self.cfg.sp_onnx_path
-            lg_path = self.cfg.lg_onnx_path
-            if sp_path is None or lg_path is None:
-                _sp_default, _lg_default = _default_sp_lg_paths()
-                sp_path = sp_path or _sp_default
-                lg_path = lg_path or _lg_default
-            self._sp_session, self._lg_session = _make_sp_lg_sessions(
-                sp_path, lg_path, self.cfg.sp_ort_provider
+        extractor = self.cfg.feature_extractor
+        matcher   = self.cfg.feature_matcher
+
+        if extractor == "sift" and matcher == "lightglue":
+            raise ValueError(
+                "feature_extractor='sift' + feature_matcher='lightglue' is not "
+                "supported: the bundled lightglue_only.onnx was exported for "
+                "SuperPoint descriptors only. Use feature_extractor='superpoint' "
+                "or feature_matcher='ratio_test'."
+            )
+
+        # ── Extractor ────────────────────────────────────────────────────────
+        if extractor == "superpoint":
+            _sp_default, _ = _default_sp_lg_paths()
+            sp_path = self.cfg.sp_onnx_path or _sp_default
+            self._sp_session = _make_ort_session(sp_path, self.cfg.sp_ort_provider)
+            print(
+                f"[drone_map] SP session loaded  "
+                f"provider={self._sp_session.get_providers()[0]}  "
+                f"model={os.path.basename(sp_path)}"
             )
             self.detector = None
-            self.norm = None
-            # Warmup: prime CUDA kernels so the first real frame isn't slow.
+            self.norm = cv2.NORM_L2   # used if matcher == "ratio_test"
+            # SP warmup
             _dummy = np.zeros((2, 1, 480, 640), dtype=np.float32)
             kp_w, _, des_w = self._sp_session.run(None, {"images": _dummy})
+            print("[drone_map] SP warmup done.")
+        else:  # sift
+            self.detector, self.norm = _make_detector()
+            self._sp_session = None
+            kp_w = des_w = None
+
+        # ── Matcher ──────────────────────────────────────────────────────────
+        if matcher == "lightglue":
+            _, _lg_default = _default_sp_lg_paths()
+            lg_path = self.cfg.lg_onnx_path or _lg_default
+            self._lg_session = _make_ort_session(lg_path, self.cfg.sp_ort_provider)
+            print(
+                f"[drone_map] LG session loaded  "
+                f"provider={self._lg_session.get_providers()[0]}  "
+                f"model={os.path.basename(lg_path)}"
+            )
+            # LG warmup (needs SP output shapes; only reachable when SP is loaded)
             kn_w = np.zeros((1, kp_w.shape[1], 2), dtype=np.float32)
             dn_w = des_w[0:1]
             self._lg_session.run(
                 None, {"kpts0": kn_w, "kpts1": kn_w, "desc0": dn_w, "desc1": dn_w}
             )
-            print("[drone_map] SP+LG warmup done.")
-        else:
-            self.detector, self.norm = _make_detector()
-            self._sp_session = None
+            print("[drone_map] LG warmup done.")
+        else:  # ratio_test
             self._lg_session = None
 
         self._canvas: Optional[np.ndarray] = None
@@ -1678,6 +1761,26 @@ class MapReconstructor:
         # Running counters for grid-refinement telemetry.
         self._n_grid_refined = 0
         self._n_grid_skipped = 0
+
+        # ── global-consistency back-end ──────────────────────────────────────
+        self._fiducial = (
+            FiducialDetector(FiducialConfig(dictionary=self.cfg.fiducial_dictionary))
+            if self.cfg.use_fiducials else None
+        )
+        self._sg = (
+            StitchGraph(StitchGraphConfig(
+                marker_weight=self.cfg.pg_marker_weight,
+                odom_weight=self.cfg.pg_odom_weight,
+                loop_weight=self.cfg.pg_loop_weight,
+                iterations=self.cfg.pg_iterations,
+                huber_delta=self.cfg.pg_huber_delta,
+            ))
+            if self.cfg.use_pose_graph else None
+        )
+        self._render_idx = 0           # 0-based placement counter == graph rec_idx
+        self._cache_dir: Optional[str] = None
+        self._finalized = False
+        self._last_finalize_report: Optional[dict] = None  # set by finalize()
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -1751,6 +1854,11 @@ class MapReconstructor:
 
         producer_thread.join()
 
+        # Stream ended → run the global pose-graph solve and re-render the
+        # corrected map. This is the "portion that runs once the feed stops".
+        if self.cfg.use_pose_graph:
+            self.finalize(verbose=verbose)
+
     def add_frame(self, img: np.ndarray, verbose: bool = False) -> bool:
         """
         Attempt to place `img` onto the map canvas.
@@ -1783,6 +1891,12 @@ class MapReconstructor:
         """
         if self._canvas is None:
             raise RuntimeError("No frames placed yet.")
+
+        # If the pose graph is enabled but finalize() hasn't run yet (e.g. the
+        # caller used add_frame() directly rather than add_video()), run the
+        # global solve + re-render now so get_map() returns the corrected map.
+        if self.cfg.use_pose_graph and not self._finalized:
+            self.finalize(verbose=False)
 
         canvas = self._canvas
         self._canvas = None   # drop reference; allows GC during resize below
@@ -1841,12 +1955,13 @@ class MapReconstructor:
         h, w = img.shape[:2]
 
         if self._sp_session is not None:
-            # SP+LG path: SuperPoint does not support detection masks; the full
-            # image is used.  LightGlue's learned matching handles descriptor
-            # ambiguity better than the BFMatcher ratio test.
+            # SuperPoint extractor: no mask support; full image is used.
             kp_px, kp_norm, des_sp = _sp_extract_feats(self._sp_session, img)
-            kp = kp_px                        # numpy (K, 2) pixel coords
-            des = (kp_norm, des_sp)           # packed for _pairwise_H SP path
+            kp = kp_px                        # (K, 2) pixel coords
+            if self._lg_session is not None:
+                des = (kp_norm, des_sp)       # packed tuple for LightGlue
+            else:
+                des = des_sp[0]               # (K, 256) flat array for ratio_test
             if len(kp_px) < 8:
                 if verbose:
                     print(f"  [skip] insufficient SP keypoints (n={len(kp_px)})")
@@ -1890,11 +2005,19 @@ class MapReconstructor:
             elif verbose:
                 print(f"  [grid] {len(grid_pts)} intersections detected")
 
+        # ArUco markers — detected on the unmasked image (same as features) so
+        # nothing is hidden. Each is a uniquely-identifiable loop-closure
+        # landmark for the pose graph.
+        markers = self._fiducial.detect(img) if self._fiducial is not None else []
+        if markers and verbose:
+            print(f"  [aruco] ids={[m.marker_id for m in markers]}")
+
         return {
             "img_stitch": img_stitch,
             "kp": kp,
             "des": des,
             "grid_pts": grid_pts,
+            "markers": markers,
             "h": h,
             "w": w,
         }
@@ -1909,6 +2032,7 @@ class MapReconstructor:
         kp         = prep["kp"]
         des        = prep["des"]
         grid_pts   = prep["grid_pts"]
+        markers    = prep.get("markers", [])
         h, w       = prep["h"], prep["w"]
 
         # ── first frame: initialise canvas ──────────────────────────────────
@@ -1929,6 +2053,8 @@ class MapReconstructor:
             self._warp_and_blend_roi(img_stitch, H0)
             self._register(kp, des, H0, grid_pts=grid_pts)
             self._n_placed = 1
+            # Pose graph: first frame is the FIXED gauge keyframe.
+            self._graph_on_placed(img_stitch, H0, True, w, h, markers, fixed=True)
             return True
 
         # ── match against recent frames + keyframes (parallel) ───────────────
@@ -2003,7 +2129,83 @@ class MapReconstructor:
         self._warp_and_blend_roi(img_stitch, best_H)
         self._n_placed += 1
         self._register(kp, des, best_H, grid_pts=grid_pts)
+        # Pose graph: mirror _register's keyframe rule so the graph node set
+        # matches the keyframe archive.
+        becomes_kf = (self._n_placed % self.cfg.keyframe_interval == 0)
+        self._graph_on_placed(img_stitch, best_H, becomes_kf, w, h, markers)
         return True
+
+    # ── pose-graph / fiducial hooks ───────────────────────────────────────────
+
+    def _graph_on_placed(self, img_stitch, H, is_keyframe, w, h, markers,
+                         fixed: bool = False):
+        """Feed a just-placed frame to the pose graph and cache its pixels for
+        the finalize() re-render. No-op when the pose graph is disabled."""
+        if self._sg is None:
+            return
+        self._sg.on_placed(H, is_keyframe=is_keyframe, frame_w=w, frame_h=h,
+                           fixed=fixed)
+        self._sg.on_markers(markers)
+        self._cache_frame(self._render_idx, img_stitch)
+        self._render_idx += 1
+
+    def _cache_frame(self, idx: int, img: np.ndarray) -> None:
+        if self._cache_dir is None:
+            if self.cfg.render_cache_dir:
+                os.makedirs(self.cfg.render_cache_dir, exist_ok=True)
+                self._cache_dir = self.cfg.render_cache_dir
+            else:
+                import tempfile
+                self._cache_dir = tempfile.mkdtemp(prefix="arena_render_")
+        cv2.imwrite(os.path.join(self._cache_dir, f"{idx:06d}.png"), img)
+
+    def _load_cached_frame(self, idx: int) -> Optional[np.ndarray]:
+        p = os.path.join(self._cache_dir, f"{idx:06d}.png")
+        return cv2.imread(p) if os.path.exists(p) else None
+
+    def _cleanup_cache(self) -> None:
+        if self.cfg.render_cache_dir:
+            return  # caller-owned dir: leave it
+        import shutil
+        if self._cache_dir and os.path.isdir(self._cache_dir):
+            shutil.rmtree(self._cache_dir, ignore_errors=True)
+        self._cache_dir = None
+
+    def finalize(self, verbose: bool = True) -> Optional[dict]:
+        """Run the global pose-graph solve and re-render the corrected map.
+
+        Call this once the stream/video has ended (add_video() calls it
+        automatically). The streaming canvas is replaced in-place by a fresh
+        render in which every frame is placed at its globally-consistent pose.
+        Returns the solver report, or None if the pose graph is disabled.
+        """
+        if self._sg is None or self._finalized or self._render_idx == 0:
+            return None
+        if verbose:
+            print("  [finalize] solving global pose graph...")
+        report = self._sg.finalize(verbose=verbose)
+
+        # Re-render: fresh canvas, re-warp each cached frame at its corrected
+        # pose. Frames are pulled from disk one at a time → no RAM blow-up.
+        fresh = np.zeros_like(self._canvas)
+        old_canvas = self._canvas
+        self._canvas = fresh
+        del old_canvas
+        n = 0
+        for rec_idx, H_corr in self._sg.iter_corrections():
+            img = self._load_cached_frame(rec_idx)
+            if img is None:
+                continue
+            self._warp_and_blend_roi(img, H_corr)
+            n += 1
+        self._cleanup_cache()
+        self._finalized = True
+        self._last_finalize_report = report
+        if verbose:
+            print(f"  [finalize] re-rendered {n} frames | "
+                  f"residual {report['rms_before']:.2f} -> {report['rms_after']:.2f} px | "
+                  f"markers={report['markers']} edges={report['edges']}")
+        return report
 
     def _register(
         self,

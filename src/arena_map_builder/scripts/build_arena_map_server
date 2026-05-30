@@ -156,11 +156,12 @@ class BuildArenaMapServer(Node):
         self.declare_parameter("stitch.reconstruct.grid_hsv_s_lo",              50)
         self.declare_parameter("stitch.reconstruct.grid_hsv_v_lo",              50)
 
-        # Feature backend
-        self.declare_parameter("stitch.reconstruct.feature_backend",  "sift")
-        self.declare_parameter("stitch.reconstruct.sp_ort_provider",  "cuda")
-        self.declare_parameter("stitch.reconstruct.sp_onnx_path",     "")
-        self.declare_parameter("stitch.reconstruct.lg_onnx_path",     "")
+        # Feature extractor / matcher (independent)
+        self.declare_parameter("stitch.reconstruct.feature_extractor", "sift")
+        self.declare_parameter("stitch.reconstruct.feature_matcher",   "ratio_test")
+        self.declare_parameter("stitch.reconstruct.sp_ort_provider",   "cuda")
+        self.declare_parameter("stitch.reconstruct.sp_onnx_path",      "")
+        self.declare_parameter("stitch.reconstruct.lg_onnx_path",      "")
 
         # ColorRangeMask lists — encoded as string arrays where each item is
         #   "name:h_lo,h_hi,s_lo,s_hi,v_lo,v_hi:B,G,R"
@@ -347,7 +348,8 @@ class BuildArenaMapServer(Node):
                 "stitch.reconstruct.color_masks"),
             feature_exclude_hsv       = self._parse_color_mask_list(
                 "stitch.reconstruct.feature_exclude_hsv"),
-            feature_backend           = str(self._get("stitch.reconstruct.feature_backend")),
+            feature_extractor         = str(self._get("stitch.reconstruct.feature_extractor")),
+            feature_matcher           = str(self._get("stitch.reconstruct.feature_matcher")),
             sp_ort_provider           = str(self._get("stitch.reconstruct.sp_ort_provider")),
             sp_onnx_path              = _sp_path,
             lg_onnx_path              = _lg_path,
