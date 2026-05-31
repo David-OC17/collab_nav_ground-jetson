@@ -1636,7 +1636,7 @@ class ReconstructConfig:
     bowing-grid distortion. The live (streaming) map is unaffected; the clean
     map is produced by finalize()."""
 
-    use_fiducials: bool = True
+    use_fiducials: bool = False 
     """Detect ArUco markers per frame and use repeat sightings of the same ID
     as zero-ambiguity loop-closure landmarks in the pose graph. Markers move
     between runs and aren't surveyed, so they are NOT absolute anchors — but
