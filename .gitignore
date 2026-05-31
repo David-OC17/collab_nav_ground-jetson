@@ -4,7 +4,7 @@ install
 src/yahboomRDK_X3
 src/yahboomRDK_X3/*
 
-src/drone_map_create/src/drone_map_create/out
+src/arena_map_builder/sweep/results
 
 # Created by https://www.toptal.com/developers/gitignore/api/c++,ros2,cmake,python,visualstudiocode
 # Edit at https://www.toptal.com/developers/gitignore?templates=c++,ros2,cmake,python,visualstudiocode

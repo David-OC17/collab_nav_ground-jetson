@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sweep Parameter Reference</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #111;
+    color: #ccc;
+    padding: 32px 24px;
+    max-width: 900px;
+    margin: 0 auto;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  h1 { color: #fff; font-size: 1.4rem; margin-bottom: 6px; }
+  .subtitle { color: #666; margin-bottom: 32px; font-size: 0.85rem; }
+  h2 {
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #555;
+    margin: 28px 0 10px;
+    border-bottom: 1px solid #222;
+    padding-bottom: 5px;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  tr:hover td { background: #1a1a1a; }
+  td {
+    padding: 7px 10px;
+    border-bottom: 1px solid #1c1c1c;
+    vertical-align: top;
+  }
+  td:first-child {
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 0.82rem;
+    color: #7ec8e3;
+    white-space: nowrap;
+    width: 230px;
+    padding-right: 20px;
+  }
+  td:nth-child(2) {
+    color: #999;
+    font-size: 0.78rem;
+    width: 160px;
+    white-space: nowrap;
+  }
+  td:last-child { color: #bbb; }
+  .val { color: #aaa; }
+  .tag {
+    display: inline-block;
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  .t-bool   { background: #1e3a2f; color: #4caf80; }
+  .t-cat    { background: #2a2040; color: #9b7de8; }
+  .t-float  { background: #2a1e10; color: #d4924a; }
+  .t-int    { background: #1a2535; color: #5b9bd5; }
+</style>
+</head>
+<body>
+
+<h1>Sweep Parameter Reference</h1>
+<p class="subtitle">Quick-reference for the 83-run overnight sweep. Groups match run_matrix.py.</p>
+
+<!-- ── FRAME EXTRACTION ──────────────────────────────────────────────── -->
+<h2>Frame extraction &nbsp;·&nbsp; groups D</h2>
+<table>
+  <tr>
+    <td>target_fps</td>
+    <td><span class="tag t-float">float</span> 3–7</td>
+    <td>How many frames per second to sample from the video. Lower = fewer frames to stitch, faster but may miss coverage. Higher = denser overlap, slower, higher risk of static-frame noise.</td>
+  </tr>
+  <tr>
+    <td>min_movement</td>
+    <td><span class="tag t-float">float</span> 0.010–0.020</td>
+    <td>Minimum feature displacement (fraction of frame diagonal) required to keep a frame. Frames below this are treated as the drone hovering and skipped. Lower = accept nearly-static frames; higher = only keep frames with clear motion.</td>
+  </tr>
+</table>
+
+<!-- ── FEATURE BACKEND ──────────────────────────────────────────────── -->
+<h2>Feature backend &nbsp;·&nbsp; groups A, H</h2>
+<table>
+  <tr>
+    <td>feature_extractor</td>
+    <td><span class="tag t-cat">categorical</span></td>
+    <td><b>sift</b> — classic hand-crafted detector, 5000 keypoints, CPU-only.<br>
+        <b>superpoint</b> — learned neural detector, 256 keypoints (GPU), more robust on textureless floors.</td>
+  </tr>
+  <tr>
+    <td>feature_matcher</td>
+    <td><span class="tag t-cat">categorical</span></td>
+    <td><b>ratio_test</b> — Lowe's ratio test + mutual cross-check. Works with both extractors.<br>
+        <b>lightglue</b> — learned matcher (GPU). SuperPoint only. Produces fewer but more reliable matches on difficult scenes.</td>
+  </tr>
+  <tr>
+    <td>feature_exclude_hsv</td>
+    <td><span class="tag t-cat">categorical</span></td>
+    <td><b>none</b> — detect features everywhere.<br>
+        <b>blue_tape</b> — mask out the blue grid tape before feature detection so keypoints don't land on the repetitive grid (only meaningful for SIFT; SuperPoint ignores this).</td>
+  </tr>
+</table>
+
+<!-- ── MATCHING QUALITY ─────────────────────────────────────────────── -->
+<h2>Matching quality &nbsp;·&nbsp; groups B, F, G</h2>
+<table>
+  <tr>
+    <td>match_ratio</td>
+    <td><span class="tag t-float">float</span> 0.65–0.80</td>
+    <td>Lowe's ratio threshold for descriptor matching. Lower = stricter (fewer, more reliable matches). Higher = more permissive (more matches, more ambiguous ones). Ignored by LightGlue.</td>
+  </tr>
+  <tr>
+    <td>mad_factor</td>
+    <td><span class="tag t-float">float</span> 4–6</td>
+    <td>Median-Absolute-Deviation gate applied to match displacements before RANSAC. Rejects matches whose shift deviates from the median by more than this × MAD. Lower = tighter pre-filter, helps on repetitive grids. Too low = over-rejection.</td>
+  </tr>
+  <tr>
+    <td>feature_exclude_dilate_px</td>
+    <td><span class="tag t-int">int</span> 3–12</td>
+    <td>How many pixels to dilate the blue-tape exclusion mask outward. Without dilation, keypoints latch onto tape edges (still grid-locked). Larger = cleaner exclusion; too large = fewer features overall.</td>
+  </tr>
+  <tr>
+    <td>min_inliers</td>
+    <td><span class="tag t-int">int</span> 8–20</td>
+    <td>Minimum RANSAC inliers required to accept a frame placement. Lower = place more frames (including uncertain ones). Higher = only place high-confidence alignments, possibly leaving gaps.</td>
+  </tr>
+</table>
+
+<!-- ── GRID ALIGNMENT ───────────────────────────────────────────────── -->
+<h2>Grid alignment &nbsp;·&nbsp; groups A</h2>
+<table>
+  <tr>
+    <td>use_grid_intersections</td>
+    <td><span class="tag t-bool">bool</span></td>
+    <td>Whether to detect blue tape grid intersections and use them as a second RANSAC stage after feature matching. The grid provides sub-pixel geometric anchors that tighten rotation and scale estimates. Disabling reverts to feature-only alignment.</td>
+  </tr>
+</table>
+
+<!-- ── TEMPORAL / KEYFRAME ──────────────────────────────────────────── -->
+<h2>Temporal coverage &nbsp;·&nbsp; groups C, I</h2>
+<table>
+  <tr>
+    <td>lookback</td>
+    <td><span class="tag t-int">int</span> 4–8</td>
+    <td>How many recently placed frames to try matching against for each new frame. Higher = more matching attempts per frame, catches the best recent overlap, slower per frame.</td>
+  </tr>
+  <tr>
+    <td>keyframe_interval</td>
+    <td><span class="tag t-int">int</span> 5–15</td>
+    <td>Store a long-range keyframe every N successfully placed frames. These are used for re-localisation when the drone revisits an area. Lower = denser keyframe coverage (better loop closure), more memory. Higher = fewer keyframes.</td>
+  </tr>
+</table>
+
+<!-- ── POSE GRAPH / SOLVER ──────────────────────────────────────────── -->
+<h2>Pose graph &amp; solver &nbsp;·&nbsp; groups A, E, J</h2>
+<table>
+  <tr>
+    <td>use_pose_graph</td>
+    <td><span class="tag t-bool">bool</span></td>
+    <td>Run a global least-squares solve over keyframe poses after the online pass. Corrects the accumulated drift visible as bowed-grid or stacked-cards artifacts. The live map is unaffected; the corrected map is produced by finalize().</td>
+  </tr>
+  <tr>
+    <td>use_fiducials</td>
+    <td><span class="tag t-bool">bool</span></td>
+    <td>Detect ArUco markers per frame and add them as zero-ambiguity loop-closure constraints in the pose graph. Each marker ID seen in multiple frames ties those frames together with high-accuracy corner correspondences. Requires use_pose_graph=True to have any effect.</td>
+  </tr>
+  <tr>
+    <td>pg_marker_weight</td>
+    <td><span class="tag t-float">float</span> 5–25</td>
+    <td>How strongly marker-corner constraints pull the solve compared to odometry edges. Higher = markers dominate the correction; lower = feature-loop edges have more say. Subpixel corners are very accurate so higher values are usually safe.</td>
+  </tr>
+  <tr>
+    <td>pg_huber_delta</td>
+    <td><span class="tag t-float">float</span> 2–8</td>
+    <td>Huber loss threshold (pixels) for the global solve. Residuals below this are treated as normal least-squares; above it, their influence is down-weighted. Lower = tighter rejection of bad loop closures; higher = more permissive.</td>
+  </tr>
+</table>
+
+</body>
+</html>
