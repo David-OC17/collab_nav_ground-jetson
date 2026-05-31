@@ -36,7 +36,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
 
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
 
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import Pose, Point, Quaternion
@@ -79,6 +79,7 @@ class BuildArenaMapServer(Node):
 
         # ── Parameters (all configurable at runtime via ros2 param) ────
         self._declare_parameters()
+        self.add_on_set_parameters_callback(self._on_params_changed)
 
         # ── Concurrency ────────────────────────────────────────────────
         self._cb_group = ReentrantCallbackGroup()
@@ -162,6 +163,20 @@ class BuildArenaMapServer(Node):
         self.declare_parameter("stitch.reconstruct.sp_ort_provider",   "cuda")
         self.declare_parameter("stitch.reconstruct.sp_onnx_path",      "")
         self.declare_parameter("stitch.reconstruct.lg_onnx_path",      "")
+
+        # Pose-graph / fiducial loop closure
+        self.declare_parameter("stitch.reconstruct.use_pose_graph",      True)
+        self.declare_parameter("stitch.reconstruct.use_fiducials",       True)
+        self.declare_parameter("stitch.reconstruct.fiducial_dictionary", "DICT_4X4_50")
+        self.declare_parameter("stitch.reconstruct.pg_marker_weight",    15.0)
+        self.declare_parameter("stitch.reconstruct.pg_odom_weight",       1.0)
+        self.declare_parameter("stitch.reconstruct.pg_loop_weight",       2.0)
+        self.declare_parameter("stitch.reconstruct.pg_iterations",       10)
+        self.declare_parameter("stitch.reconstruct.pg_huber_delta",       4.0)
+        self.declare_parameter("stitch.reconstruct.render_cache_dir",    "")
+
+        # Diagnostics / verbosity
+        self.declare_parameter("stitch.verbose", False)
 
         # ColorRangeMask lists — encoded as string arrays where each item is
         #   "name:h_lo,h_hi,s_lo,s_hi,v_lo,v_hi:B,G,R"
@@ -310,6 +325,31 @@ class BuildArenaMapServer(Node):
                 out.append(m)
         return out
 
+    def _on_params_changed(self, params) -> SetParametersResult:
+        """Validate parameter changes before they are applied.
+
+        Rejects the sift+lightglue combination because the bundled
+        lightglue_only.onnx was exported for SuperPoint descriptors only."""
+        proposed = {p.name: p.value for p in params}
+        extractor = proposed.get(
+            "stitch.reconstruct.feature_extractor",
+            self._get("stitch.reconstruct.feature_extractor"),
+        )
+        matcher = proposed.get(
+            "stitch.reconstruct.feature_matcher",
+            self._get("stitch.reconstruct.feature_matcher"),
+        )
+        if extractor == "sift" and matcher == "lightglue":
+            return SetParametersResult(
+                successful=False,
+                reason=(
+                    "feature_extractor='sift' + feature_matcher='lightglue' is not "
+                    "supported: the bundled lightglue_only.onnx was exported for "
+                    "SuperPoint descriptors only."
+                ),
+            )
+        return SetParametersResult(successful=True)
+
     def _build_extract_cfg(self) -> ExtractionConfig:
         return ExtractionConfig(
             target_fps          = float(self._get("stitch.extract.target_fps")),
@@ -321,8 +361,9 @@ class BuildArenaMapServer(Node):
         )
 
     def _build_reconstruct_cfg(self) -> ReconstructConfig:
-        _sp_path = str(self._get("stitch.reconstruct.sp_onnx_path")) or None
-        _lg_path = str(self._get("stitch.reconstruct.lg_onnx_path")) or None
+        _sp_path     = str(self._get("stitch.reconstruct.sp_onnx_path"))     or None
+        _lg_path     = str(self._get("stitch.reconstruct.lg_onnx_path"))     or None
+        _cache_dir   = str(self._get("stitch.reconstruct.render_cache_dir")) or None
         return ReconstructConfig(
             canvas_margin             = int(self._get("stitch.reconstruct.canvas_margin")),
             min_inliers               = int(self._get("stitch.reconstruct.min_inliers")),
@@ -353,6 +394,15 @@ class BuildArenaMapServer(Node):
             sp_ort_provider           = str(self._get("stitch.reconstruct.sp_ort_provider")),
             sp_onnx_path              = _sp_path,
             lg_onnx_path              = _lg_path,
+            use_pose_graph            = bool(self._get("stitch.reconstruct.use_pose_graph")),
+            use_fiducials             = bool(self._get("stitch.reconstruct.use_fiducials")),
+            fiducial_dictionary       = str(self._get("stitch.reconstruct.fiducial_dictionary")),
+            pg_marker_weight          = float(self._get("stitch.reconstruct.pg_marker_weight")),
+            pg_odom_weight            = float(self._get("stitch.reconstruct.pg_odom_weight")),
+            pg_loop_weight            = float(self._get("stitch.reconstruct.pg_loop_weight")),
+            pg_iterations             = int(self._get("stitch.reconstruct.pg_iterations")),
+            pg_huber_delta            = float(self._get("stitch.reconstruct.pg_huber_delta")),
+            render_cache_dir          = _cache_dir,
         )
 
     def _build_transfer_cfg(self) -> TransferConfig:
@@ -428,7 +478,7 @@ class BuildArenaMapServer(Node):
             extract_cfg=extract_cfg,
             reconstruct_cfg=reconstruct_cfg,
             save_path=stitched_path,
-            verbose=True,  # TODO: revert after diagnostics
+            verbose=bool(self._get("stitch.verbose")),
         )
         if stitched is None:
             return self._abort(goal_handle, "Stitching returned None.")
