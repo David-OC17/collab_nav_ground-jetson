@@ -30,19 +30,14 @@ Pipeline
     Build clean pink (obstacle) and green (wall) masks. Apply MORPH_CLOSE
     `close_iterations` times to each (configurable).
 
-  Stage 4 - Blob extraction + heuristic shape classification
-    Connected components on the cleaned pink mask. For each blob:
-      - compute solidity, aspect ratio, vertex count of approxPolyDP, etc.
-      - decide whether it looks like a "box" (rectangular), a "cone"
-        (round or triangular), or "unknown".
-    Tiny / scattered blobs are dropped via area / solidity thresholds.
+  Stage 4 - Blob extraction
+    Connected components on the cleaned pink mask. Blobs outside the
+    configurable area band are dropped. Every surviving blob is accepted
+    as an obstacle — no shape classification is applied (boxes may appear
+    as joint/irregular shapes whose geometry doesn't fit a single-object
+    heuristic).
 
-  Stage 5 - (Optional) Florence-2 verification
-    If enabled, every accepted blob is crop-padded and sent to Florence-2
-    with the shape descriptions. Blobs that don't match any expected shape
-    are rejected. Soft import — clear error if transformers is unavailable.
-
-  Stage 6 - Project obstacles onto background.png
+  Stage 5 - Project obstacles onto background.png
     Two modes:
       * "bbox" : map the cleaned-image bounding box -> the inner wall bbox
                  of background.png, scale obstacle contours accordingly,
@@ -167,39 +162,22 @@ class TransferConfig:
     """Number of MORPH_CLOSE passes applied to pink and green masks in
     Stage 3. Higher fills bigger gaps but may merge nearby blobs."""
 
-    # ── Stage 4: blob filtering + heuristic classification ──────────────────
+    # ── Stage 4: blob filtering ─────────────────────────────────────────────
     min_blob_area_frac: float = 0.001
     """Drop blobs whose area / total-image-area is below this fraction.
     0.001 of a 2000x2000 image == 4000 px (a small but real object)."""
-    max_blob_area_frac: float = 0.25
+    max_blob_area_frac: float = 0.40
     """Drop blobs above this fraction (probably the wall or huge noise)."""
 
-    min_solidity_box: float = 0.85
-    """Solidity (area / convex-hull area) above which a blob looks like
-    a filled, convex shape (consistent with a box or upright cone)."""
-    box_aspect_min: float = 0.55
-    box_aspect_max: float = 1.85
-    """Aspect-ratio band for box classification on the min-area rect."""
-    box_rectangularity_min: float = 0.78
-    """Area / minAreaRect area for box classification."""
-
-    cone_circularity_min: float = 0.55
-    """4*pi*A / P^2 lower bound for a cone seen from above (circle)."""
-    cone_triangle_vertices: Tuple[int, int] = (3, 5)
-    """approxPolyDP vertex range for a triangle-like cone."""
-
-    # ── Stage 5: Florence-2 verification (opt-in) ──────────────────────────
-    use_florence2: bool = False
-    florence2_model_id: str = "microsoft/Florence-2-base"
-    florence2_device: str = "auto"  # "auto" / "cpu" / "cuda"
-    florence2_pad_px: int = 20
-    """Pixels of context padding around the blob crop sent to Florence-2."""
-    florence2_min_score: float = 0.0
-    """Florence-2 doesn't always return scores; placeholder for future use."""
+    min_blob_solidity: float = 0.25
+    """Minimum solidity (area / convex-hull area) for a blob to be accepted.
+    Rejects thin noise strips at the image border while passing any compact
+    obstacle shape including irregular joint box arrangements (L, U, T, etc).
+    Lower values are more permissive; 0.25 rejects only truly scattered noise."""
 
     expected_shapes: List[ExpectedShape] = field(default_factory=_default_shapes)
 
-    # ── Stage 6: projection onto background ────────────────────────────────
+    # ── Stage 5: projection onto background ────────────────────────────────
     project_mode: str = "bbox"   # "bbox" or "grid"
     background_wall_h_lo: int = 5
     background_wall_h_hi: int = 25
@@ -486,7 +464,7 @@ def build_clean_masks(img: np.ndarray, cfg: TransferConfig,
 
 
 # ===============================================================================
-# Stage 4 — Blob extraction + heuristic shape classification
+# Stage 4 — Blob extraction
 # ===============================================================================
 
 @dataclass
@@ -495,14 +473,7 @@ class Blob:
     area: float
     bbox: Tuple[int, int, int, int]   # x, y, w, h
     centroid: Tuple[float, float]
-    solidity: float
-    aspect: float
-    rectangularity: float
-    circularity: float
-    n_vertices: int
-    heuristic_label: str         # "box" / "cone" / "unknown"
-    heuristic_confidence: float  # 0..1
-    final_label: Optional[str] = None  # set after classify / Florence-2
+    final_label: Optional[str] = None
 
     # Consistency score in [0, 1] (1.0 == high confidence).
     # Populated by compute_consistency(); None means "not computed".
@@ -514,227 +485,59 @@ class Blob:
         return self.area  # convenience placeholder; populated externally
 
 
-def _classify_blob(contour: np.ndarray, cfg: TransferConfig) -> Tuple[str, float, Dict[str, float]]:
-    """
-    Returns (label, confidence, metrics_dict).
-    Heuristic only — lenient: prefers to label something rather than 'unknown'
-    when borderline. Florence-2 can override later if enabled.
-    """
-    area = float(cv2.contourArea(contour))
-    if area <= 0:
-        return "unknown", 0.0, {}
-
-    peri = cv2.arcLength(contour, closed=True) + 1e-9
-    hull = cv2.convexHull(contour)
-    hull_area = float(cv2.contourArea(hull)) + 1e-9
-    solidity  = area / hull_area
-
-    rect    = cv2.minAreaRect(contour)   # ((cx,cy),(w,h),angle)
-    (w, h)  = rect[1]
-    rect_a  = max(w * h, 1e-9)
-    rectangularity = area / rect_a
-    if w == 0 or h == 0:
-        aspect = 0.0
-    else:
-        aspect = min(w, h) / max(w, h)   # 1.0 == square, <1 == elongated
-
-    circularity = 4.0 * math.pi * area / (peri * peri)
-
-    approx = cv2.approxPolyDP(contour, 0.04 * peri, closed=True)
-    n_vert = len(approx)
-
-    metrics = dict(
-        area=area, solidity=solidity, aspect=aspect,
-        rectangularity=rectangularity, circularity=circularity,
-        n_vertices=float(n_vert),
-    )
-
-    # Box test: high rectangularity, decent solidity, moderate aspect.
-    is_box = (
-        rectangularity >= cfg.box_rectangularity_min
-        and solidity   >= cfg.min_solidity_box
-        and cfg.box_aspect_min <= aspect <= cfg.box_aspect_max
-    )
-
-    # Cone-circle: high circularity + decent solidity.
-    is_cone_circle = (
-        circularity >= cfg.cone_circularity_min
-        and solidity >= cfg.min_solidity_box - 0.05
-    )
-
-    # Cone-triangle: 3-5 vertices on approxPolyDP.
-    is_cone_triangle = (
-        cfg.cone_triangle_vertices[0] <= n_vert <= cfg.cone_triangle_vertices[1]
-        and solidity >= cfg.min_solidity_box - 0.10
-        and aspect   <= 0.95     # rules out near-square boxes that triangulate to 4 verts
-        and rectangularity < cfg.box_rectangularity_min   # avoid box overlap
-    )
-
-    if is_box and not (is_cone_circle and circularity > 0.85):
-        # Confidence: how comfortably we're inside the box band.
-        conf = min(rectangularity, solidity)
-        return "box", conf, metrics
-
-    if is_cone_circle or is_cone_triangle:
-        conf = max(circularity, 0.5 if is_cone_triangle else 0.0)
-        return "cone", conf, metrics
-
-    # Borderline: be lenient if it's still a tidy convex blob with decent area.
-    if solidity >= 0.75 and rectangularity >= 0.6:
-        # Lean on aspect to pick the closest class.
-        if aspect >= 0.5 and rectangularity >= 0.7:
-            return "box", 0.45, metrics
-        return "cone", 0.40, metrics
-
-    return "unknown", 0.0, metrics
-
-
 def extract_blobs(pink_mask: np.ndarray, cfg: TransferConfig,
                   verbose: bool = True) -> List[Blob]:
+    """Extract all pink blobs that fall within the area band.
+
+    No shape classification is applied — every surviving blob is accepted as
+    an obstacle (labeled with the first expected shape). Boxes may appear as
+    joint or irregular arrangements whose geometry doesn't fit a per-object
+    heuristic.
+    """
     img_area = float(pink_mask.shape[0] * pink_mask.shape[1])
     min_area = cfg.min_blob_area_frac * img_area
     max_area = cfg.max_blob_area_frac * img_area
 
+    label = cfg.expected_shapes[0].name if cfg.expected_shapes else "box"
+
     contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     blobs: List[Blob] = []
+    dropped_area = dropped_solidity = 0
     for c in contours:
         a = float(cv2.contourArea(c))
         if a < min_area or a > max_area:
+            dropped_area += 1
             continue
+
+        # Solidity filter: rejects thin noise strips (solidity ≈ 0.1-0.2)
+        # while accepting any compact shape including joint box arrangements.
+        hull = cv2.convexHull(c)
+        hull_area = float(cv2.contourArea(hull)) + 1e-9
+        solidity = a / hull_area
+        if solidity < cfg.min_blob_solidity:
+            dropped_solidity += 1
+            continue
+
         x, y, w, h = cv2.boundingRect(c)
         M = cv2.moments(c)
         if M["m00"] == 0:
             continue
         cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
 
-        label, conf, metrics = _classify_blob(c, cfg)
-
         blobs.append(Blob(
             contour=c, area=a, bbox=(x, y, w, h), centroid=(cx, cy),
-            solidity=metrics.get("solidity", 0.0),
-            aspect=metrics.get("aspect", 0.0),
-            rectangularity=metrics.get("rectangularity", 0.0),
-            circularity=metrics.get("circularity", 0.0),
-            n_vertices=int(metrics.get("n_vertices", 0)),
-            heuristic_label=label,
-            heuristic_confidence=conf,
-            final_label=label if label != "unknown" else None,
+            final_label=label,
         ))
 
-    _log(f"  Found {len(blobs)} candidate blobs after area filter "
-         f"[{min_area:.0f}..{max_area:.0f} px]", verbose)
+    _log(f"  Found {len(blobs)} blobs (dropped {dropped_area} by area, "
+         f"{dropped_solidity} by solidity)  "
+         f"area=[{min_area:.0f}..{max_area:.0f} px]  "
+         f"min_solidity={cfg.min_blob_solidity}", verbose)
     for i, b in enumerate(blobs):
-        _log(f"    [{i:02d}] area={b.area:7.0f}  solid={b.solidity:.2f}  "
-             f"asp={b.aspect:.2f}  rect={b.rectangularity:.2f}  "
-             f"circ={b.circularity:.2f}  verts={b.n_vertices}  "
-             f"-> {b.heuristic_label} ({b.heuristic_confidence:.2f})", verbose)
+        _log(f"    [{i:02d}] area={b.area:7.0f}  centroid=({b.centroid[0]:.0f}, "
+             f"{b.centroid[1]:.0f})  label={b.final_label}", verbose)
     return blobs
 
-
-# ===============================================================================
-# Stage 5 — Florence-2 verification (soft import, opt-in)
-# ===============================================================================
-
-class Florence2Verifier:
-    """Lazy wrapper. Import + load the model only if instantiated."""
-
-    def __init__(self, cfg: TransferConfig, verbose: bool = True):
-        try:
-            from transformers import AutoProcessor, AutoModelForCausalLM  # noqa: F401
-            import torch                                                  # noqa: F401
-        except ImportError as e:
-            raise ImportError(
-                "Florence-2 verification requested but `transformers`/`torch` "
-                "are not installed. Install with: "
-                "pip install transformers torch pillow\n"
-                f"(underlying error: {e})"
-            ) from e
-
-        import torch
-        from transformers import AutoProcessor, AutoModelForCausalLM
-
-        device = cfg.florence2_device
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        _log(f"  Loading Florence-2 ({cfg.florence2_model_id}) on {device}...", verbose)
-        self.device    = device
-        self.processor = AutoProcessor.from_pretrained(cfg.florence2_model_id,
-                                                       trust_remote_code=True)
-        self.model     = AutoModelForCausalLM.from_pretrained(cfg.florence2_model_id,
-                                                              trust_remote_code=True
-                                                              ).to(device).eval()
-        self.cfg = cfg
-
-    def _caption(self, pil_img) -> str:
-        import torch
-        task = "<MORE_DETAILED_CAPTION>"
-        inputs = self.processor(text=task, images=pil_img,
-                                return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            ids = self.model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=128, num_beams=3, do_sample=False,
-            )
-        text = self.processor.batch_decode(ids, skip_special_tokens=True)[0]
-        return text.lower()
-
-    def verify(self, blob_crop_bgr: np.ndarray) -> Optional[str]:
-        """Return the matched expected-shape name or None."""
-        from PIL import Image
-        pil = Image.fromarray(cv2.cvtColor(blob_crop_bgr, cv2.COLOR_BGR2RGB))
-        caption = self._caption(pil)
-
-        best = None
-        for shape in self.cfg.expected_shapes:
-            # any keyword from name or descriptions appearing in the caption?
-            hits = [shape.name.lower()] + [d.lower() for d in shape.descriptions]
-            if any(self._keyword_hit(caption, kw) for kw in hits):
-                best = shape.name
-                break
-        return best
-
-    @staticmethod
-    def _keyword_hit(caption: str, phrase: str) -> bool:
-        """Very loose phrase match — checks any non-trivial word from the
-        phrase appears in the caption."""
-        if phrase in caption:
-            return True
-        # fallback: any meaningful >=4-letter word
-        for w in phrase.split():
-            if len(w) >= 4 and w in caption:
-                return True
-        return False
-
-
-def verify_with_florence2(img_bgr: np.ndarray, blobs: List[Blob],
-                          cfg: TransferConfig, verbose: bool = True) -> List[Blob]:
-    if not cfg.use_florence2:
-        return blobs
-    if not blobs:
-        return blobs
-
-    verifier = Florence2Verifier(cfg, verbose=verbose)
-    pad = cfg.florence2_pad_px
-    H, W = img_bgr.shape[:2]
-    kept: List[Blob] = []
-    for i, b in enumerate(blobs):
-        x, y, w, h = b.bbox
-        x0 = max(0, x - pad);  y0 = max(0, y - pad)
-        x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
-        crop = img_bgr[y0:y1, x0:x1]
-        label = verifier.verify(crop)
-        if label is None:
-            _log(f"    [{i:02d}] Florence-2 rejected (heuristic said "
-                 f"{b.heuristic_label})", verbose)
-            b.final_label = None
-            continue
-        b.final_label = label
-        _log(f"    [{i:02d}] Florence-2: {label} "
-             f"(heuristic said {b.heuristic_label})", verbose)
-        kept.append(b)
-    return kept
 
 
 # ===============================================================================
@@ -941,10 +744,7 @@ def _blob_overlay(img_bgr: np.ndarray, blobs: List[Blob]) -> np.ndarray:
             color = (90, 90, 90)
         cv2.drawContours(out, [b.contour], -1, color, 2)
         cx, cy = int(b.centroid[0]), int(b.centroid[1])
-        text = f"#{i} {b.heuristic_label}"
-        if b.final_label and b.final_label != b.heuristic_label:
-            text += f"->{b.final_label}"
-        cv2.putText(out, text, (cx - 30, cy),
+        cv2.putText(out, f"#{i} {b.final_label or 'unknown'}", (cx - 30, cy),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
     return out
 
@@ -1210,27 +1010,27 @@ def run_pipeline(
 
     # Stage 1 ------------------------------------------------------------
     if cfg.correct_perspective:
-        _log("\n[1/6] De-warping via blue grid lines...", verbose)
+        _log("\n[1/5] De-warping via blue grid lines...", verbose)
         dewarped = dewarp(img, cfg, verbose=verbose)
     else:
-        _log("\n[1/6] Perspective correction disabled.", verbose)
+        _log("\n[1/5] Perspective correction disabled.", verbose)
         dewarped = img
     stages["dewarped"] = dewarped
     _save_debug(None, "01_dewarped", dewarped, debug_dir, verbose)
 
     # Stage 2 ------------------------------------------------------------
-    _log("\n[2/6] Cropping to blue boundary...", verbose)
+    _log("\n[2/5] Cropping to blue boundary...", verbose)
     cropped = crop_to_blue(dewarped, cfg, verbose=verbose)
     stages["cropped"] = cropped
     _save_debug(None, "02_cropped", cropped, debug_dir, verbose)
 
-    _log("\n[2b/6] Masking everything outside the green wall hull...", verbose)
+    _log("\n[2b/5] Masking everything outside the green wall hull...", verbose)
     cleaned, hull = mask_outside_wall(cropped, cfg, verbose=verbose)
     stages["wall_masked"] = cleaned
     _save_debug(None, "03_wall_masked", cleaned, debug_dir, verbose)
 
     # Stage 3 ------------------------------------------------------------
-    _log("\n[3/6] Building pink & green masks with closing...", verbose)
+    _log("\n[3/5] Building pink & green masks with closing...", verbose)
     pink, green = build_clean_masks(cleaned, cfg, verbose=verbose)
     stages["pink_mask"]  = pink
     stages["green_mask"] = green
@@ -1240,22 +1040,15 @@ def run_pipeline(
                 debug_dir, verbose)
 
     # Stage 4 ------------------------------------------------------------
-    _log("\n[4/6] Extracting blobs and classifying heuristically...", verbose)
+    _log("\n[4/5] Extracting blobs...", verbose)
     blobs = extract_blobs(pink, cfg, verbose=verbose)
-
-    # Stage 5 ------------------------------------------------------------
-    if cfg.use_florence2:
-        _log("\n[5/6] Verifying every blob with Florence-2...", verbose)
-        blobs = verify_with_florence2(cleaned, blobs, cfg, verbose=verbose)
-    else:
-        _log("\n[5/6] Florence-2 disabled — using heuristic labels.", verbose)
 
     overlay = _blob_overlay(cleaned, blobs)
     stages["blob_overlay"] = overlay
     _save_debug(None, "06_blob_overlay", overlay, debug_dir, verbose)
 
-    # Stage 6 ------------------------------------------------------------
-    _log(f"\n[6/6] Projecting blobs onto background "
+    # Stage 5 ------------------------------------------------------------
+    _log(f"\n[5/5] Projecting blobs onto background "
          f"(mode={cfg.project_mode})...", verbose)
     final = project_onto_background(bg, cleaned, blobs, cfg, verbose=verbose)
     stages["final"] = final
@@ -1294,16 +1087,11 @@ def _build_argparser() -> argparse.ArgumentParser:
 
     # Stage 4
     ap.add_argument("--min-area-frac", type=float, default=0.001)
-    ap.add_argument("--max-area-frac", type=float, default=0.25)
+    ap.add_argument("--max-area-frac", type=float, default=0.40)
+    ap.add_argument("--min-solidity", type=float, default=0.25,
+                    help="Minimum blob solidity; filters noise strips (default 0.25)")
 
     # Stage 5
-    ap.add_argument("--use-florence2", action="store_true",
-                    help="Verify every blob with Florence-2 (needs transformers)")
-    ap.add_argument("--florence2-model", default="microsoft/Florence-2-base")
-    ap.add_argument("--florence2-device", default="auto",
-                    choices=["auto", "cpu", "cuda"])
-
-    # Stage 6
     ap.add_argument("--project-mode", default="bbox", choices=["bbox", "grid"],
                     help="bbox = simple scale-and-shift to background wall bbox; "
                          "grid = piecewise-linear via detected blue grid lines.")
@@ -1325,9 +1113,7 @@ def main():
         morph_kernel        = args.morph_kernel,
         min_blob_area_frac  = args.min_area_frac,
         max_blob_area_frac  = args.max_area_frac,
-        use_florence2       = args.use_florence2,
-        florence2_model_id  = args.florence2_model,
-        florence2_device    = args.florence2_device,
+        min_blob_solidity   = args.min_solidity,
         project_mode        = args.project_mode,
         drop_unknown        = not args.keep_unknown,
     )

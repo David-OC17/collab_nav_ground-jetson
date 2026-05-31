@@ -63,6 +63,7 @@ import os
 import cv2
 import numpy as np
 import math
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Generator, List, Optional, Tuple
@@ -1094,12 +1095,27 @@ def _feather_blend_roi(
     canvas_roi: np.ndarray,
     warped_roi: np.ndarray,
     mask_new: np.ndarray,
+    mask_c: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Distance-weighted feathering blend operating on pre-extracted ROI arrays.
     Both inputs are the same small region; the full canvas is never touched.
+
+    mask_c : pre-computed boolean coverage mask for canvas_roi.  When None,
+             falls back to the pixel-sum heuristic (canvas_roi.sum > 0), which
+             misidentifies genuinely black scene pixels as "not yet covered".
+
+    Alpha is derived from the dual distance transform:
+        alpha = dist_new / (dist_new + dist_old + eps)
+    where dist_new = distance from the new frame's footprint boundary and
+    dist_old = distance from the existing coverage boundary.  This seats the
+    seam at the iso-depth contour of both footprints — each image is weighted
+    by how "deep inside" its own territory the pixel sits — rather than giving
+    the new frame higher weight at the center of the overlap zone (the old
+    single-distanceTransform approach).
     """
-    mask_c = canvas_roi.sum(axis=2) > 0
+    if mask_c is None:
+        mask_c = canvas_roi.sum(axis=2) > 0
     only_new = mask_new & ~mask_c
     overlap = mask_new & mask_c
 
@@ -1109,9 +1125,11 @@ def _feather_blend_roi(
     if not overlap.any():
         return result
 
-    dist = cv2.distanceTransform(overlap.astype(np.uint8) * 255, cv2.DIST_L2, 5)
-    d_max = dist.max()
-    alpha = (dist / d_max if d_max > 0 else np.full_like(dist, 0.5)).astype(np.float32)
+    # Dual distance transform: each source is weighted by how far its pixel
+    # sits from its own footprint boundary relative to the other source.
+    dist_new = cv2.distanceTransform(mask_new.astype(np.uint8) * 255, cv2.DIST_L2, 5)
+    dist_old = cv2.distanceTransform(mask_c.astype(np.uint8) * 255, cv2.DIST_L2, 5)
+    alpha = (dist_new / (dist_new + dist_old + 1e-6)).astype(np.float32)
     a3 = alpha[:, :, np.newaxis]
 
     blended = (
@@ -1155,7 +1173,7 @@ def _laplacian_pyramid_blend(
     gp_m = _gpyr(m, levels)
 
     blended_lp = []
-    for la, lb, gm in zip(lp_a, lp_b, reversed(gp_m)):
+    for la, lb, gm in zip(lp_a, lp_b, gp_m):
         if gm.shape[:2] != la.shape[:2]:
             gm = cv2.resize(gm, (la.shape[1], la.shape[0]))
         if gm.ndim == 2:
@@ -1636,7 +1654,7 @@ class ReconstructConfig:
     bowing-grid distortion. The live (streaming) map is unaffected; the clean
     map is produced by finalize()."""
 
-    use_fiducials: bool = False 
+    use_fiducials: bool = True
     """Detect ArUco markers per frame and use repeat sightings of the same ID
     as zero-ambiguity loop-closure landmarks in the pose graph. Markers move
     between runs and aren't surveyed, so they are NOT absolute anchors — but
@@ -1747,12 +1765,14 @@ class MapReconstructor:
             self._lg_session = None
 
         self._canvas: Optional[np.ndarray] = None
-        # When pre-allocation is active, the canvas is larger than needed.
-        # _canvas_origin tracks the (x, y) pixel offset of the coordinate
-        # origin used by all stored homographies within the canvas array.
-        self._canvas_origin: Tuple[int, int] = (0, 0)
+        # Boolean coverage mask — True wherever the canvas has been painted.
+        # Kept alongside _canvas so genuinely black scene pixels (0, 0, 0) are
+        # correctly distinguished from unpainted canvas cells (also 0, 0, 0).
+        self._coverage: Optional[np.ndarray] = None
 
-        self._recent: List[dict] = []    # ring buffer  {kp, des, H, grid_pts}
+        # Ring buffer of recently placed frames {kp, des, H, grid_pts, kf_id}.
+        # deque with a hard maxlen gives O(1) append/drop vs. O(N) list.pop(0).
+        self._recent: deque = deque(maxlen=self.cfg.lookback + 2)
         self._keyframes: List[dict] = [] # sparse long-range anchors
 
         self._n_placed = 0
@@ -1761,6 +1781,13 @@ class MapReconstructor:
         # Running counters for grid-refinement telemetry.
         self._n_grid_refined = 0
         self._n_grid_skipped = 0
+
+        # Persistent thread pool for parallel candidate matching in _place_frame.
+        # Creating a new ThreadPoolExecutor per frame (the original code) spawns
+        # and tears down threads at the frame rate; OpenCV RANSAC/matcher DO
+        # release the GIL so the parallelism is real, but the OS overhead is not.
+        _max_workers = max(1, self.cfg.lookback + self.cfg.max_keyframes)
+        self._pool = ThreadPoolExecutor(max_workers=_max_workers)
 
         # ── global-consistency back-end ──────────────────────────────────────
         self._fiducial = (
@@ -1783,6 +1810,12 @@ class MapReconstructor:
         self._last_finalize_report: Optional[dict] = None  # set by finalize()
 
     # ── public API ───────────────────────────────────────────────────────────
+
+    def __del__(self):
+        """Shut down the persistent candidate-matching thread pool."""
+        pool = getattr(self, "_pool", None)
+        if pool is not None:
+            pool.shutdown(wait=False)
 
     def add_video(
         self,
@@ -2051,15 +2084,19 @@ class MapReconstructor:
                 H0 = np.array([[1, 0, m], [0, 1, m], [0, 0, 1]], dtype=np.float64)
                 self._canvas = np.zeros((h + 2 * m, w + 2 * m, 3), dtype=np.uint8)
             self._warp_and_blend_roi(img_stitch, H0)
-            self._register(kp, des, H0, grid_pts=grid_pts)
             self._n_placed = 1
             # Pose graph: first frame is the FIXED gauge keyframe.
-            self._graph_on_placed(img_stitch, H0, True, w, h, markers, fixed=True)
+            # Call before _register so the returned kf_id can be stored in the
+            # keyframe entry that _register is about to add.
+            kf_id_assigned = self._graph_on_placed(
+                img_stitch, H0, True, w, h, markers, fixed=True
+            )
+            self._register(kp, des, H0, grid_pts=grid_pts, kf_id=kf_id_assigned)
             return True
 
         # ── match against recent frames + keyframes (parallel) ───────────────
         lookback = min(self.cfg.lookback, len(self._recent))
-        candidates = self._recent[-lookback:] + self._keyframes
+        candidates = list(self._recent)[-lookback:] + self._keyframes
 
         canvas_h_px, canvas_w_px = self._canvas.shape[:2]
         # Allow overflow up to one frame diagonal on each side.
@@ -2080,26 +2117,33 @@ class MapReconstructor:
                 lg_session=self._lg_session,
             )
             if H_pair is None:
-                return None, 0, None, {}
+                return None, 0, None, {}, None, None
             composed = ref["H"] @ H_pair
             ok, reason = _validate_composed_H(
                 composed, w, h, canvas_h_px, canvas_w_px, max_overflow
             )
             if not ok:
-                return None, n_in, reason, {}
-            return composed, n_in, None, stats
+                return None, n_in, reason, {}, None, None
+            # Return the reference's kf_id (None for recent-buffer entries) and
+            # the raw pairwise H so the caller can add a loop edge to the graph.
+            return composed, n_in, None, stats, ref.get("kf_id"), H_pair
 
         best_H, best_n, best_stats = None, 0, {}
-        with ThreadPoolExecutor(max_workers=max(1, len(candidates))) as pool:
-            for composed, n_in, reject_reason, stats in pool.map(_match_candidate, candidates):
-                if composed is None:
-                    if verbose and reject_reason is not None:
-                        print(f"  [reject_composed] {reject_reason} (n_in={n_in})")
-                    continue
-                if n_in > best_n:
-                    best_H = composed
-                    best_n = n_in
-                    best_stats = stats
+        winner_kf_id: Optional[int] = None
+        winner_H_pair: Optional[np.ndarray] = None
+        for composed, n_in, reject_reason, stats, ref_kf_id, H_pair in self._pool.map(
+            _match_candidate, candidates
+        ):
+            if composed is None:
+                if verbose and reject_reason is not None:
+                    print(f"  [reject_composed] {reject_reason} (n_in={n_in})")
+                continue
+            if n_in > best_n:
+                best_H = composed
+                best_n = n_in
+                best_stats = stats
+                winner_kf_id = ref_kf_id
+                winner_H_pair = H_pair
 
         if verbose and best_stats:
             s = best_stats
@@ -2128,26 +2172,66 @@ class MapReconstructor:
         # ── warp and blend (ROI only) ────────────────────────────────────────
         self._warp_and_blend_roi(img_stitch, best_H)
         self._n_placed += 1
-        self._register(kp, des, best_H, grid_pts=grid_pts)
-        # Pose graph: mirror _register's keyframe rule so the graph node set
-        # matches the keyframe archive.
+
+        # Feed the pose graph BEFORE _register so the returned kf_id can be
+        # stored in the keyframe entry _register is about to create.  Loop
+        # edges are only added when the winner was a keyframe (winner_kf_id is
+        # not None) and this frame also becomes a keyframe.
         becomes_kf = (self._n_placed % self.cfg.keyframe_interval == 0)
-        self._graph_on_placed(img_stitch, best_H, becomes_kf, w, h, markers)
+        kf_id_assigned = self._graph_on_placed(
+            img_stitch, best_H, becomes_kf, w, h, markers,
+            matched_kf_id=winner_kf_id,
+            matched_H_pair=winner_H_pair,
+            matched_n_inliers=best_n,
+        )
+        self._register(kp, des, best_H, grid_pts=grid_pts, kf_id=kf_id_assigned)
         return True
 
     # ── pose-graph / fiducial hooks ───────────────────────────────────────────
 
-    def _graph_on_placed(self, img_stitch, H, is_keyframe, w, h, markers,
-                         fixed: bool = False):
+    def _graph_on_placed(
+        self,
+        img_stitch: np.ndarray,
+        H: np.ndarray,
+        is_keyframe: bool,
+        w: int,
+        h: int,
+        markers,
+        fixed: bool = False,
+        matched_kf_id: Optional[int] = None,
+        matched_H_pair: Optional[np.ndarray] = None,
+        matched_n_inliers: int = 0,
+    ) -> Optional[int]:
         """Feed a just-placed frame to the pose graph and cache its pixels for
-        the finalize() re-render. No-op when the pose graph is disabled."""
+        the finalize() re-render.
+
+        Returns the StitchGraph keyframe id assigned to this frame if it became
+        a keyframe (so _register can tag the keyframe entry for future loop
+        edges), else None.  Returns None when the pose graph is disabled.
+
+        matched_kf_id / matched_H_pair / matched_n_inliers
+            When the winning reference frame during candidate matching was a
+            keyframe, these carry its graph id, the pairwise relative transform,
+            and the inlier count.  StitchGraph uses them to add a loop-closure
+            edge between the two keyframes — the edge that closes the gap
+            between lawnmower passes and is the primary non-fiducial constraint.
+        """
         if self._sg is None:
-            return
-        self._sg.on_placed(H, is_keyframe=is_keyframe, frame_w=w, frame_h=h,
-                           fixed=fixed)
+            return None
+        kf_id = self._sg.on_placed(
+            H,
+            is_keyframe=is_keyframe,
+            frame_w=w,
+            frame_h=h,
+            fixed=fixed,
+            matched_kf_id=matched_kf_id,
+            matched_H_pair=matched_H_pair,
+            matched_n_inliers=matched_n_inliers,
+        )
         self._sg.on_markers(markers)
         self._cache_frame(self._render_idx, img_stitch)
         self._render_idx += 1
+        return kf_id
 
     def _cache_frame(self, idx: int, img: np.ndarray) -> None:
         if self._cache_dir is None:
@@ -2191,6 +2275,8 @@ class MapReconstructor:
         old_canvas = self._canvas
         self._canvas = fresh
         del old_canvas
+        # Reset the coverage mask so the re-render rebuilds it from scratch.
+        self._coverage = np.zeros(fresh.shape[:2], dtype=np.bool_)
         n = 0
         for rec_idx, H_corr in self._sg.iter_corrections():
             img = self._load_cached_frame(rec_idx)
@@ -2213,6 +2299,7 @@ class MapReconstructor:
         des,
         H: np.ndarray,
         grid_pts: Optional[np.ndarray] = None,
+        kf_id: Optional[int] = None,
     ):
         """Store frame data in the recent-frames ring buffer and keyframe archive.
 
@@ -2220,18 +2307,22 @@ class MapReconstructor:
         in this frame's local coordinate system, or None if grid detection
         was disabled / returned no intersections.  Stored alongside kp/des so
         that subsequent frames can use them as Stage-2 refinement anchors.
+
+        kf_id — StitchGraph keyframe id returned by _graph_on_placed when this
+        frame became a keyframe.  Stored in the keyframe-archive entry so that
+        when a future frame matches this keyframe as its best reference, the
+        loop-closure edge can be reported back to the pose graph.
         """
         entry = {
             "kp":       kp,
             "des":      des,
             "H":        H.copy(),
             "grid_pts": grid_pts,   # may be None
+            "kf_id":    None,       # recent-buffer entries are not keyframes
         }
 
-        # ── recent ring buffer (bounded by lookback + 2) ─────────────────────
+        # ── recent ring buffer — deque.maxlen enforces the bound automatically ─
         self._recent.append(entry)
-        if len(self._recent) > self.cfg.lookback + 2:
-            self._recent.pop(0)
 
         # ── keyframe archive (bounded by max_keyframes) ──────────────────────
         if self._n_placed % self.cfg.keyframe_interval == 0:
@@ -2240,6 +2331,7 @@ class MapReconstructor:
                 "des":      des,
                 "H":        H.copy(),
                 "grid_pts": grid_pts,
+                "kf_id":    kf_id,   # links this entry to its pose-graph node
             })
 
             cap = self.cfg.max_keyframes
@@ -2331,6 +2423,12 @@ class MapReconstructor:
         del self._canvas        # release old before assigning new
         self._canvas = new_canvas
 
+        # Expand the coverage mask by the same offsets.
+        if self._coverage is not None:
+            new_cov = np.zeros((new_h, new_w), dtype=np.bool_)
+            new_cov[pt : pt + ch, pl : pl + cw] = self._coverage
+            self._coverage = new_cov
+
         T = np.array([[1, 0, pl], [0, 1, pt], [0, 0, 1]], dtype=np.float64)
         for rec in (*self._recent, *self._keyframes):
             rec["H"] = T @ rec["H"]
@@ -2355,9 +2453,28 @@ class MapReconstructor:
                     1080p frame), regardless of canvas size.
 
         Peak extra memory ≈ 2 × (roi_h × roi_w × 3) bytes.
+
+        Coverage mask
+        ─────────────
+        A boolean mask (self._coverage) is maintained alongside the canvas.
+        It is set True at every pixel that has been painted, regardless of the
+        pixel's colour value.  This correctly handles genuinely black scene
+        content (black obstacles, dark floor) that would otherwise be
+        misidentified as "canvas not yet painted" by a pixel-sum > 0 test.
+
+        Frame footprint (mask_new)
+        ──────────────────────────
+        mask_new is derived by warping a white sentinel image through the same
+        transform, not from the pixel values of warped_roi.  This marks the
+        true source-frame boundary so that genuinely black source pixels within
+        the footprint are counted as covered rather than excluded.
         """
         fh, fw = img.shape[:2]
         ch, cw = self._canvas.shape[:2]
+
+        # Lazily initialise the coverage mask (first call after canvas creation).
+        if self._coverage is None:
+            self._coverage = np.zeros((ch, cw), dtype=np.bool_)
 
         # ── tight bounding box of the warped frame on the canvas ─────────────
         corners = np.float32([[0, 0], [fw, 0], [fw, fh], [0, fh]]).reshape(-1, 1, 2)
@@ -2386,7 +2503,17 @@ class MapReconstructor:
             ).download()
         else:
             warped_roi = cv2.warpPerspective(img, H_roi, (roi_w, roi_h))
-        mask_new = warped_roi.sum(axis=2) > 0
+
+        # True footprint: warp a white sentinel so that genuinely black source
+        # pixels are counted as "inside the frame" rather than "no data".
+        # cv2.warpPerspective fills out-of-source-bounds areas with 0, so any
+        # non-zero sentinel pixel correctly marks a source-frame location.
+        _sentinel = np.ones((fh, fw), dtype=np.uint8) * 255
+        mask_new = cv2.warpPerspective(_sentinel, H_roi, (roi_w, roi_h)) > 0
+        del _sentinel
+
+        # ── coverage ROI — a VIEW into self._coverage (writes propagate) ─────
+        coverage_roi = self._coverage[y0:y1, x0:x1]   # bool (roi_h, roi_w)
 
         # ── blend directly into the canvas slice ─────────────────────────────
         # canvas_roi is a VIEW into self._canvas, so in-place writes propagate.
@@ -2394,7 +2521,7 @@ class MapReconstructor:
         mode = self.cfg.blend_mode
 
         if mode == "flat":
-            mask_c = canvas_roi.sum(axis=2) > 0
+            mask_c = coverage_roi
             only_new = mask_new & ~mask_c
             overlap = mask_new & mask_c
             canvas_roi[only_new] = warped_roi[only_new]
@@ -2405,26 +2532,35 @@ class MapReconstructor:
                 ).astype(np.uint8)
 
         elif mode == "pyramid":
-            mask_c = canvas_roi.sum(axis=2) > 0
+            mask_c = coverage_roi
             only_new = mask_new & ~mask_c
             overlap = mask_new & mask_c
             canvas_roi[only_new] = warped_roi[only_new]
             if overlap.any():
-                dist = cv2.distanceTransform(
-                    overlap.astype(np.uint8) * 255, cv2.DIST_L2, 5
+                # Dual distance transform for the alpha map — same semantics as
+                # feather mode: seam placed at the iso-depth contour of both
+                # footprints.  This also fixes the old single-distanceTransform
+                # on the overlap region, which gave the new frame higher weight
+                # at the overlap centre rather than at its own territory centre.
+                dist_new = cv2.distanceTransform(
+                    mask_new.astype(np.uint8) * 255, cv2.DIST_L2, 5
                 )
-                d_max = dist.max()
-                alpha = (dist / d_max if d_max > 0 else np.full_like(dist, 0.5)).astype(
-                    np.float32
+                dist_old = cv2.distanceTransform(
+                    mask_c.astype(np.uint8) * 255, cv2.DIST_L2, 5
                 )
+                alpha = (dist_new / (dist_new + dist_old + 1e-6)).astype(np.float32)
                 blended = _laplacian_pyramid_blend(
                     canvas_roi, warped_roi, alpha, self.cfg.pyramid_levels
                 )
                 canvas_roi[overlap] = blended[overlap]
 
         else:  # "feather" (default)
-            blended = _feather_blend_roi(canvas_roi, warped_roi, mask_new)
+            blended = _feather_blend_roi(canvas_roi, warped_roi, mask_new,
+                                         mask_c=coverage_roi)
             self._canvas[y0:y1, x0:x1] = blended
+
+        # ── update coverage for every pixel touched by this frame ─────────────
+        coverage_roi |= mask_new
 
 
 # ══════════════════════════════════════════════════════════════════════════════

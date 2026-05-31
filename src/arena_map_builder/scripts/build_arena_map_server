@@ -202,13 +202,10 @@ class BuildArenaMapServer(Node):
         self.declare_parameter("transfer.correct_perspective", True)
         self.declare_parameter("transfer.close_iterations", 3)
         self.declare_parameter("transfer.morph_kernel",     5)
-        self.declare_parameter("transfer.min_blob_area_frac", 0.001)
-        self.declare_parameter("transfer.max_blob_area_frac", 0.25)
-        self.declare_parameter("transfer.use_florence2",     False)
-        self.declare_parameter("transfer.florence2_model_id",
-                               "microsoft/Florence-2-base")
-        self.declare_parameter("transfer.florence2_device",  "auto")
-        self.declare_parameter("transfer.drop_unknown",      True)
+        self.declare_parameter("transfer.min_blob_area_frac",  0.001)
+        self.declare_parameter("transfer.max_blob_area_frac",  0.40)
+        self.declare_parameter("transfer.min_blob_solidity",   0.25)
+        self.declare_parameter("transfer.drop_unknown",        True)
         # Background template (path to the clean arena PNG).
         self.declare_parameter("transfer.background_path", "")
 
@@ -412,9 +409,7 @@ class BuildArenaMapServer(Node):
             morph_kernel        = self._get("transfer.morph_kernel"),
             min_blob_area_frac  = self._get("transfer.min_blob_area_frac"),
             max_blob_area_frac  = self._get("transfer.max_blob_area_frac"),
-            use_florence2       = self._get("transfer.use_florence2"),
-            florence2_model_id  = self._get("transfer.florence2_model_id"),
-            florence2_device    = self._get("transfer.florence2_device"),
+            min_blob_solidity   = self._get("transfer.min_blob_solidity"),
             drop_unknown        = self._get("transfer.drop_unknown"),
         )
 

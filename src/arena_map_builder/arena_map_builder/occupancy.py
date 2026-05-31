@@ -97,7 +97,7 @@ class OccupancyConfig:
     """S below which (combined with white_v_lo) marks the unknown region."""
 
     # ── Misc ────────────────────────────────────────────────────────────
-    frame_id: str = "map"
+    frame_id: str = "world"
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -284,6 +284,16 @@ def occupancy_to_grid_array(
         (width, height),
         interpolation=cv2.INTER_NEAREST,
     ).astype(np.int8)
+
+    # Re-stamp the 2-cell wall border after resize. INTER_NEAREST can leave
+    # partial or missing wall pixels at the very edge of the grid when the
+    # arena bbox didn't land on an exact cell boundary. Overwriting the
+    # perimeter guarantees a clean, gapless boundary in the published map.
+    border = 2
+    resized[:border,   :] = cfg.wall_occ
+    resized[-border:,  :] = cfg.wall_occ
+    resized[:,  :border] = cfg.wall_occ
+    resized[:, -border:] = cfg.wall_occ
 
     # Flip vertically: image y grows downward, nav2 y grows upward.
     nav2_grid = np.flipud(resized)
