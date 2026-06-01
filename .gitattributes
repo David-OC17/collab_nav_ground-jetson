@@ -7,3 +7,4 @@ src/arena_map_builder/data/background.png filter=lfs diff=lfs merge=lfs -text
 src/arena_map_builder/data/drone_scans filter=lfs diff=lfs merge=lfs -text
 src/arena_map_builder/data/square_cut filter=lfs diff=lfs merge=lfs -text
 src/arena_map_builder/data/static_scans filter=lfs diff=lfs merge=lfs -text
+src/mission_orchestrator/recorded_data/ filter=lfs diff=lfs merge=lfs -text

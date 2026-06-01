@@ -196,6 +196,8 @@ Test planning and control loop that executes after orchestrator's handoff:
 ```bash
 # Once per scan (slow — runs map builder + localizer):
 python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 10 --aruco-ids '[0, 2]'
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 15 --aruco-ids '[5, 0]'
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 17 --aruco-ids '[3, 2]'
 
 # Many times (fast — only AMR bringup + planning):
 python3 src/mission_orchestrator/scripts/run_hw_test_amr_nav.py --scan-id 10

@@ -94,7 +94,7 @@ orchestrator:
   map_builder:
     background_image_path: "/home/jetson/collab_nav_ground-jetson/src/arena_map_builder/config/background.png"
     action_name: "build_arena_map"
-    action_timeout_sec: 300.0
+    action_timeout_sec: 30000.0
     server_ready_timeout_sec: 30.0
     drone_map_topic: "/drone/map"
 

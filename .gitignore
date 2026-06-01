@@ -5,6 +5,7 @@ src/yahboomRDK_X3
 src/yahboomRDK_X3/*
 
 src/arena_map_builder/sweep/stitching/results
+src/arena_map_builder/sweep/transfer/results
 
 # Created by https://www.toptal.com/developers/gitignore/api/c++,ros2,cmake,python,visualstudiocode
 # Edit at https://www.toptal.com/developers/gitignore?templates=c++,ros2,cmake,python,visualstudiocode

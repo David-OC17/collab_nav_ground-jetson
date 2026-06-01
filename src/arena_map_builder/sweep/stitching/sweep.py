@@ -44,7 +44,7 @@ from action_msgs.msg import GoalStatus
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
-from run_matrix import RUNS
+from run_matrix_v2 import RUNS
 
 from arena_map_builder_msgs.action import BuildArenaMap
 
@@ -62,23 +62,43 @@ PROGRESS_FILE   = "progress.yaml"
 # ══════════════════════════════════════════════════════════════════════════════
 
 _PARAM_MAP: Dict[str, tuple] = {
+    # ExtractionConfig
     "target_fps":                ("stitch.extract.target_fps",                    "float"),
     "min_movement":              ("stitch.extract.min_movement",                  "float"),
+    "max_movement":              ("stitch.extract.max_movement",                  "float"),
+    "blur_thresh":               ("stitch.extract.blur_thresh",                   "float"),
+    "artifact_thresh":           ("stitch.extract.artifact_thresh",               "float"),
+    "static_pixel_thresh":       ("stitch.extract.static_pixel_thresh",           "float"),
+    # ReconstructConfig — backend
     "feature_extractor":         ("stitch.reconstruct.feature_extractor",         "str"),
     "feature_matcher":           ("stitch.reconstruct.feature_matcher",           "str"),
+    "processing_scale":          ("stitch.reconstruct.processing_scale",          "float"),
+    # ReconstructConfig — alignment flags
     "use_grid_intersections":    ("stitch.reconstruct.use_grid_intersections",    "bool"),
     "use_pose_graph":            ("stitch.reconstruct.use_pose_graph",            "bool"),
     "use_fiducials":             ("stitch.reconstruct.use_fiducials",             "bool"),
+    # ReconstructConfig — feature quality
     "feature_exclude_dilate_px": ("stitch.reconstruct.feature_exclude_dilate_px", "int"),
     "match_ratio":               ("stitch.reconstruct.match_ratio",               "float"),
     "mad_factor":                ("stitch.reconstruct.mad_factor",                "float"),
     "min_inliers":               ("stitch.reconstruct.min_inliers",               "int"),
+    "min_keypoint_bins":         ("stitch.reconstruct.min_keypoint_bins",         "int"),
+    # ReconstructConfig — temporal
     "lookback":                  ("stitch.reconstruct.lookback",                  "int"),
     "keyframe_interval":         ("stitch.reconstruct.keyframe_interval",         "int"),
+    # ReconstructConfig — grid detection
+    "grid_match_dist":           ("stitch.reconstruct.grid_match_dist",           "float"),
+    "grid_min_intersections":    ("stitch.reconstruct.grid_min_intersections",    "int"),
+    "grid_hsv_h_lo":             ("stitch.reconstruct.grid_hsv_h_lo",             "int"),
+    "grid_hsv_h_hi":             ("stitch.reconstruct.grid_hsv_h_hi",             "int"),
+    "grid_hsv_s_lo":             ("stitch.reconstruct.grid_hsv_s_lo",             "int"),
+    "grid_hsv_v_lo":             ("stitch.reconstruct.grid_hsv_v_lo",             "int"),
+    # ReconstructConfig — pose graph
     "pg_marker_weight":          ("stitch.reconstruct.pg_marker_weight",          "float"),
     "pg_odom_weight":            ("stitch.reconstruct.pg_odom_weight",            "float"),
     "pg_loop_weight":            ("stitch.reconstruct.pg_loop_weight",            "float"),
     "pg_huber_delta":            ("stitch.reconstruct.pg_huber_delta",            "float"),
+    "pg_iterations":             ("stitch.reconstruct.pg_iterations",             "int"),
 }
 
 # ColorRangeMask.blue_tape() encoded as a server string-array entry
@@ -469,15 +489,19 @@ def _print_plan(pending: list, completed: set, failed: set) -> None:
     print(f"Pending:        {len(pending)}\n")
     descs = {
         "A": "architecture × grid × solver × feature-exclusion",
-        "B": "match_ratio × mad_factor",
-        "C": "lookback × keyframe_interval  (sift)",
-        "D": "target_fps × min_movement",
-        "E": "pg_marker_weight × pg_huber_delta  (sift)",
-        "F": "feature_exclude_dilate_px",
-        "G": "min_inliers",
-        "H": "cross-backend best-params check",
-        "I": "lookback × keyframe_interval  (sp+ratio)",
-        "J": "pg_marker_weight × pg_huber_delta  (sp+ratio)",
+        "B": "match_ratio × mad_factor  [0.55–0.80 × 2–6]",
+        "C": "lookback × keyframe_interval  [lb up to 16, ki up to 20]",
+        "D": "processing_scale  [0.25–1.0]",
+        "E": "feature_exclude_dilate_px  [3–20 px]",
+        "F": "min_keypoint_bins + min_inliers",
+        "G": "grid re-exploration: grid_match_dist × HSV recalibration",
+        "H": "pose-graph re-exploration: marker_weight × huber_delta",
+        "I": "target_fps × min_movement",
+        "J": "blur_thresh + max_movement",
+        "K": "processing_scale × match_ratio  [interaction]",
+        "L": "3-way: match_ratio × mad_factor × lookback",
+        "M": "SP × processing_scale  [GPU]",
+        "N": "static_pixel_thresh + artifact_thresh",
     }
     print(f"{'Group':<8} {'Pending':>7}   Description")
     print("─" * 55)
