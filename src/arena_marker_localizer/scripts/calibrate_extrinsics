@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-calibrate_extrinsics -- calibrate T_drone_from_cam from a static session.
+calibrate_extrinsics -- calibrate T_drone_from_cam from one or more static sessions.
 
 The drone is held fixed on a stable mount with one or more ArUco markers at
 precisely known map-frame positions visible to the camera.  The script
@@ -8,41 +8,67 @@ optimises all six parameters of T_drone_from_cam (x, y, z, roll, pitch, yaw)
 so that the full pipeline transform chain reproduces the known marker
 positions as closely as possible.
 
+Multiple (video, gt) pairs can be given to combine sessions where the marker
+layout changes between recordings.  All sessions are optimised jointly.
+A single --csv applies to all videos (when the drone did not move between
+recordings); pass one --csv per --video when the drone was repositioned.
+
 Setup
 ─────
 1. Fix the drone on a stable, level mount.
 2. Have OptiTrack running while recording a short video.
-3. Measure the (x, y, z, yaw) of each visible ArUco marker in the MAP frame.
-4. Create a ground-truth YAML (see format below) with the known positions.
+3. Measure the (x, y) of each visible ArUco marker in the MAP frame.
+4. Create a ground-truth YAML for each video (see format below).
 
 Usage
 ─────
+  # Single session:
   calibrate_extrinsics \\
-      --video   calib.mp4                  \\
-      --csv     calib.csv                  \\
-      --gt      calib_gt.yaml              \\
-      --config  config/default.yaml        \\
+      --video calib.mp4  --csv calib.csv  --gt gt.yaml \\
+      --config config/default.yaml        \\
       --intrinsics config/calibration.yaml
 
-Ground-truth YAML format (calib_gt.yaml)
-────────────────────────────────────────
+  # Multiple sessions, drone did not move (one shared CSV):
+  calibrate_extrinsics \\
+      --video static_scans/video1/scan.mp4 --gt aruco_pose_gt/static_scan1.yaml \\
+      --video static_scans/video2/scan.mp4 --gt aruco_pose_gt/static_scan2.yaml \\
+      --csv   static_scans/video1/telemetry.csv  \\
+      --config config/default.yaml               \\
+      --intrinsics config/calibration.yaml
+
+  # Multiple sessions with drone repositioned (one CSV per video):
+  calibrate_extrinsics \\
+      --video v1.mp4 --csv c1.csv --gt gt1.yaml \\
+      --video v2.mp4 --csv c2.csv --gt gt2.yaml \\
+      --config config/default.yaml
+
+Ground-truth YAML format
+────────────────────────
   markers:
     5:
       x: 1.20    # map frame, metres
       y: 0.85
-      z: 0.0     # optional, default 0
-      yaw: 0.0   # optional, radians
+      z: 0.0     # optional, not yet used in cost
+      theta: 180 # facing direction in map frame, degrees — strongly recommended
     12:
       x: 2.40
       y: 1.10
+      theta: 90
 
 Notes
 ─────
-- More markers → better-conditioned optimisation. A single marker constrains
-  only some of the 6 DOF (enough for the dominant tilt correction).
+- theta (degrees) is the direction the marker faces in the map frame
+  (same convention as the scan GT files).  When provided it adds an
+  orientation term to the cost function, which prevents the optimiser from
+  trading rotation accuracy for position accuracy — a common failure mode
+  when the drone is at a single fixed position.
+- Without theta the optimisation is under-constrained for rotation when the
+  drone does not move between sessions.  Add theta to at least some markers.
+- Translation is bounded to ±0.15 m from the config initial value; increase
+  --max-translation if you expect a larger physical offset.
 - The optimiser is initialised from the current config values, so the result
-  is best interpreted as a refinement rather than a full cold-start solution.
-- Results are printed in a form ready to paste into config/default.yaml.
+  is best interpreted as a refinement rather than a cold-start solution.
+- Results are printed ready to paste into config/default.yaml.
 """
 
 import argparse
@@ -56,14 +82,14 @@ import cv2
 try:
     import scipy.optimize
 except ImportError:
-    sys.exit("ERROR: scipy is required. Install it with: pip install scipy")
+    sys.exit("ERROR: scipy is required.  Install with: pip install scipy")
 
 from arena_marker_localizer.intrinsics       import load_intrinsics
 from arena_marker_localizer.marker_detection import MultiDictDetector, DictionaryConfig
 from arena_marker_localizer.optitrack        import load_optitrack_csv
 from arena_marker_localizer.transforms       import (
     StaticTransform6DoF, OptiTrackAxisConfig,
-    opti_transform_from_pose,
+    opti_transform_from_pose, R_to_euler_zyx,
 )
 
 
@@ -95,6 +121,40 @@ def _parse_dicts(p: dict) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Ground-truth loading
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_gt(path: str) -> tuple[dict, dict]:
+    """
+    Load ground-truth YAML.
+
+    Returns:
+        gt_xy    – {marker_id: np.array([x, y])}
+        gt_theta – {marker_id: theta_rad}  (only for markers that have 'theta')
+    """
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    entries = raw.get("markers", raw)
+    gt_xy: dict = {}
+    gt_theta: dict = {}
+    for mid_str, vals in entries.items():
+        try:
+            mid = int(mid_str)
+        except (ValueError, TypeError):
+            continue
+        gt_xy[mid] = np.array([float(vals["x"]), float(vals["y"])])
+        if "theta" in vals:
+            gt_theta[mid] = math.radians(float(vals["theta"]))
+    return gt_xy, gt_theta
+
+
+def _angle_diff(a: float, b: float) -> float:
+    """Signed angular difference (a - b) wrapped to [-π, π]."""
+    d = a - b
+    return (d + math.pi) % (2.0 * math.pi) - math.pi
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Detection collection
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -103,9 +163,7 @@ def _collect_detections(video_path: str,
                         intrinsics,
                         max_reproj_err_px: float,
                         stride: int = 1) -> dict:
-    """
-    Return {marker_id: [T_cam_marker, ...]} for every accepted detection.
-    """
+    """Return {marker_id: [T_cam_marker, ...]} for every accepted detection."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         sys.exit(f"ERROR: cannot open video {video_path!r}")
@@ -125,36 +183,80 @@ def _collect_detections(video_path: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Drone pose from CSV (drone must be static — average all rows)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _static_drone_pose(csv_path: str,
+                       opti_cfg: OptiTrackAxisConfig,
+                       verbose: bool = False) -> np.ndarray:
+    """Average all CSV rows and return T_opti_from_drone."""
+    drone_poses = load_optitrack_csv(csv_path)
+    if not drone_poses:
+        sys.exit(f"ERROR: CSV is empty: {csv_path!r}")
+    mean_pos = np.mean([dp.pos_xyz for dp in drone_poses], axis=0)
+    mean_yaw = math.atan2(
+        np.mean([math.sin(dp.yaw_rad) for dp in drone_poses]),
+        np.mean([math.cos(dp.yaw_rad) for dp in drone_poses]),
+    )
+    if verbose:
+        pos_std = np.std([dp.pos_xyz for dp in drone_poses], axis=0)
+        status = "OK" if pos_std.max() < 0.005 else "WARNING: drone may have moved"
+        print(f"  Drone mean pos : ({mean_pos[0]:.4f}, {mean_pos[1]:.4f}, {mean_pos[2]:.4f})"
+              f"  yaw : {math.degrees(mean_yaw):.2f}°")
+        print(f"  Drone pos std  : ({pos_std[0]:.4f}, {pos_std[1]:.4f}, {pos_std[2]:.4f})"
+              f"  [{status}]")
+    return opti_transform_from_pose(mean_pos, mean_yaw, opti_cfg)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Optimisation cost
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _cost(params: np.ndarray,
-          detections_by_marker: dict,
-          T_opti_from_drone: np.ndarray,
+          sessions: list,
           T_map_from_opti: np.ndarray,
-          gt_xy: dict) -> float:
+          theta_weight: float) -> float:
     """
-    Mean squared XY map-frame position error across all detections of all
-    known markers.  params = [x, y, z, roll, pitch, yaw] of T_drone_from_cam.
+    Joint position + orientation cost across all sessions.
+
+    params        = [x, y, z, roll, pitch, yaw] of T_drone_from_cam.
+    sessions      = [(T_opti_from_drone, detections, gt_xy, gt_theta), ...]
+    theta_weight  = relative weight of angular vs positional cost.
+
+    Position cost : mean squared XY error in map frame [m²].
+    Orientation cost : mean squared yaw error in map frame [rad²], using the
+        same R_to_euler_zyx extraction as the live pipeline.  Only markers
+        that have a theta entry in their GT file contribute to this term.
     """
     x, y, z, roll, pitch, yaw = params
     T_dfc = StaticTransform6DoF(
         x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw
     ).as_matrix()
-    base = T_map_from_opti @ T_opti_from_drone @ T_dfc
 
-    total = 0.0
-    n = 0
-    for mid, T_list in detections_by_marker.items():
-        if mid not in gt_xy:
-            continue
-        gxy = gt_xy[mid]
-        for T_cm in T_list:
-            est = (base @ T_cm)[:2, 3]
-            diff = est - gxy
-            total += float(np.dot(diff, diff))
-            n += 1
-    return total / max(1, n)
+    pos_total = 0.0;  n_pos = 0
+    ang_total = 0.0;  n_ang = 0
+
+    for T_opti_from_drone, detections, gt_xy, gt_theta in sessions:
+        base = T_map_from_opti @ T_opti_from_drone @ T_dfc
+        for mid, T_list in detections.items():
+            if mid not in gt_xy:
+                continue
+            gxy   = gt_xy[mid]
+            g_th  = gt_theta.get(mid)
+            for T_cm in T_list:
+                T_marker_in_map = base @ T_cm
+                est_xy = T_marker_in_map[:2, 3]
+                diff = est_xy - gxy
+                pos_total += float(np.dot(diff, diff))
+                n_pos += 1
+                if g_th is not None:
+                    _, _, yaw_est = R_to_euler_zyx(T_marker_in_map[:3, :3])
+                    ang_total += _angle_diff(yaw_est, g_th) ** 2
+                    n_ang += 1
+
+    pos_cost = pos_total / max(1, n_pos)
+    ang_cost = ang_total / max(1, n_ang) if n_ang > 0 else 0.0
+    return pos_cost + theta_weight * ang_cost
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,23 +265,54 @@ def _cost(params: np.ndarray,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Calibrate T_drone_from_cam from a static calibration session."
+        description="Calibrate T_drone_from_cam from one or more static sessions."
     )
-    ap.add_argument("--video",      required=True, help="Calibration video.")
-    ap.add_argument("--csv",        required=True,
-                    help="OptiTrack CSV recorded while drone is static.")
-    ap.add_argument("--gt",         required=True,
-                    help="Ground-truth YAML with known marker positions.")
+    ap.add_argument("--video", required=True, action="append", dest="videos",
+                    metavar="VIDEO",
+                    help="Calibration video.  Repeat for multiple sessions.")
+    ap.add_argument("--csv", required=True, action="append", dest="csvs",
+                    metavar="CSV",
+                    help="OptiTrack CSV.  Pass one (shared across all videos when "
+                         "the drone did not move) or one per --video.")
+    ap.add_argument("--gt", required=True, action="append", dest="gts",
+                    metavar="GT",
+                    help="Ground-truth YAML.  One per --video.")
     ap.add_argument("--config",     required=True,
                     help="Pipeline config YAML (config/default.yaml).")
     ap.add_argument("--intrinsics", default=None,
                     help="Camera intrinsics YAML (overrides the config value).")
     ap.add_argument("--max-reproj-err", type=float, default=4.0, dest="max_reproj",
-                    help="Reprojection error gate for detections [px]. Default: 4.0.")
+                    help="Reprojection error gate [px]. Default: 4.0.")
     ap.add_argument("--stride", type=int, default=1,
                     help="Use every Nth video frame. Default: 1.")
+    ap.add_argument("--theta-weight", type=float, default=1.0, dest="theta_weight",
+                    help="Weight of angular cost relative to position cost. "
+                         "Default: 1.0 (balanced; increase to prioritise "
+                         "orientation accuracy).")
+    ap.add_argument("--max-translation", type=float, default=0.15,
+                    dest="max_translation",
+                    help="Half-width of the search bound for x/y/z [m]. "
+                         "Default: 0.15.  Increase only if the camera is known "
+                         "to be far from the drone body.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    n_videos = len(args.videos)
+
+    if len(args.gts) != n_videos:
+        sys.exit(
+            f"ERROR: --gt count must equal the number of --video arguments "
+            f"({n_videos}).  Got {len(args.gts)}."
+        )
+    if len(args.csvs) == 1:
+        csv_paths = args.csvs * n_videos
+    elif len(args.csvs) == n_videos:
+        csv_paths = args.csvs
+    else:
+        sys.exit(
+            f"ERROR: --csv count must be 1 or equal to the number of --video "
+            f"arguments ({n_videos}).  Got {len(args.csvs)}."
+        )
 
     # ── Config ─────────────────────────────────────────────────────────
     cfg_p = _load_ros_yaml(args.config)
@@ -195,61 +328,64 @@ def main():
         x_dir=int(cfg_p.get("optitrack", {}).get("x_dir",    1)),
         y_dir=int(cfg_p.get("optitrack", {}).get("y_dir",    1)),
     )
-    flip = np.diag([float(opti_cfg.x_dir), float(opti_cfg.y_dir), 1.0, 1.0])
-    T_map_from_opti = T_map_from_opti @ flip
+    # x_dir / y_dir axis remapping is applied inside opti_transform_from_pose
+    # when converting raw CSV positions to T_opti_from_drone.  It must NOT be
+    # re-applied here to T_map_from_opti — that would double-count the flip.
 
-    # ── Ground truth ───────────────────────────────────────────────────
-    with open(args.gt) as f:
-        gt_raw = yaml.safe_load(f)
-    gt_xy: dict = {}
-    for mid_str, vals in gt_raw.get("markers", {}).items():
-        gt_xy[int(mid_str)] = np.array([float(vals["x"]), float(vals["y"])])
+    detector = MultiDictDetector(_parse_dicts(cfg_p))
 
-    if not gt_xy:
-        sys.exit("ERROR: no markers found in ground-truth YAML.")
-    print(f"Ground truth: {len(gt_xy)} marker(s): {sorted(gt_xy.keys())}")
+    # ── Build one session per (video, csv, gt) triplet ─────────────────
+    sessions = []
+    total_detections = 0
 
-    # ── Drone mean pose from CSV (drone is static; average all rows) ───
-    drone_poses = load_optitrack_csv(args.csv)
-    if not drone_poses:
-        sys.exit(f"ERROR: CSV is empty: {args.csv!r}")
+    for idx, (video_path, csv_path, gt_path) in enumerate(
+            zip(args.videos, csv_paths, args.gts)):
+        print(f"\n[{idx+1}/{n_videos}] {video_path!r}")
 
-    mean_pos = np.mean([dp.pos_xyz for dp in drone_poses], axis=0)
-    mean_yaw = math.atan2(
-        np.mean([math.sin(dp.yaw_rad) for dp in drone_poses]),
-        np.mean([math.cos(dp.yaw_rad) for dp in drone_poses]),
-    )
-    T_opti_from_drone = opti_transform_from_pose(mean_pos, mean_yaw, opti_cfg)
+        gt_xy, gt_theta = _load_gt(gt_path)
+        if not gt_xy:
+            sys.exit(f"ERROR: no markers in ground-truth YAML: {gt_path!r}")
+        n_with_theta = len(gt_theta)
+        print(f"  GT ({gt_path}): {len(gt_xy)} marker(s): {sorted(gt_xy.keys())}"
+              f"  ({n_with_theta} with theta)")
 
-    if args.verbose:
-        print(f"Drone mean position : {mean_pos}  yaw : {math.degrees(mean_yaw):.2f} deg")
-        print(f"Drone pose spread   : std = "
-              f"{np.std([dp.pos_xyz for dp in drone_poses], axis=0)}")
+        T_opti_from_drone = _static_drone_pose(csv_path, opti_cfg, args.verbose)
 
-    # ── Detect markers ─────────────────────────────────────────────────
-    detector   = MultiDictDetector(_parse_dicts(cfg_p))
-    detections = _collect_detections(
-        args.video, detector, intrinsics, args.max_reproj, args.stride
-    )
+        detections = _collect_detections(
+            video_path, detector, intrinsics, args.max_reproj, args.stride)
 
-    if args.verbose:
-        for mid, lst in sorted(detections.items()):
-            print(f"  Detected marker {mid}: {len(lst)} frame(s)")
+        if args.verbose:
+            for mid, lst in sorted(detections.items()):
+                print(f"  Detected marker {mid}: {len(lst)} frame(s)")
 
-    known_detected = sorted(set(detections) & set(gt_xy))
-    if not known_detected:
-        sys.exit(
-            "ERROR: none of the ground-truth markers were detected in the video.\n"
-            f"  Ground-truth IDs : {sorted(gt_xy.keys())}\n"
-            f"  Detected IDs     : {sorted(detections.keys())}"
-        )
-    print(f"Known markers detected: {known_detected}  "
-          f"({sum(len(detections[m]) for m in known_detected)} total detections)")
+        known_detected = sorted(set(detections) & set(gt_xy))
+        if not known_detected:
+            print(f"  [WARN] No GT markers detected — skipping this session.")
+            continue
 
-    if len(known_detected) == 1:
-        print("[NOTE] Only 1 known marker visible — 6 DOF are not fully constrained.\n"
-              "       The optimiser will minimise positional error but the result\n"
-              "       may not be unique.  Add more known markers for a better fit.")
+        n_det = sum(len(detections[m]) for m in known_detected)
+        print(f"  Known markers detected: {known_detected}  ({n_det} detections)")
+        total_detections += n_det
+        sessions.append((T_opti_from_drone, detections, gt_xy, gt_theta))
+
+    if not sessions:
+        sys.exit("ERROR: no usable sessions (no GT markers detected in any video).")
+
+    all_known = sorted({mid for _, dets, gt, _ in sessions
+                        for mid in set(dets) & set(gt)})
+    n_theta_total = sum(len(gth) for _, _, _, gth in sessions)
+    print(f"\nTotal: {len(sessions)} session(s), "
+          f"{total_detections} detections, "
+          f"markers {all_known}, "
+          f"{n_theta_total} marker(s) with theta constraints")
+
+    if n_theta_total == 0:
+        print("[WARN] No theta values in any GT file — rotation is under-constrained.\n"
+              "       The optimiser may trade orientation accuracy for position\n"
+              "       accuracy.  Add theta to GT markers to prevent this.")
+    if len(all_known) == 1:
+        print("[NOTE] Only 1 known marker across all sessions — "
+              "6 DOF are not fully constrained.")
 
     # ── Optimise ───────────────────────────────────────────────────────
     x0 = np.array([
@@ -257,30 +393,47 @@ def main():
         init_dfc.roll, init_dfc.pitch, init_dfc.yaw,
     ])
 
+    mt = args.max_translation
     bounds = [
-        (-0.5, 0.5), (-0.5, 0.5), (-0.5, 0.5),        # x, y, z  [m]
-        (-math.pi, math.pi), (-math.pi, math.pi),       # roll, pitch
-        (-math.pi, math.pi),                            # yaw
+        (x0[0] - mt, x0[0] + mt),   # x
+        (x0[1] - mt, x0[1] + mt),   # y
+        (x0[2] - mt, x0[2] + mt),   # z
+        (-math.pi, math.pi),          # roll
+        (-math.pi, math.pi),          # pitch
+        (-math.pi, math.pi),          # yaw
     ]
+    print(f"Translation bounds   : ±{mt:.2f} m around initial values")
+    if n_theta_total > 0:
+        print(f"Theta weight         : {args.theta_weight}")
 
-    init_rms = math.sqrt(_cost(x0, detections, T_opti_from_drone,
-                               T_map_from_opti, gt_xy)) * 100
+    cost_args = (sessions, T_map_from_opti, args.theta_weight)
+    init_cost  = _cost(x0, *cost_args)
+    init_rms   = math.sqrt(max(0.0, _cost(x0, sessions, T_map_from_opti, 0.0))) * 100
     print(f"\nInitial RMS XY error : {init_rms:.1f} cm")
 
     result = scipy.optimize.minimize(
         _cost, x0,
-        args=(detections, T_opti_from_drone, T_map_from_opti, gt_xy),
+        args=cost_args,
         method="L-BFGS-B",
         bounds=bounds,
         options={"maxiter": 5000, "ftol": 1e-14, "gtol": 1e-10},
     )
 
-    final_rms = math.sqrt(result.fun) * 100
+    final_rms = math.sqrt(max(0.0, _cost(result.x, sessions, T_map_from_opti, 0.0))) * 100
     print(f"Final  RMS XY error : {final_rms:.1f} cm")
+    if n_theta_total > 0:
+        ang_only = math.sqrt(max(0.0, _cost(result.x, sessions, T_map_from_opti, 1e9) / 1e9))
+        print(f"Final  RMS θ  error : {math.degrees(ang_only):.1f} deg")
     if not result.success:
         print(f"[WARN] Optimiser: {result.message}")
-
     ox, oy, oz, oroll, opitch, oyaw = result.x
+    for label, val, lo, hi in [("x", ox, bounds[0][0], bounds[0][1]),
+                                ("y", oy, bounds[1][0], bounds[1][1]),
+                                ("z", oz, bounds[2][0], bounds[2][1])]:
+        if abs(val - lo) < 1e-4 or abs(val - hi) < 1e-4:
+            print(f"[WARN] {label} hit its bound ({val:+.4f} m) — the true minimum "
+                  f"may be outside the search region.  Consider increasing "
+                  f"--max-translation or checking GT accuracy.")
 
     print(f"\n{'─'*60}")
     print("Optimised T_drone_from_cam  (paste into config/default.yaml):")

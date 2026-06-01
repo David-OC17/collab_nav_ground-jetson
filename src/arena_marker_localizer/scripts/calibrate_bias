@@ -1,52 +1,70 @@
 #!/usr/bin/env python3
 """
-calibrate_bias -- post-hoc 2-D rigid correction for ArUco marker localisation.
+calibrate_bias -- post-hoc correction for ArUco marker localisation errors.
 
-Runs the full localisation pipeline on one or more (video, CSV) pairs,
-compares the estimated positions of known markers against ground-truth
-measurements, and fits a 2-D rigid transform (Δx, Δy, Δθ) that best maps
-estimates to ground truth.
+Runs the full localisation pipeline on one or more (video, CSV, GT-YAML) triplets,
+compares estimated marker positions/headings against ground truth, and fits a
+physically-motivated correction model that separates:
 
-The correction is absorbed into T_map_from_opti and the resulting values
-are written to a YAML file ready to paste into config/default.yaml.
+  • A static map-frame offset  (c_x, c_y)  → absorbed into T_map_from_opti
+  • A drone-frame translation  (dx_d, dy_d) → absorbed into T_drone_from_cam
+  • An angular offset          (Δyaw)       → absorbed into T_drone_from_cam.yaw
 
-When more than one video is given, the per-marker position estimates are
-combined as a weighted mean (weighted by n_observations) before fitting.
+Physical model
+──────────────
+A T_drone_from_cam translation error (dx_d, dy_d) in drone body frame rotates
+with the drone heading ψ when projected into map frame:
+
+    correction_x(ψ) = c_x  +  dx_d·cos(ψ) − dy_d·sin(ψ)
+    correction_y(ψ) = c_y  +  dx_d·sin(ψ) + dy_d·cos(ψ)
+
+This is a 4-parameter linear regression in {1, cos(ψ), sin(ψ)}.  ψ is the
+drone's mean heading in map frame across the observations of each marker,
+tracked by the pipeline as MarkerResult.mean_obs_drone_yaw_rad.
+
+When ≥2 pairs are given, leave-one-out (or --k-folds) cross-validation is
+performed first; fold results are saved to <out>_kfold.yaml.  The final
+calibration always uses ALL pairs.
 
 Usage
 ─────
   calibrate_bias \\
-      --video v1.mp4 --csv c1.csv          \\
-      --video v2.mp4 --csv c2.csv          \\
-      --gt    ground_truth.yaml            \\
-      --config  config/default.yaml        \\
-      --intrinsics config/calibration.yaml \\
-      --out   corrected_T_map_from_opti.yaml
+      --video v1.mp4 --csv c1.csv --gt gt1.yaml \\
+      --video v2.mp4 --csv c2.csv --gt gt2.yaml \\
+      --config  config/default.yaml              \\
+      --intrinsics config/calibration.yaml       \\
+      --out   corrected_transforms.yaml
 
-Ground-truth YAML format
-────────────────────────
-  # Known marker positions in the MAP frame (metres / radians).
-  # Minimum 1 marker (pure translation fit). 2+ markers enable rotation.
+  (Single GT applies to all videos:)
+  calibrate_bias \\
+      --video v1.mp4 --csv c1.csv \\
+      --video v2.mp4 --csv c2.csv \\
+      --gt    ground_truth.yaml   \\
+      ...
+
+Ground-truth YAML format (per-video file)
+─────────────────────────────────────────
   markers:
     3:
       x: 1.200
       y: 0.850
+      theta: 180      # degrees in map frame; optional but recommended
     7:
       x: 2.100
       y: 1.500
+      theta: 0
 
 Notes
 ─────
-- The fitted correction absorbs ALL remaining systematic error into
-  T_map_from_opti.  Re-run this script whenever T_drone_from_cam or the
-  marker size changes, since those affect the bias.
-- At least 3 markers are recommended for a stable rotation estimate.
-  With 2 markers the rotation is determined but sensitive to noise.
-  With 1 marker only a translation is fitted (rotation forced to zero).
+- The pipeline must expose mean_obs_drone_yaw_rad per MarkerResult (pipeline ≥ v2).
+- Re-run this script whenever T_drone_from_cam or marker size changes.
+- Cross-validation error is the generalisation estimate; the post-correction
+  RMS (printed last) uses training data and will be optimistically low.
 """
 
 import argparse
 import math
+import os
 import sys
 
 import numpy as np
@@ -125,26 +143,229 @@ def _build_pipeline_config(p: dict, intrinsics_path: str) -> PipelineConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2-D rigid transform fitting (closed-form Kabsch / Procrustes)
+# Ground-truth loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fit_2d_rigid(estimated: np.ndarray, ground_truth: np.ndarray):
+def _load_gt(path: str) -> dict:
     """
-    Fit R2, t such that  R2 @ estimated_i + t  ≈  ground_truth_i.
-    Both inputs are (N, 2).  Returns (R2 (2×2), theta_rad, t (2,)).
-    Guarantees det(R2) = +1 (no reflection).
+    Load a ground-truth YAML.  Expects a top-level 'markers' key containing
+    {id: {x, y[, theta_degrees]}}.  Also accepts the legacy format where
+    marker IDs are at the top level directly.
+
+    Returns {marker_id (int): {'x': float, 'y': float, 'theta_rad': float|None}}.
     """
-    p_bar = estimated.mean(axis=0)
-    q_bar = ground_truth.mean(axis=0)
-    P = estimated    - p_bar
-    Q = ground_truth - q_bar
-    H = P.T @ Q                                        # 2×2 cross-covariance
-    U, _, Vt = np.linalg.svd(H)
-    D  = np.diag([1.0, np.linalg.det(Vt.T @ U.T)])   # handles reflections
-    R2 = Vt.T @ D @ U.T
-    t  = q_bar - R2 @ p_bar
-    theta = math.atan2(R2[1, 0], R2[0, 0])
-    return R2, theta, t
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+
+    entries = raw.get("markers", raw)
+
+    result = {}
+    for mid_str, vals in entries.items():
+        try:
+            mid = int(mid_str)
+        except (ValueError, TypeError):
+            continue
+        theta_raw = vals.get("theta")
+        result[mid] = {
+            "x":         float(vals["x"]),
+            "y":         float(vals["y"]),
+            "theta_rad": math.radians(float(theta_raw)) if theta_raw is not None else None,
+        }
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Angle helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _angle_diff(a: float, b: float) -> float:
+    """Signed angular difference (a - b) wrapped to [-π, π]."""
+    d = a - b
+    return (d + math.pi) % (2.0 * math.pi) - math.pi
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4-parameter drone-frame correction model
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fit_drone_correction(
+    est_pts: np.ndarray,
+    gt_pts: np.ndarray,
+    drone_yaws: np.ndarray,
+) -> tuple:
+    """
+    Fit the 4-parameter physical model using least squares:
+
+        correction_x(ψ) = c_x  +  dx_d·cos(ψ) − dy_d·sin(ψ)
+        correction_y(ψ) = c_y  +  dx_d·sin(ψ) + dy_d·cos(ψ)
+
+    Parameters: [c_x, c_y, dx_d, dy_d]
+
+    c_x / c_y  → add to T_map_from_opti.x / .y
+    dx_d / dy_d → add to T_drone_from_cam.x / .y
+
+    Falls back to pure translation (dx_d=dy_d=0) if all drone headings
+    are within 15° of each other (model is degenerate with no heading
+    variation).
+
+    Returns (c_x, c_y, dx_d, dy_d, degenerate: bool).
+    """
+    errors = gt_pts - est_pts  # (N, 2)
+    n = len(est_pts)
+
+    # Check heading variation
+    heading_range = float(np.max(drone_yaws) - np.min(drone_yaws))
+    if heading_range < math.radians(15.0):
+        # No heading variation: dx_d/dy_d are unobservable; fit only c_x, c_y
+        c_x = float(np.mean(errors[:, 0]))
+        c_y = float(np.mean(errors[:, 1]))
+        return c_x, c_y, 0.0, 0.0, True
+
+    A = np.zeros((2 * n, 4))
+    b = np.zeros(2 * n)
+    for i, psi in enumerate(drone_yaws):
+        c, s = math.cos(psi), math.sin(psi)
+        A[2*i    ] = [1, 0,  c, -s]
+        A[2*i + 1] = [0, 1,  s,  c]
+        b[2*i    ] = errors[i, 0]
+        b[2*i + 1] = errors[i, 1]
+    params, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    return float(params[0]), float(params[1]), float(params[2]), float(params[3]), False
+
+
+def _apply_drone_correction(
+    c_x: float, c_y: float, dx_d: float, dy_d: float,
+    est_pts: np.ndarray,
+    drone_yaws: np.ndarray,
+    gt_pts: np.ndarray,
+    est_thetas: "np.ndarray | None" = None,
+    gt_thetas: "np.ndarray | None" = None,
+    delta_yaw: float = 0.0,
+):
+    """
+    Apply the fitted correction and compute per-point errors.
+
+    Returns (pos_errors, corrected_pts, ang_errors_deg | None).
+    """
+    corrected = np.array([
+        est + np.array([
+            c_x + dx_d * math.cos(psi) - dy_d * math.sin(psi),
+            c_y + dx_d * math.sin(psi) + dy_d * math.cos(psi),
+        ])
+        for est, psi in zip(est_pts, drone_yaws)
+    ])
+    pos_errors = np.array([np.linalg.norm(c - g) for c, g in zip(corrected, gt_pts)])
+
+    ang_errors_deg = None
+    if est_thetas is not None and gt_thetas is not None:
+        corrected_thetas = est_thetas + delta_yaw
+        ang_errors_deg = np.degrees(
+            np.array([abs(_angle_diff(ct, gt))
+                      for ct, gt in zip(corrected_thetas, gt_thetas)])
+        )
+
+    return pos_errors, corrected, ang_errors_deg
+
+
+def _fit_angular_correction(est_thetas, gt_thetas) -> float:
+    """Circular-mean angular correction Δyaw = mean(gt_theta - est_theta)."""
+    diffs = [_angle_diff(gt, est) for gt, est in zip(gt_thetas, est_thetas)]
+    return float(math.atan2(np.mean(np.sin(diffs)), np.mean(np.cos(diffs))))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data collection helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _collect_fit_data(pair_indices, per_pair_results, per_pair_gts):
+    """
+    Gather aligned (est, gt) pairs from the given subset of video pairs.
+
+    per_pair_results[i] = {marker_id: (xy_2d, n_obs, yaw_rad, drone_yaw_rad)}
+    per_pair_gts[i]     = {marker_id: {'x', 'y', 'theta_rad'}}
+
+    Returns (est_pts, gt_pts, mids, pair_ids, est_thetas, gt_thetas, drone_yaws)
+    or an all-None 7-tuple when no common markers are found.
+    est_thetas / gt_thetas are None when no GT theta values are available.
+    """
+    est_list, gt_list, mids, pair_ids = [], [], [], []
+    est_theta_list, gt_theta_list, drone_yaw_list = [], [], []
+
+    for i in pair_indices:
+        results = per_pair_results[i]
+        gt = per_pair_gts[i]
+        for mid in sorted(set(results) & set(gt)):
+            xy, _n_obs, yaw_rad, drone_yaw_rad = results[mid]
+            est_list.append(xy)
+            gt_list.append(np.array([gt[mid]["x"], gt[mid]["y"]]))
+            mids.append(mid)
+            pair_ids.append(i)
+            drone_yaw_list.append(drone_yaw_rad)
+            if gt[mid]["theta_rad"] is not None:
+                est_theta_list.append(yaw_rad)
+                gt_theta_list.append(gt[mid]["theta_rad"])
+
+    if not est_list:
+        return None, None, None, None, None, None, None
+
+    est_thetas = np.array(est_theta_list) if est_theta_list else None
+    gt_thetas  = np.array(gt_theta_list)  if gt_theta_list  else None
+    drone_yaws = np.array(drone_yaw_list)
+    return np.array(est_list), np.array(gt_list), mids, pair_ids, est_thetas, gt_thetas, drone_yaws
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# K-fold split
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _kfold_indices(n: int, k: int):
+    """Yield (train_indices, test_indices) for a k-fold split of n items."""
+    indices = list(range(n))
+    fold_sizes = [n // k + (1 if i < n % k else 0) for i in range(k)]
+    folds, start = [], 0
+    for size in fold_sizes:
+        folds.append(indices[start:start + size])
+        start += size
+    for i in range(k):
+        test  = folds[i]
+        train = [idx for j, fold in enumerate(folds) if j != i for idx in fold]
+        yield train, test
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reporting helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _print_residuals(label, mids, est_pts, gt_pts, pair_ids,
+                     pos_errors, corrected=None, ang_errors_deg=None,
+                     drone_yaws=None):
+    print(f"\n{label}  ({len(mids)} point(s)):")
+    for k, mid in enumerate(mids):
+        pi   = pair_ids[k]
+        gp   = gt_pts[k]
+        e_cm = pos_errors[k] * 100.0
+
+        if corrected is not None:
+            pos_str = f"corr=({corrected[k][0]:.3f}, {corrected[k][1]:.3f})"
+        else:
+            pos_str = f"est=({est_pts[k][0]:.3f}, {est_pts[k][1]:.3f})"
+
+        yaw_str = ""
+        if drone_yaws is not None:
+            yaw_str = f"  ψ={math.degrees(drone_yaws[k]):+.1f}°"
+
+        ang_str = ""
+        if ang_errors_deg is not None:
+            ang_str = f"  θ_err={ang_errors_deg[k]:.1f}°"
+
+        print(f"  Marker {mid:3d} [pair {pi+1}]: {pos_str}  "
+              f"gt=({gp[0]:.3f}, {gp[1]:.3f})  err={e_cm:.1f} cm{yaw_str}{ang_str}")
+
+    rms = math.sqrt(np.mean(pos_errors ** 2))
+    print(f"  RMS position : {rms * 100:.1f} cm")
+    if ang_errors_deg is not None:
+        print(f"  Mean θ error : {ang_errors_deg.mean():.1f}°  "
+              f"max={ang_errors_deg.max():.1f}°")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,31 +376,50 @@ def main():
     ap = argparse.ArgumentParser(
         description=(
             "Estimate and correct systematic bias in ArUco marker localisation "
-            "using known ground-truth marker positions."
+            "using known ground-truth marker positions and headings."
         )
     )
     ap.add_argument("--video", required=True, action="append", dest="videos",
                     metavar="VIDEO",
-                    help="Video path. Repeat flag for multiple videos.")
+                    help="Video path.  Repeat for multiple videos.")
     ap.add_argument("--csv", required=True, action="append", dest="csvs",
                     metavar="CSV",
-                    help="OptiTrack CSV path. One per --video, same order.")
-    ap.add_argument("--gt", required=True,
-                    help="Ground-truth YAML with known marker positions.")
+                    help="OptiTrack CSV path.  One per --video, same order.")
+    ap.add_argument("--gt", required=True, action="append", dest="gts",
+                    metavar="GT",
+                    help="Ground-truth YAML.  Pass one per --video (same order), "
+                         "or a single file that applies to all videos.")
     ap.add_argument("--config", required=True,
                     help="Pipeline config YAML (config/default.yaml).")
     ap.add_argument("--intrinsics", default=None,
                     help="Camera intrinsics YAML (overrides the config value).")
-    ap.add_argument("--out", default="corrected_T_map_from_opti.yaml",
-                    help="Output YAML for the corrected T_map_from_opti. "
-                         "Default: corrected_T_map_from_opti.yaml")
+    ap.add_argument("--out", default="corrected_transforms.yaml",
+                    help="Output YAML for corrected T_map_from_opti and T_drone_from_cam.  "
+                         "Default: corrected_transforms.yaml")
+    ap.add_argument("--k-folds", type=int, default=0,
+                    metavar="K",
+                    help="Number of cross-validation folds "
+                         "(default: leave-one-out = number of pairs).  "
+                         "Ignored when only one pair is given.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    if len(args.videos) != len(args.csvs):
+    n_pairs = len(args.videos)
+
+    if len(args.csvs) != n_pairs:
         sys.exit("ERROR: number of --video and --csv arguments must match.")
 
-    pairs = list(zip(args.videos, args.csvs))
+    if len(args.gts) == 1:
+        gt_paths = args.gts * n_pairs
+    elif len(args.gts) == n_pairs:
+        gt_paths = args.gts
+    else:
+        sys.exit(
+            f"ERROR: --gt count must be 1 or equal to the number of --video "
+            f"arguments ({n_pairs}).  Got {len(args.gts)}."
+        )
+
+    pairs = list(zip(args.videos, args.csvs, gt_paths))
 
     # ── Config ─────────────────────────────────────────────────────────
     cfg_p = _load_ros_yaml(args.config)
@@ -189,132 +429,293 @@ def main():
 
     pipeline_cfg = _build_pipeline_config(cfg_p, intrinsics_path)
 
-    # ── Ground truth ───────────────────────────────────────────────────
-    with open(args.gt) as f:
-        gt_raw = yaml.safe_load(f)
-    gt: dict = {}
-    for mid_str, vals in gt_raw.get("markers", {}).items():
-        gt[int(mid_str)] = np.array([float(vals["x"]), float(vals["y"])])
+    # ── Ground truth (one dict per pair) ───────────────────────────────
+    per_pair_gts = []
+    for i, (_, _, gt_path) in enumerate(pairs):
+        gt = _load_gt(gt_path)
+        if not gt:
+            sys.exit(f"ERROR: no markers found in ground-truth YAML: {gt_path!r}")
+        per_pair_gts.append(gt)
+        has_theta = sum(1 for v in gt.values() if v["theta_rad"] is not None)
+        print(f"GT [{i+1}] {gt_path!r}: "
+              f"{len(gt)} marker(s) {sorted(gt.keys())}  "
+              f"({has_theta} with theta)")
 
-    if not gt:
-        sys.exit("ERROR: no markers found in ground-truth YAML.")
+    print(f"Videos : {n_pairs}")
 
-    print(f"Ground truth : {len(gt)} marker(s): {sorted(gt.keys())}")
-    print(f"Videos       : {len(pairs)}")
+    # ── Run pipeline on every pair ──────────────────────────────────────
+    # per_pair_results[i] = {marker_id: (xy_2d, n_obs, yaw_rad, drone_yaw_rad)}
+    per_pair_results: list[dict] = []
 
-    # ── Run pipeline on each pair, accumulate estimates ────────────────
-    # {marker_id: [(xy, n_obs), ...]}  one entry per video where seen
-    accumulated: dict = {}
-
-    for idx, (video_path, csv_path) in enumerate(pairs):
-        print(f"\n[{idx+1}/{len(pairs)}] {video_path!r}")
+    for idx, (video_path, csv_path, _) in enumerate(pairs):
+        print(f"\n[{idx+1}/{n_pairs}] {video_path!r}")
         try:
             results, _ = run_pipeline(video_path, csv_path, pipeline_cfg)
         except Exception as e:
             print(f"  [WARN] pipeline failed: {e}  — skipping.")
+            per_pair_results.append({})
             continue
 
+        pair_res: dict = {}
         for mid, r in results.items():
             xy = r.position_m[:2].copy()
-            accumulated.setdefault(mid, []).append((xy, r.n_observations))
+            pair_res[mid] = (
+                xy,
+                r.n_observations,
+                float(r.yaw_rad),
+                float(r.mean_obs_drone_yaw_rad),
+            )
             if args.verbose:
                 print(f"  Marker {mid:3d}: ({xy[0]:.3f}, {xy[1]:.3f})  "
+                      f"yaw={math.degrees(r.yaw_rad):.1f}°  "
+                      f"ψ_drone={math.degrees(r.mean_obs_drone_yaw_rad):.1f}°  "
                       f"n={r.n_observations}")
+        per_pair_results.append(pair_res)
 
-    if not accumulated:
+    if all(not r for r in per_pair_results):
         sys.exit("ERROR: pipeline produced no results from any video.")
 
-    # ── Weighted mean estimate per marker ──────────────────────────────
-    estimates: dict = {}
-    for mid, obs_list in accumulated.items():
-        total_w = sum(n for _, n in obs_list)
-        estimates[mid] = sum(xy * n for xy, n in obs_list) / total_w
+    # ─────────────────────────────────────────────────────────────────────
+    # K-fold cross-validation
+    # ─────────────────────────────────────────────────────────────────────
+    fold_results:   list[dict] = []
+    all_cv_pos_err: list[float] = []
+    all_cv_ang_err: list[float] = []
 
-    # ── Match against ground truth ─────────────────────────────────────
-    common = sorted(set(estimates) & set(gt))
-    if not common:
-        sys.exit(
-            "ERROR: no overlap between pipeline results and ground-truth markers.\n"
-            f"  Estimated IDs : {sorted(estimates.keys())}\n"
-            f"  GT IDs        : {sorted(gt.keys())}"
-        )
+    if n_pairs >= 2:
+        k = n_pairs  # leave-one-out default
+        if args.k_folds >= 2:
+            k = min(args.k_folds, n_pairs)
 
-    est_pts = np.array([estimates[m] for m in common])  # (N, 2)
-    gt_pts  = np.array([gt[m]        for m in common])  # (N, 2)
+        print(f"\n{'═'*62}")
+        print(f"  K-FOLD CROSS-VALIDATION  (k={k}, n_pairs={n_pairs})")
+        print(f"{'═'*62}")
 
-    # ── Per-marker residuals before correction ─────────────────────────
-    print(f"\nResiduals BEFORE correction  ({len(common)} marker(s)):")
-    pre_errs = []
-    for m, ep, gp in zip(common, est_pts, gt_pts):
-        e = np.linalg.norm(ep - gp)
-        pre_errs.append(e)
-        print(f"  Marker {m:3d}: est=({ep[0]:.3f}, {ep[1]:.3f})  "
-              f"gt=({gp[0]:.3f}, {gp[1]:.3f})  err={e*100:.1f} cm")
-    print(f"  RMS : {math.sqrt(np.mean(np.array(pre_errs)**2))*100:.1f} cm")
+        for fold_idx, (train_ids, test_ids) in enumerate(_kfold_indices(n_pairs, k)):
+            print(f"\n── Fold {fold_idx+1}/{k} ──")
+            print(f"  Train: pair(s) {[i+1 for i in train_ids]}")
+            print(f"  Test : pair(s) {[i+1 for i in test_ids]}")
 
-    # ── Fit correction transform ───────────────────────────────────────
-    if len(common) == 1:
-        print(
-            "\n[NOTE] Only 1 matching marker — fitting a pure translation "
-            "(Δθ forced to zero)."
-        )
-        t     = gt_pts[0] - est_pts[0]
-        R2    = np.eye(2)
-        theta = 0.0
+            # Fit on training set
+            tr = _collect_fit_data(train_ids, per_pair_results, per_pair_gts)
+            tr_est, tr_gt, tr_mids, _, tr_eth, tr_gth, tr_dy = tr
+            if tr_est is None:
+                print("  [SKIP] no training data for this fold.")
+                continue
+
+            c_x, c_y, dx_d, dy_d, degen = _fit_drone_correction(tr_est, tr_gt, tr_dy)
+            delta_yaw = 0.0
+            if tr_eth is not None and tr_gth is not None:
+                delta_yaw = _fit_angular_correction(tr_eth, tr_gth)
+
+            note = " (degenerate: no heading variation — translation only)" if degen else ""
+            print(f"  Fitted: c_x={c_x*100:+.2f} cm  c_y={c_y*100:+.2f} cm  "
+                  f"dx_d={dx_d*100:+.2f} cm  dy_d={dy_d*100:+.2f} cm{note}")
+            if tr_eth is not None:
+                print(f"          Δyaw={math.degrees(delta_yaw):+.3f}°")
+
+            # Evaluate on test set
+            te = _collect_fit_data(test_ids, per_pair_results, per_pair_gts)
+            te_est, te_gt, te_mids, te_pids, te_eth, te_gth, te_dy = te
+            if te_est is None:
+                print("  [SKIP] no test data for this fold.")
+                continue
+
+            pos_err, corr, ang_err_deg = _apply_drone_correction(
+                c_x, c_y, dx_d, dy_d,
+                te_est, te_dy, te_gt,
+                te_eth, te_gth, delta_yaw,
+            )
+            all_cv_pos_err.extend(pos_err.tolist())
+            if ang_err_deg is not None:
+                all_cv_ang_err.extend(ang_err_deg.tolist())
+
+            _print_residuals(
+                "  Test errors", te_mids, te_est, te_gt, te_pids,
+                pos_err, corr, ang_err_deg, te_dy)
+
+            fold_entry: dict = {
+                "fold":       fold_idx + 1,
+                "train_pairs": [i + 1 for i in train_ids],
+                "test_pairs":  [i + 1 for i in test_ids],
+                "fitted_correction": {
+                    "c_x_m":   round(float(c_x),   6),
+                    "c_y_m":   round(float(c_y),   6),
+                    "dx_drone_m": round(float(dx_d), 6),
+                    "dy_drone_m": round(float(dy_d), 6),
+                    "degenerate": degen,
+                },
+                "test_marker_ids":   te_mids,
+                "test_pair_ids":     [pi + 1 for pi in te_pids],
+                "test_pos_errors_m": [round(float(e), 6) for e in pos_err],
+                "rms_pos_m":         round(float(math.sqrt(np.mean(pos_err**2))), 6),
+            }
+            if delta_yaw != 0.0:
+                fold_entry["fitted_correction"]["delta_yaw_deg"] = round(
+                    math.degrees(delta_yaw), 4)
+            if ang_err_deg is not None:
+                fold_entry["test_ang_errors_deg"] = [
+                    round(float(e), 4) for e in ang_err_deg]
+                fold_entry["mean_ang_err_deg"] = round(float(ang_err_deg.mean()), 4)
+            fold_results.append(fold_entry)
+
+        if all_cv_pos_err:
+            print(f"\n{'─'*62}")
+            print(f"  K-FOLD SUMMARY  ({len(fold_results)} folds, "
+                  f"{len(all_cv_pos_err)} test point(s))")
+            print(f"{'─'*62}")
+            print(f"  Position error — "
+                  f"min={min(all_cv_pos_err)*100:.1f} cm  "
+                  f"mean={np.mean(all_cv_pos_err)*100:.1f} cm  "
+                  f"max={max(all_cv_pos_err)*100:.1f} cm")
+            if all_cv_ang_err:
+                print(f"  Angular error  — "
+                      f"min={min(all_cv_ang_err):.1f}°  "
+                      f"mean={np.mean(all_cv_ang_err):.1f}°  "
+                      f"max={max(all_cv_ang_err):.1f}°")
+        else:
+            print("\n[WARN] No cross-validation errors collected.")
     else:
-        R2, theta, t = _fit_2d_rigid(est_pts, gt_pts)
+        print("\n[NOTE] Only 1 pair — skipping cross-validation.")
 
-    print(f"\nCorrection transform (2-D rigid):")
-    print(f"  Δx  : {t[0]*100:+.2f} cm")
-    print(f"  Δy  : {t[1]*100:+.2f} cm")
-    print(f"  Δθ  : {math.degrees(theta):+.3f} deg")
+    # Save fold results to YAML
+    if fold_results:
+        kfold_out = os.path.splitext(args.out)[0] + "_kfold.yaml"
+        summary: dict = {
+            "n_folds":           len(fold_results),
+            "total_test_points": len(all_cv_pos_err),
+            "min_pos_error_m":   round(float(min(all_cv_pos_err)),     6),
+            "mean_pos_error_m":  round(float(np.mean(all_cv_pos_err)), 6),
+            "max_pos_error_m":   round(float(max(all_cv_pos_err)),     6),
+        }
+        if all_cv_ang_err:
+            summary["min_ang_error_deg"]  = round(float(min(all_cv_ang_err)),     4)
+            summary["mean_ang_error_deg"] = round(float(np.mean(all_cv_ang_err)), 4)
+            summary["max_ang_error_deg"]  = round(float(max(all_cv_ang_err)),     4)
+        with open(kfold_out, "w") as f:
+            yaml.dump({"summary": summary, "folds": fold_results},
+                      f, default_flow_style=False, sort_keys=False)
+        print(f"\nK-fold results saved to: {kfold_out!r}")
 
-    # ── Residuals after correction ─────────────────────────────────────
-    corrected = (R2 @ est_pts.T).T + t
-    post_errs = [np.linalg.norm(c - g) for c, g in zip(corrected, gt_pts)]
+    # ─────────────────────────────────────────────────────────────────────
+    # Final fit on ALL pairs
+    # ─────────────────────────────────────────────────────────────────────
+    print(f"\n{'═'*62}")
+    print("  FINAL FIT (all pairs)")
+    print(f"{'═'*62}")
 
-    print(f"\nResiduals AFTER correction:")
-    for m, c, g, e in zip(common, corrected, gt_pts, post_errs):
-        print(f"  Marker {m:3d}: corr=({c[0]:.3f}, {c[1]:.3f})  "
-              f"gt=({g[0]:.3f}, {g[1]:.3f})  err={e*100:.1f} cm")
-    print(f"  RMS : {math.sqrt(np.mean(np.array(post_errs)**2))*100:.1f} cm")
+    fa = _collect_fit_data(range(n_pairs), per_pair_results, per_pair_gts)
+    all_est, all_gt, all_mids, all_pids, all_eth, all_gth, all_dy = fa
+    if all_est is None:
+        sys.exit("ERROR: no matching markers found across all pairs for final fit.")
 
-    # ── Absorb correction into T_map_from_opti ─────────────────────────
-    # T_new = T_correction @ T_old
-    T_correction = np.eye(4)
-    T_correction[:2, :2] = R2
-    T_correction[0, 3]   = t[0]
-    T_correction[1, 3]   = t[1]
+    # Pre-correction residuals
+    pre_pos_err = np.array([np.linalg.norm(e - g) for e, g in zip(all_est, all_gt)])
+    _print_residuals(
+        "Residuals BEFORE correction",
+        all_mids, all_est, all_gt, all_pids,
+        pre_pos_err, drone_yaws=all_dy)
 
-    T_old = _parse_static(cfg_p, "T_map_from_opti").as_matrix()
-    T_new = T_correction @ T_old
+    # Fit
+    c_x, c_y, dx_d, dy_d, degen = _fit_drone_correction(all_est, all_gt, all_dy)
+    delta_yaw = 0.0
+    if all_eth is not None and all_gth is not None:
+        delta_yaw = _fit_angular_correction(all_eth, all_gth)
 
-    new_t                    = T_new[:3, 3]
-    new_roll, new_pitch, new_yaw = R_to_euler_zyx(T_new[:3, :3])
+    print(f"\nCorrection (all pairs):")
+    print(f"  Map-frame static :  c_x={c_x*100:+.2f} cm   c_y={c_y*100:+.2f} cm")
+    print(f"  Drone-frame trans:  dx_d={dx_d*100:+.2f} cm  dy_d={dy_d*100:+.2f} cm")
+    if all_eth is not None:
+        print(f"  Angular offset  :  Δyaw={math.degrees(delta_yaw):+.3f}°  "
+              f"(→ T_drone_from_cam.yaw)")
+    if degen:
+        print("  [WARN] Heading variation < 15° — dx_d/dy_d are unreliable; "
+              "only c_x/c_y fitted.")
+
+    post_pos_err, corrected, post_ang_err = _apply_drone_correction(
+        c_x, c_y, dx_d, dy_d, all_est, all_dy, all_gt,
+        all_eth, all_gth, delta_yaw)
+    _print_residuals(
+        "Residuals AFTER correction",
+        all_mids, all_est, all_gt, all_pids,
+        post_pos_err, corrected, post_ang_err, all_dy)
+
+    # K-fold CV reminder
+    if all_cv_pos_err:
+        print(f"\nGeneralisation estimate (k-fold CV): "
+              f"pos min={min(all_cv_pos_err)*100:.1f} cm  "
+              f"mean={np.mean(all_cv_pos_err)*100:.1f} cm  "
+              f"max={max(all_cv_pos_err)*100:.1f} cm")
+        if all_cv_ang_err:
+            print(f"                                      "
+                  f"ang min={min(all_cv_ang_err):.1f}°  "
+                  f"mean={np.mean(all_cv_ang_err):.1f}°  "
+                  f"max={max(all_cv_ang_err):.1f}°")
+
+    # ── Absorb corrections into transforms ────────────────────────────
+    # c_x, c_y: constant map-frame offset → T_map_from_opti.x / .y
+    old_mfo = _parse_static(cfg_p, "T_map_from_opti")
+    new_mfo = StaticTransform6DoF(
+        x=old_mfo.x + c_x, y=old_mfo.y + c_y, z=old_mfo.z,
+        roll=old_mfo.roll, pitch=old_mfo.pitch, yaw=old_mfo.yaw,
+    )
+
+    # dx_d, dy_d: drone-frame translation → T_drone_from_cam.x / .y
+    # delta_yaw: angular correction       → T_drone_from_cam.yaw
+    old_dfc = _parse_static(cfg_p, "T_drone_from_cam")
+    new_dfc = StaticTransform6DoF(
+        x=old_dfc.x + dx_d, y=old_dfc.y + dy_d, z=old_dfc.z,
+        roll=old_dfc.roll, pitch=old_dfc.pitch, yaw=old_dfc.yaw + delta_yaw,
+    )
 
     # ── Write output YAML ──────────────────────────────────────────────
     out_data = {
         "T_map_from_opti": {
-            "x":     round(float(new_t[0]),  6),
-            "y":     round(float(new_t[1]),  6),
-            "z":     round(float(new_t[2]),  6),
-            "roll":  round(float(new_roll),  6),
-            "pitch": round(float(new_pitch), 6),
-            "yaw":   round(float(new_yaw),   6),
-        }
+            "x":     round(float(new_mfo.x),     6),
+            "y":     round(float(new_mfo.y),     6),
+            "z":     round(float(new_mfo.z),     6),
+            "roll":  round(float(new_mfo.roll),  6),
+            "pitch": round(float(new_mfo.pitch), 6),
+            "yaw":   round(float(new_mfo.yaw),   6),
+        },
+        "T_drone_from_cam": {
+            "x":     round(float(new_dfc.x),     6),
+            "y":     round(float(new_dfc.y),     6),
+            "z":     round(float(new_dfc.z),     6),
+            "roll":  round(float(new_dfc.roll),  6),
+            "pitch": round(float(new_dfc.pitch), 6),
+            "yaw":   round(float(new_dfc.yaw),   6),
+        },
+        "correction_params": {
+            "c_x_m":      round(float(c_x),  6),
+            "c_y_m":      round(float(c_y),  6),
+            "dx_drone_m": round(float(dx_d), 6),
+            "dy_drone_m": round(float(dy_d), 6),
+            "delta_yaw_deg": round(math.degrees(delta_yaw), 4),
+            "degenerate_heading": degen,
+        },
     }
     with open(args.out, "w") as f:
         yaml.dump(out_data, f, default_flow_style=False)
 
-    print(f"\nCorrected T_map_from_opti written to: {args.out!r}")
-    print("Replace the T_map_from_opti block in your config/default.yaml:")
+    print(f"\nCorrected transforms written to: {args.out!r}")
+    print("\nPaste both blocks into config/default.yaml:")
+
     print(f"\n    T_map_from_opti:")
-    print(f"      x    : {new_t[0]:.6f}")
-    print(f"      y    : {new_t[1]:.6f}")
-    print(f"      z    : {new_t[2]:.6f}")
-    print(f"      roll : {new_roll:.6f}   # {math.degrees(new_roll):.3f} deg")
-    print(f"      pitch: {new_pitch:.6f}   # {math.degrees(new_pitch):.3f} deg")
-    print(f"      yaw  : {new_yaw:.6f}   # {math.degrees(new_yaw):.3f} deg\n")
+    print(f"      x    : {new_mfo.x:.6f}")
+    print(f"      y    : {new_mfo.y:.6f}")
+    print(f"      z    : {new_mfo.z:.6f}")
+    print(f"      roll : {new_mfo.roll:.6f}   # {math.degrees(new_mfo.roll):.3f} deg")
+    print(f"      pitch: {new_mfo.pitch:.6f}   # {math.degrees(new_mfo.pitch):.3f} deg")
+    print(f"      yaw  : {new_mfo.yaw:.6f}   # {math.degrees(new_mfo.yaw):.3f} deg")
+
+    print(f"\n    T_drone_from_cam:")
+    print(f"      x    : {new_dfc.x:.6f}")
+    print(f"      y    : {new_dfc.y:.6f}")
+    print(f"      z    : {new_dfc.z:.6f}")
+    print(f"      roll : {new_dfc.roll:.6f}   # {math.degrees(new_dfc.roll):.3f} deg")
+    print(f"      pitch: {new_dfc.pitch:.6f}   # {math.degrees(new_dfc.pitch):.3f} deg")
+    print(f"      yaw  : {new_dfc.yaw:.6f}   # {math.degrees(new_dfc.yaw):.3f} deg\n")
 
 
 if __name__ == "__main__":

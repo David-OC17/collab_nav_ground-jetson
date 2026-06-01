@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+"""
+ArUco Grid Position Locator
+════════════════════════════
+Interactively maps ArUco marker IDs to physical (x, y, θ) coordinates
+on a taped grid board.  For each marker you navigate a visual grid,
+pick the square and its corner, set the orientation, and get YAML output.
+
+Usage
+─────
+    python aruco_locator.py                   # prompts for IDs at start
+    python aruco_locator.py 0 1 2 3 5         # pass IDs as arguments
+
+Controls
+────────
+    Square mode   ↑↓←→  move cursor    Enter  confirm square
+                  Backspace            undo last committed marker
+    Corner mode   ↑↓←→  pick corner   Enter  confirm    Esc  go back
+    Theta  mode   ←→    choose angle   Enter  confirm    Esc  go back
+"""
+
+import sys
+import math
+import tkinter as tk
+from tkinter import messagebox
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 1 — BOARD MEASUREMENTS                                         ║
+# ║  Edit this block whenever the board layout changes.                     ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+#
+#  Coordinate system
+#    (0, 0)  = lower-left outer corner of the board
+#    +X      = left → right
+#    +Y      = bottom → top
+#
+#  The grid has 6 × 6 full squares:
+#    columns  X1 (left) … X6 (right)
+#    rows     Y1 (bottom) … Y6 (top)
+#
+#  Each pair of adjacent squares is separated by a tape line of width
+#  TAPE_MM.  ArUco markers are placed at the 4 inner corners of any
+#  full square (TL / TR / BL / BR).
+#
+
+# Width of each tape line in cm.
+TAPE_CM = 5.0
+
+# Distance from the board origin to the outer edge of the FIRST tape line (cm).
+OFFSET_X_CM = 27.5   # horizontal offset  (left side of board)
+OFFSET_Y_CM = 29.0   # vertical   offset  (bottom side of board)
+
+# Side length of the ArUco markers in cm.  ← SET THIS TO YOUR ACTUAL VALUE
+# The reported (x, y) is the marker's geometric centre, which sits half
+# a side length inward from the tape corner in both axes.
+MARKER_SIZE_CM = 13.5
+
+# ── IND_X — inner width of each square (cm) ───────────────────────────────
+#
+#   IND_X[row][col]
+#     row index :  0 = Y6 (top row)    …  5 = Y1 (bottom row)
+#     col index :  0 = X1 (left col)   …  5 = X6 (right col)
+#
+#   Measurement approach for a non-uniform grid
+#   ────────────────────────────────────────────
+#   Because the squares are irregular, the x-position of a tape edge
+#   computed by traversing row Y4 may differ slightly from the same
+#   edge computed by traversing row Y1.  The code resolves this by using
+#   IND_X from the square's OWN row for its x-coordinates, and IND_Y from
+#   the square's OWN column for its y-coordinates.  This samples the tape
+#   intersection position from the measurements taken closest to it, which
+#   is the most physically consistent strategy without a full calibration.
+#
+IND_X = [
+    # X1     X2     X3     X4     X5     X6
+    [49.00, 51.00, 47.70, 49.40, 49.60, 48.60],  # Y6 (top)
+    [48.70, 51.90, 48.40, 49.40, 49.20, 48.90],  # Y5
+    [48.50, 50.30, 49.20, 49.20, 48.50, 49.40],  # Y4
+    [48.50, 49.60, 49.50, 49.60, 48.20, 50.00],  # Y3
+    [48.50, 49.60, 49.50, 49.90, 47.80, 50.00],  # Y2
+    [48.50, 49.50, 49.00, 49.50, 47.50, 50.00],  # Y1 (bottom)
+]
+
+# ── IND_Y — inner height of each square (cm) ──────────────────────────────
+#
+#   IND_Y[row][col]
+#     row index :  0 = X1 (left col)   …  5 = X6 (right col)
+#     col index :  0 = Y6 (top row)    …  5 = Y1 (bottom row)
+#
+IND_Y = [
+    # Y6     Y5     Y4     Y3     Y2     Y1
+    [49.00, 49.50, 49.40, 50.00, 48.30, 49.50],  # X1 (left)
+    [49.00, 49.90, 49.60, 49.50, 48.90, 49.40],  # X2
+    [48.80, 49.50, 49.50, 49.70, 49.00, 49.00],  # X3
+    [49.00, 49.50, 49.00, 49.70, 49.40, 48.50],  # X4
+    [48.60, 49.20, 49.00, 49.60, 49.00, 49.50],  # X5
+    [48.50, 50.00, 48.50, 50.00, 49.00, 49.10],  # X6 (right)
+]
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 2 — COORDINATE COMPUTATION  (no editing needed below)         ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+NC = NR = 6                              # full columns / rows
+THETAS     = (0, 90, 180, 270)           # allowed orientations (degrees)
+THETA_SYMB = {0: '→', 90: '↑', 180: '←', 270: '↓'}
+
+# Corner type ↔ 2×2 grid position  (col 0=left|1=right, row 0=top|1=bottom)
+_CR2STR = {(0, 0): 'TL', (1, 0): 'TR', (0, 1): 'BL', (1, 1): 'BR'}
+_STR2CR = {v: k for k, v in _CR2STR.items()}
+CORNER_LONG = {
+    'TL': 'Top-Left',  'TR': 'Top-Right',
+    'BL': 'Bottom-Left', 'BR': 'Bottom-Right',
+}
+
+
+def _precompute_corners() -> dict:
+    """
+    Return {(xi, yj, corner): (x_cm, y_cm)} for all 144 valid positions.
+    xi ∈ 1..6,  yj ∈ 1..6,  corner ∈ {'TL','TR','BL','BR'}
+
+    All values are in cm.  Divide by 100 to get metres.
+
+    Inner-edge derivation (1-indexed xi, yj, T = TAPE_CM):
+        x_left  = OFFSET_X + xi·T  + Σ IND_X[NR-yj, k]   for k = 0 .. xi-2
+        x_right = x_left  + IND_X[NR-yj, xi-1]
+
+        y_bot   = OFFSET_Y + yj·T  + Σ IND_Y[xi-1, NR-k]  for k = 1 .. yj-1
+        y_top   = y_bot   + IND_Y[xi-1, NR-yj]
+
+    X uses IND_X from the square's own row (yj).
+    Y uses IND_Y from the square's own column (xi).
+    This is the most locally consistent strategy for a non-uniform grid.
+    """
+    tbl = {}
+    for yj in range(1, NR + 1):
+        rx = NR - yj      # IND_X row : Y6→0, Y1→5
+        cy = NR - yj      # IND_Y col : Y6→0, Y1→5
+        for xi in range(1, NC + 1):
+            ry = xi - 1   # IND_Y row : X1→0, X6→5
+
+            # ── x inner edges (cm) ───────────────────────────────────────
+            xl = OFFSET_X_CM + xi * TAPE_CM
+            for k in range(xi - 1):
+                xl += IND_X[rx][k]           # sum widths X1 … Xi-1
+            xr = xl + IND_X[rx][xi - 1]
+
+            # ── y inner edges (cm) ───────────────────────────────────────
+            yb = OFFSET_Y_CM + yj * TAPE_CM
+            for k in range(1, yj):
+                yb += IND_Y[ry][NR - k]      # sum heights Y1 … Yj-1
+            yt = yb + IND_Y[ry][cy]
+
+            tbl[(xi, yj, 'TL')] = (xl, yt)
+            tbl[(xi, yj, 'TR')] = (xr, yt)
+            tbl[(xi, yj, 'BL')] = (xl, yb)
+            tbl[(xi, yj, 'BR')] = (xr, yb)
+    return tbl
+
+
+CTABLE = _precompute_corners()
+
+# Direction from tape corner → marker centre, per corner type.
+# The marker always extends INTO the square, so:
+#   TL → right (+X), down (−Y)      TR → left (−X), down (−Y)
+#   BL → right (+X), up  (+Y)       BR → left (−X), up  (+Y)
+_CENTRE_DIR = {
+    'TL': (+1, -1),
+    'TR': (-1, -1),
+    'BL': (+1, +1),
+    'BR': (-1, +1),
+}
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 3 — GUI                                                        ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+# ── Layout constants ──────────────────────────────────────────────────────
+CELL  = 78    # canvas pixels per square cell
+TAPE  = 7     # canvas pixels per tape line
+MAR   = 46    # margin around the grid (room for axis labels)
+DOT_R = 9     # corner-dot radius (pixels)
+
+# ── Palette ───────────────────────────────────────────────────────────────
+CLR = dict(
+    bg       = '#181818',
+    tape     = '#2c72d4',
+    cell     = '#111111',
+    cursor   = '#ffe566',   # square-mode cursor
+    sel      = '#1a3460',   # selected square in corner/theta mode
+    dot      = '#cccccc',
+    dot_act  = '#ff4040',   # active corner dot
+    axis     = '#777777',
+    cur_txt  = '#111111',   # text on highlighted cursor cell
+    sel_txt  = '#7aadff',   # text on selected-square cell
+    cell_txt = '#484848',   # text on unselected cells
+)
+
+
+class App:
+    """Main application window."""
+
+    S_SQ = 'sq'   # mode: navigating squares
+    S_CR = 'cr'   # mode: picking a corner
+    S_TH = 'th'   # mode: choosing theta
+
+    def __init__(self, root: tk.Tk, ids: list):
+        self.root = root
+        self.ids  = ids
+        self.idx  = 0        # index of the current marker in self.ids
+        self.res  = {}       # {marker_id: {'x':…, 'y':…, 'theta':…}}
+
+        # ── Navigation state ──────────────────────────────────────────────
+        self.mode = self.S_SQ
+        self.sc   = (1, 1)   # square cursor  (xi, yj)
+        self.sq   = (1, 1)   # confirmed square
+        self.cc   = (0, 0)   # corner cursor  (col 0/1, row 0/1)
+        self.ti   = 0        # theta index into THETAS
+
+        root.title('ArUco Position Locator')
+        root.resizable(False, False)
+        root.configure(bg='#222222')
+        root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+        self._build_ui()
+        self._draw()
+        root.bind('<KeyPress>', self._key)
+        root.focus_set()
+
+    # ── Widget construction ───────────────────────────────────────────────
+
+    def _build_ui(self):
+        W = MAR + NC * (CELL + TAPE) + TAPE + MAR
+        H = MAR + NR * (CELL + TAPE) + TAPE + MAR
+
+        self.hdr = tk.Label(
+            self.root, bg='#2a2a2a', fg='#ffffff',
+            font=('Helvetica', 13, 'bold'), pady=8,
+        )
+        self.hdr.pack(fill=tk.X)
+
+        self.cv = tk.Canvas(
+            self.root, width=W, height=H,
+            bg=CLR['bg'], highlightthickness=0,
+        )
+        self.cv.pack(padx=8, pady=2)
+
+        self.sbar = tk.Label(
+            self.root, bg='#2a2a2a', fg='#aaaaaa',
+            font=('Courier', 10), anchor='w', padx=12, pady=7,
+        )
+        self.sbar.pack(fill=tk.X)
+
+    # ── Geometry helpers ──────────────────────────────────────────────────
+
+    def _bbox(self, xi: int, yj: int):
+        """Canvas bounding box (x0,y0,x1,y1) of square (xi, yj)."""
+        c  = xi - 1        # 0-based column, left→right in canvas
+        r  = NR - yj       # 0-based row,    top→bottom in canvas (Y6 at top)
+        x0 = MAR + TAPE + c * (CELL + TAPE)
+        y0 = MAR + TAPE + r * (CELL + TAPE)
+        return x0, y0, x0 + CELL, y0 + CELL
+
+    def _dot_xy(self, xi: int, yj: int, col: int, row: int):
+        """Canvas centre of corner dot at (col, row) for square (xi, yj)."""
+        x0, y0, x1, y1 = self._bbox(xi, yj)
+        return (x0 if col == 0 else x1), (y0 if row == 0 else y1)
+
+    # ── Drawing ───────────────────────────────────────────────────────────
+
+    def _draw(self):
+        cv = self.cv
+        cv.delete('all')
+        W, H = int(cv['width']), int(cv['height'])
+
+        # Tape backdrop (fills the entire grid area in tape colour)
+        cv.create_rectangle(MAR, MAR, W - MAR, H - MAR,
+                            fill=CLR['tape'], outline='')
+
+        # ── Square cells ──────────────────────────────────────────────────
+        for yj in range(1, NR + 1):
+            for xi in range(1, NC + 1):
+                x0, y0, x1, y1 = self._bbox(xi, yj)
+                is_cur = self.mode == self.S_SQ and (xi, yj) == self.sc
+                is_sel = self.mode != self.S_SQ and (xi, yj) == self.sq
+
+                if is_cur:
+                    fill, tc = CLR['cursor'],  CLR['cur_txt']
+                elif is_sel:
+                    fill, tc = CLR['sel'],     CLR['sel_txt']
+                else:
+                    fill, tc = CLR['cell'],    CLR['cell_txt']
+
+                cv.create_rectangle(x0, y0, x1, y1, fill=fill, outline='')
+                cv.create_text(
+                    (x0 + x1) // 2, (y0 + y1) // 2,
+                    text=f'X{xi}\nY{yj}',
+                    fill=tc, font=('Helvetica', 8),
+                )
+
+        # ── Corner dots (corner & theta modes) ────────────────────────────
+        if self.mode in (self.S_CR, self.S_TH):
+            xi, yj = self.sq
+            for (c, r), label in _CR2STR.items():
+                active = ((c, r) == self.cc)
+                cx, cy = self._dot_xy(xi, yj, c, r)
+                rad    = DOT_R + 3 if active else DOT_R
+                color  = CLR['dot_act'] if active else CLR['dot']
+                cv.create_oval(
+                    cx - rad, cy - rad, cx + rad, cy + rad,
+                    fill=color, outline='#000000', width=1,
+                )
+                # Label: above for top corners, below for bottom corners
+                label_dy = -(rad + 8) if r == 0 else (rad + 9)
+                cv.create_text(
+                    cx, cy + label_dy, text=label,
+                    fill=color, font=('Helvetica', 7, 'bold'),
+                )
+
+        # ── Theta direction arrow (theta mode) ────────────────────────────
+        if self.mode == self.S_TH:
+            xi, yj = self.sq
+            x0, y0, x1, y1 = self._bbox(xi, yj)
+            cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+            theta  = THETAS[self.ti]
+            L      = 22
+            rad    = math.radians(theta)
+            ax     = cx + int(L * math.cos(rad))
+            ay     = cy - int(L * math.sin(rad))   # canvas y is inverted
+            cv.create_line(
+                cx, cy, ax, ay,
+                fill='#ffcc00', width=3,
+                arrow=tk.LAST, arrowshape=(10, 12, 4),
+            )
+            cv.create_text(
+                cx, cy + 32,
+                text=f'{theta}°  {THETA_SYMB[theta]}',
+                fill='#ffcc00', font=('Helvetica', 9, 'bold'),
+            )
+
+        # ── Axis labels ───────────────────────────────────────────────────
+        for xi in range(1, NC + 1):
+            x0, _, x1, _ = self._bbox(xi, 1)
+            cv.create_text(
+                (x0 + x1) // 2, H - MAR // 2,
+                text=f'X{xi}', fill=CLR['axis'], font=('Helvetica', 9),
+            )
+        for yj in range(1, NR + 1):
+            _, y0, _, y1 = self._bbox(1, yj)
+            cv.create_text(
+                MAR // 2, (y0 + y1) // 2,
+                text=f'Y{yj}', fill=CLR['axis'], font=('Helvetica', 9),
+            )
+
+        # Origin symbol at lower-left of the grid area
+        cv.create_text(
+            MAR // 2, H - MAR // 2,
+            text='⊙', fill='#55bb44', font=('Helvetica', 11),
+        )
+
+        self._update_bars()
+
+    def _update_bars(self):
+        mid   = self.ids[self.idx]
+        total = len(self.ids)
+        self.hdr.config(text=f'Marker  {mid}     ({self.idx + 1} / {total})')
+
+        if self.mode == self.S_SQ:
+            xi, yj = self.sc
+            undo   = '   Backspace: undo last' if self.idx > 0 else ''
+            txt    = (f'  ↑↓←→ navigate   Enter: confirm square'
+                      f'   cursor → X{xi}, Y{yj}{undo}')
+
+        elif self.mode == self.S_CR:
+            xi, yj = self.sq
+            cr     = _CR2STR[self.cc]
+            txt    = (f'  ↑↓←→ pick corner   Enter: confirm   Esc: back   '
+                      f'Square X{xi},Y{yj}   Corner: {cr} ({CORNER_LONG[cr]})')
+
+        else:  # S_TH
+            xi, yj = self.sq
+            cr     = _CR2STR[self.cc]
+            theta  = THETAS[self.ti]
+            txt    = (f'  ←→ orientation   Enter: confirm   Esc: back   '
+                      f'X{xi},Y{yj}  {cr}   θ = {theta}°  {THETA_SYMB[theta]}'
+                      f'   (0°=+X  90°=+Y  180°=−X  270°=−Y)')
+
+        self.sbar.config(text=txt)
+
+    # ── Key handler ───────────────────────────────────────────────────────
+
+    def _key(self, event):
+        k = event.keysym
+
+        if self.mode == self.S_SQ:
+            xi, yj = self.sc
+            if   k == 'Up':        self.sc = (xi, min(yj + 1, NR))
+            elif k == 'Down':      self.sc = (xi, max(yj - 1, 1))
+            elif k == 'Left':      self.sc = (max(xi - 1, 1), yj)
+            elif k == 'Right':     self.sc = (min(xi + 1, NC), yj)
+            elif k in ('Return', 'KP_Enter'):
+                self.sq   = self.sc
+                self.cc   = (0, 0)          # default: TL corner
+                self.mode = self.S_CR
+            elif k == 'BackSpace' and self.idx > 0:
+                self.idx -= 1
+                self.res.pop(self.ids[self.idx], None)
+
+        elif self.mode == self.S_CR:
+            c, r = self.cc
+            if   k == 'Right':     self.cc = (min(c + 1, 1), r)
+            elif k == 'Left':      self.cc = (max(c - 1, 0), r)
+            elif k == 'Up':        self.cc = (c, max(r - 1, 0))
+            elif k == 'Down':      self.cc = (c, min(r + 1, 1))
+            elif k in ('Return', 'KP_Enter'):
+                self.ti   = 0
+                self.mode = self.S_TH
+            elif k == 'Escape':
+                self.mode = self.S_SQ
+
+        else:  # S_TH
+            if   k == 'Right':     self.ti = (self.ti + 1) % len(THETAS)
+            elif k == 'Left':      self.ti = (self.ti - 1) % len(THETAS)
+            elif k in ('Return', 'KP_Enter'):
+                self._commit()
+                return
+            elif k == 'Escape':
+                self.mode = self.S_CR
+
+        self._draw()
+
+    # ── Commit & finish ───────────────────────────────────────────────────
+
+    def _commit(self):
+        xi, yj  = self.sq
+        cr      = _CR2STR[self.cc]
+        theta   = THETAS[self.ti]
+
+        # Tape-corner position (cm)
+        x_cm, y_cm = CTABLE[(xi, yj, cr)]
+
+        # Shift to marker centre: half the marker side inward on each axis (cm)
+        half    = MARKER_SIZE_CM / 2.0
+        dx, dy  = _CENTRE_DIR[cr]
+        x_cm   += dx * half
+        y_cm   += dy * half
+
+        self.res[self.ids[self.idx]] = {
+            'x':     round(x_cm / 100.0, 4),   # cm → metres
+            'y':     round(y_cm / 100.0, 4),
+            'theta': theta,
+        }
+        self.idx += 1
+
+        if self.idx >= len(self.ids):
+            self._finish()
+        else:
+            self.mode = self.S_SQ
+            self._draw()
+
+    def _save(self):
+        yaml_txt = _to_yaml(self.res)
+        fname    = 'aruco_positions.yaml'
+        with open(fname, 'w') as f:
+            f.write(yaml_txt + '\n')
+        return yaml_txt, fname
+
+    def _finish(self):
+        yaml_txt, fname = self._save()
+        print(yaml_txt)
+        preview = yaml_txt if len(yaml_txt) < 900 else yaml_txt[:900] + '\n...'
+        messagebox.showinfo(
+            'All markers placed!',
+            f'Saved to "{fname}".\n\n{preview}',
+        )
+        self.root.destroy()
+
+    def _on_close(self):
+        if self.res:
+            if messagebox.askyesno('Exit', 'Save partial results before closing?'):
+                yaml_txt, fname = self._save()
+                print(yaml_txt)
+                messagebox.showinfo('Saved', f'Partial results saved to "{fname}".')
+        self.root.destroy()
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 4 — YAML FORMATTING                                            ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+def _to_yaml(results: dict) -> str:
+    lines = ['markers:']
+    for mid in sorted(results):
+        r = results[mid]
+        lines += [
+            f'  {mid}:',
+            f'    x:     {r["x"]:.4f}',
+            f'    y:     {r["y"]:.4f}',
+            f'    theta: {r["theta"]}',
+        ]
+    return '\n'.join(lines)
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 5 — ENTRY POINT                                                ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+def _get_ids() -> list:
+    if sys.argv[1:]:
+        try:
+            return [int(a) for a in sys.argv[1:]]
+        except ValueError:
+            sys.exit('Error: all marker IDs must be integers.')
+    raw = input('Marker IDs (space-separated): ').strip()
+    if not raw:
+        sys.exit('No IDs provided.')
+    try:
+        return [int(x) for x in raw.split()]
+    except ValueError:
+        sys.exit('Error: all marker IDs must be integers.')
+
+
+def main():
+    ids  = _get_ids()
+    root = tk.Tk()
+    App(root, ids)
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    main()

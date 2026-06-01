@@ -49,6 +49,7 @@ class AggregatedPose:
     pos_var_y:      float = 1.0   # sample variance of inlier y positions [m²]
     pos_cov_xy:     float = 0.0   # sample covariance of inlier (x,y) [m²]
     yaw_var:        float = 1.0   # -2·ln(R_mean), circular dispersion [rad²]
+    mean_obs_drone_yaw_rad: float = 0.0  # circular mean of drone heading across surviving observations
 
 
 def _mad(values: np.ndarray) -> Tuple[float, float]:
@@ -101,9 +102,10 @@ def _geometric_median(points: np.ndarray, cfg: AggregationConfig) -> np.ndarray:
 
 
 def aggregate(
-    positions: np.ndarray,   # (N, 3)
-    yaws_rad:  np.ndarray,   # (N,)
+    positions: np.ndarray,                    # (N, 3)
+    yaws_rad:  np.ndarray,                    # (N,)
     cfg: Optional[AggregationConfig] = None,
+    drone_yaws_rad: Optional[np.ndarray] = None,  # (N,) drone heading in map frame per obs
 ) -> AggregatedPose:
 
     cfg       = cfg or AggregationConfig()
@@ -141,6 +143,13 @@ def aggregate(
     surviving   = positions[keep]    # (M, 3)
     surviving_y = yaws_rad[keep]     # (M,)
 
+    if drone_yaws_rad is not None:
+        surv_dy = np.asarray(drone_yaws_rad, dtype=np.float64)[keep]
+        mean_drone_yaw = float(math.atan2(
+            np.mean(np.sin(surv_dy)), np.mean(np.cos(surv_dy))))
+    else:
+        mean_drone_yaw = 0.0
+
     # ── Robust pose estimate ─────────────────────────────────────────────
     pos = _geometric_median(surviving, cfg)
     yaw = _circular_median_angle(surviving_y)
@@ -176,5 +185,6 @@ def aggregate(
         pos_var_y=pos_var_y,
         pos_cov_xy=pos_cov_xy,
         yaw_var=yaw_var,
+        mean_obs_drone_yaw_rad=mean_drone_yaw,
     )
         

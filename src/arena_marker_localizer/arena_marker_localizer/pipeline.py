@@ -125,21 +125,25 @@ class PipelineConfig:
 
 @dataclass
 class _MarkerObservations:
-    positions: List[np.ndarray] = field(default_factory=list)
-    yaws_rad:  List[float]      = field(default_factory=list)
-    sample_label: List[str]     = field(default_factory=list)
+    positions:      List[np.ndarray] = field(default_factory=list)
+    yaws_rad:       List[float]      = field(default_factory=list)
+    drone_yaws_rad: List[float]      = field(default_factory=list)
+    sample_label:   List[str]        = field(default_factory=list)
     """e.g. 'DICT_4X4_50' so the caller can audit which dict produced
     the aggregate."""
 
-    def add(self, pos: np.ndarray, yaw: float, label: str, cap: int):
+    def add(self, pos: np.ndarray, yaw: float, label: str, cap: int,
+            drone_yaw: float = 0.0):
         self.positions.append(pos)
         self.yaws_rad.append(yaw)
+        self.drone_yaws_rad.append(drone_yaw)
         self.sample_label.append(label)
         # FIFO trim
         if len(self.positions) > cap:
-            self.positions  = self.positions[-cap:]
-            self.yaws_rad   = self.yaws_rad[-cap:]
-            self.sample_label = self.sample_label[-cap:]
+            self.positions      = self.positions[-cap:]
+            self.yaws_rad       = self.yaws_rad[-cap:]
+            self.drone_yaws_rad = self.drone_yaws_rad[-cap:]
+            self.sample_label   = self.sample_label[-cap:]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -159,6 +163,7 @@ class MarkerResult:
     pos_var_y:     float = 1.0  # ← Sample variance of inlier y positions [m²]
     pos_cov_xy:    float = 0.0  # ← Sample covariance of inlier (x,y) [m²]
     yaw_var:       float = 1.0  # ← Circular dispersion of inlier yaws [rad²]
+    mean_obs_drone_yaw_rad: float = 0.0  # ← Circular mean of drone heading during inlier obs
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -242,6 +247,12 @@ def run_pipeline(
         T_opti_drone = opti_transform_from_pose(
             dp.pos_xyz, dp.yaw_rad, cfg.optitrack_axis,
         )
+
+        # Drone heading in map frame — used by calibrate_bias to fit a
+        # heading-dependent correction model for T_drone_from_cam errors.
+        T_map_drone = T_map_from_opti @ T_opti_drone
+        _, _, drone_yaw_map = R_to_euler_zyx(T_map_drone[:3, :3])
+
         obs_list = []
         n_pnp_fail = 0
         for det in detections:
@@ -254,7 +265,7 @@ def run_pipeline(
             )
             pos = T_map_marker[:3, 3].copy()
             _r, _p, yaw = R_to_euler_zyx(T_map_marker[:3, :3])
-            obs_list.append((det.marker_id, pos, yaw, det.dict_name))
+            obs_list.append((det.marker_id, pos, yaw, det.dict_name, drone_yaw_map))
 
         if obs_list:
             return {"kind": "detected", "obs": obs_list, "pnp_fail": n_pnp_fail}
@@ -296,9 +307,9 @@ def run_pipeline(
             stats["pnp_fail"] += result.get("pnp_fail", 0)
         else:
             stats["pnp_fail"] += result.get("pnp_fail", 0)
-            for marker_id, pos, yaw, dict_name in result["obs"]:
+            for marker_id, pos, yaw, dict_name, drone_yaw in result["obs"]:
                 obs = observations.setdefault(marker_id, _MarkerObservations())
-                obs.add(pos, yaw, dict_name, cfg.max_obs_per_marker)
+                obs.add(pos, yaw, dict_name, cfg.max_obs_per_marker, drone_yaw)
                 dict_name_by_id[marker_id] = dict_name
                 stats["accepted"] += 1
 
@@ -338,9 +349,11 @@ def run_pipeline(
     # ── 3) Aggregate per marker ───────────────────────────────────────
     results: Dict[int, MarkerResult] = {}
     for marker_id, obs in observations.items():
-        positions = np.stack(obs.positions, axis=0)
-        yaws_rad  = np.array(obs.yaws_rad,  dtype=np.float64)
-        agg = aggregate(positions, yaws_rad, cfg.aggregation)
+        positions      = np.stack(obs.positions, axis=0)
+        yaws_rad       = np.array(obs.yaws_rad,       dtype=np.float64)
+        drone_yaws_rad = np.array(obs.drone_yaws_rad, dtype=np.float64)
+        agg = aggregate(positions, yaws_rad, cfg.aggregation,
+                        drone_yaws_rad=drone_yaws_rad)
         if agg.rejected:
             if cfg.verbose:
                 print(f"    [reject] id={marker_id} survivors="
@@ -359,6 +372,7 @@ def run_pipeline(
             pos_var_y=agg.pos_var_y,
             pos_cov_xy=agg.pos_cov_xy,
             yaw_var=agg.yaw_var,
+            mean_obs_drone_yaw_rad=agg.mean_obs_drone_yaw_rad,
         )
 
     return results, drone_poses
