@@ -1,0 +1,10 @@
+av==17.0.1
+numpy==1.21.5
+onnxruntime_gpu==1.19.0
+paramiko==2.9.3
+pynput==1.8.2
+PyYAML==6.0.3
+scipy==1.8.0
+tellopy==0.7.0.dev0
+opencv-contrib-python==4.5.4
+Pillow==9.0.1
