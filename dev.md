@@ -94,22 +94,38 @@ Scripts:
 ```bash
 # Calibrate extrinsincs
 src/arena_marker_localizer/scripts/calibrate_extrinsics \
-  --video /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/static_scans/video1/scan.mp4 \
-  --csv   /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/static_scans/video1/telemetry.csv \
-  --gt    /home/jetson/collab_nav_ground-jetson/src/arena_marker_localizer/config/calib_gt.yaml \
-  --config     /home/jetson/collab_nav_ground-jetson/src/arena_marker_localizer/config/default.yaml \
-  --intrinsics /home/jetson/collab_nav_ground-jetson/src/arena_marker_localizer/config/calibration.yaml
+    --video  src/arena_map_builder/data/static_scans/video1/scan.mp4 \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/static_scan1.yaml \
+    --csv    src/arena_map_builder/data/static_scans/video1/telemetry.csv \
+    \
+    --video  src/arena_map_builder/data/static_scans/video2/scan.mp4 \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/static_scan2.yaml \
+    --csv    src/arena_map_builder/data/static_scans/video2/telemetry.csv \
+    \
+    --config     src/arena_marker_localizer/config/default.yaml \
+    --intrinsics src/arena_marker_localizer/config/calibration.yaml \
+    --verbose
 
 # Check sync
 src/arena_marker_localizer/scripts/check_sync --video /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/static_scans/video1/scan.mp4 --csv /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/static_scans/video1/telemetry.csv
 
-# Calibrate bias (can use multiple videos)
-calibrate_bias \
-  --video scan10.mp4 --csv scan10.csv \
-  --gt    ground_truth.yaml \
-  --config     src/arena_marker_localizer/config/default.yaml \
-  --intrinsics src/arena_marker_localizer/config/calibration.yaml \
-  --out   corrected_T_map_from_opti.yaml
+# Calibrate bias
+src/arena_marker_localizer/scripts/calibrate_bias \
+    --video  src/arena_map_builder/data/drone_scans/scan15/scan.mp4 \
+    --csv    src/arena_map_builder/data/drone_scans/scan15/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan15.yaml \
+    \
+    --video  src/arena_map_builder/data/drone_scans/scan16/scan.mp4 \
+    --csv    src/arena_map_builder/data/drone_scans/scan16/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan16.yaml \
+    \
+    --video  src/arena_map_builder/data/drone_scans/scan17/scan.mp4 \
+    --csv    src/arena_map_builder/data/drone_scans/scan17/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan17.yaml \
+    \
+    --config     src/arena_marker_localizer/config/default.yaml \
+    --intrinsics src/arena_map_builder/data/drone_scans/scan17/calibration.yaml \
+    --out        src/arena_marker_localizer/config/corrected_T_map_from_opti.yaml
 ```
 
 ## Emergency stop AMR 
@@ -197,6 +213,7 @@ Test planning and control loop that executes after orchestrator's handoff:
 # Once per scan (slow — runs map builder + localizer):
 python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 10 --aruco-ids '[0, 2]'
 python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 15 --aruco-ids '[5, 0]'
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 16 --aruco-ids '[5, 3]'
 python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 17 --aruco-ids '[3, 2]'
 
 # Many times (fast — only AMR bringup + planning):
@@ -254,3 +271,12 @@ transform_telemetry \
   --x 0.0 --y 0.0 --z 0.0 \
   --roll 0.0 --pitch 0.0 --yaw 1.570795
 ```
+
+## Enable optitrack + EKF + Teleoperated AMR
+
+```bash
+home/jetson/collab_nav_ground-jetson/scripts/amr_teleop_optitrack.sh 
+```
+
+## Run planner with custom coordinates 
+python3 run_hw_test_amr_nav.py --scan-id 10     --start-x 3.0 --start-y 0.8     --goal-x 2.0  --goal-y 2.0

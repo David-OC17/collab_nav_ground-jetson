@@ -60,20 +60,32 @@ class OptiTrackPoseNode(Node):
             self._last_time = now
             return
 
+
+        # Current pose 
+        x   = msg.pose.position.x
+        y   = msg.pose.position.y
+        yaw = self._quat_to_yaw(msg.pose.orientation)
+
+        # Last pose 
+        x0  = self._last_msg.pose.position.x
+        y0  = self._last_msg.pose.position.y
+        yaw0 = self._quat_to_yaw(self._last_msg.pose.orientation)
+
         # Current pose (rotated -90° around Z)
-        x, y, rot_q = self._rotate_z_neg90(
-            msg.pose.position.x, msg.pose.position.y, msg.pose.orientation)
-        yaw = self._quat_to_yaw(rot_q)
+        #x, y, rot_q = self._rotate_z_neg90(
+        #    msg.pose.position.x, msg.pose.position.y, msg.pose.orientation)
+        #yaw = self._quat_to_yaw(rot_q)
 
         # Last pose (rotated -90° around Z)
-        x0, y0, rot_q0 = self._rotate_z_neg90(
-            self._last_msg.pose.position.x, self._last_msg.pose.position.y,
-            self._last_msg.pose.orientation)
+        #x0, y0, rot_q0 = self._rotate_z_neg90(
+        #   self._last_msg.pose.position.x, self._last_msg.pose.position.y,
+        #    self._last_msg.pose.orientation)
 
         # Raw velocity in world frame
         dx_w = (x - x0) / dt
         dy_w = (y - y0) / dt
-        dth  = self._wrap(yaw - self._quat_to_yaw(rot_q0)) / dt
+        # dth  = self._wrap(yaw - self._quat_to_yaw(rot_q0)) / dt
+        dth  = self._wrap(yaw - yaw0) / dt
 
         # Rotate world-frame velocity → body frame
         c =  math.cos(yaw)
@@ -87,7 +99,8 @@ class OptiTrackPoseNode(Node):
         self._vy = a * vy_raw + (1.0 - a) * self._vy
         self._wz = a * dth   + (1.0 - a) * self._wz
 
-        self._publish(msg, x, y, rot_q)
+        #self._publish(msg, x, y, rot_q)
+        self._publish(msg, x, y, msg.pose.orientation)
 
         self._last_msg  = msg
         self._last_time = now
