@@ -10,3 +10,6 @@
 [submodule "src/optitrack_client"]
 	path = src/optitrack_client
 	url = git@github.com:NoeRos22/optitrack_client.git
+[submodule "src/LightGlue-ONNX-Jetson"]
+	path = src/LightGlue-ONNX-Jetson
+	url = git@github.com:limshoonkit/LightGlue-ONNX-Jetson.git
