@@ -33,8 +33,8 @@ Velocity frame — robot (base_link):
 
 Parameters:
   path_topic       '/trajectory_planner2/path'
-  map_frame        'map'
-  robot_base_frame 'base_link'
+  world_frame      'world'
+  robot_base_frame 'base_footprint'
   max_speed        0.30  m/s
   max_accel        0.20  m/s²
   goal_tolerance   0.10  m
@@ -70,15 +70,15 @@ class SplineFollower(Node):
         # Parameters
         # ------------------------------------------------------------------
         self.declare_parameter('path_topic',       '/trajectory_planner2/path')
-        self.declare_parameter('map_frame',        'map')
-        self.declare_parameter('robot_base_frame', 'base_link')
+        self.declare_parameter('world_frame',      'world')
+        self.declare_parameter('robot_base_frame', 'base_footprint')
         self.declare_parameter('max_speed',        0.30)   # m/s
         self.declare_parameter('max_accel',        0.20)   # m/s²
         self.declare_parameter('goal_tolerance',   0.10)   # m
         self.declare_parameter('update_rate',      20.0)   # Hz
 
         self.path_topic       = self.get_parameter('path_topic').value
-        self.map_frame        = self.get_parameter('map_frame').value
+        self.world_frame      = self.get_parameter('world_frame').value
         self.robot_base_frame = self.get_parameter('robot_base_frame').value
         self.max_speed        = float(self.get_parameter('max_speed').value)
         self.max_accel        = float(self.get_parameter('max_accel').value)
@@ -327,7 +327,7 @@ class SplineFollower(Node):
         """
         msg = Odometry()
         msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.map_frame
+        msg.header.frame_id = self.world_frame
         msg.child_frame_id  = self.robot_base_frame
 
         # Position + orientation

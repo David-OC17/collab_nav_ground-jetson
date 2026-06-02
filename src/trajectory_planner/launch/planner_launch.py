@@ -14,8 +14,6 @@ def generate_launch_description():
                               description='OccupancyGrid input topic'),
         DeclareLaunchArgument('goal_topic', default_value='/aruco/goal/pose',
                               description='Goal PoseWithCovarianceStamped topic'),
-        DeclareLaunchArgument('pose_topic', default_value='/amr/ekf/odom',
-                              description='Robot pose EKF Odometry topic'),
 
         DeclareLaunchArgument('inflation_radius',         default_value='0.20',
                               description='Obstacle inflation radius [m]'),
@@ -59,9 +57,7 @@ def generate_launch_description():
         parameters=[{
             'map_topic':                LaunchConfiguration('map_topic'),
             'goal_topic':               LaunchConfiguration('goal_topic'),
-            'pose_topic':               LaunchConfiguration('pose_topic'),
-            'map_frame':                'map',
-            'robot_base_frame':         'base_link',
+            'robot_base_frame':         'base_footprint',
             'inflation_radius':         LaunchConfiguration('inflation_radius'),
             'robot_radius':             LaunchConfiguration('robot_radius'),
             'cost_scaling':             LaunchConfiguration('cost_scaling'),
@@ -82,8 +78,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'path_topic':       '/trajectory_planner2/path',
-            'map_frame':        'map',
-            'robot_base_frame': 'base_link',
+            'robot_base_frame': 'base_footprint',
             'max_speed':        LaunchConfiguration('max_speed'),
             'max_accel':        LaunchConfiguration('max_accel'),
             'goal_tolerance':   LaunchConfiguration('goal_tolerance'),

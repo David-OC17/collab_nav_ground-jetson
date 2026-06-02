@@ -11,13 +11,14 @@ Plans a collision-free path on a fused occupancy grid using A* with:
 Subscribes:
   - /fusion/map              (nav_msgs/OccupancyGrid)                  — fused occupancy grid
   - /aruco/goal/pose         (geometry_msgs/PoseWithCovarianceStamped) — navigation goal
-  - /aruco/amr/pose          (nav_msgs/Odometry)                       — robot pose (continuous)
+
+Robot pose is obtained exclusively from TF: world → base_footprint.
 
 Publishes:
   - /trajectory_planner2/path  (nav_msgs/Path)  — A* path waypoints
 
 Replanning triggers:
-  1. FIRST PLAN — all three inputs available (map + pose + goal) and no path exists yet.
+  1. FIRST PLAN — map + goal available and no path exists yet.
 
   2. NEW GOAL — goal topic receives a pose farther than `goal_change_threshold` metres
      from the last accepted goal. Clears the current path and replans immediately.
@@ -38,9 +39,8 @@ All replanning is rate-limited by `min_replan_interval_sec`.
 Parameters (all configurable at launch):
   map_topic                 '/fusion/map'
   goal_topic                '/aruco/goal/pose'
-  pose_topic                '/aruco/amr/pose'
-  map_frame                 'map'
-  robot_base_frame          'base_link'
+  world_frame               'world'
+  robot_base_frame          'base_footprint'
   goal_change_threshold     0.30     m     — min goal displacement to trigger replan
   collision_cost_threshold  80.0           — inflated cost above which path is blocked
   global_change_threshold   0.05           — ratio [0,1] of new obstacles in full map
@@ -59,9 +59,11 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy, QoSDurabilityPolicy
+import tf2_ros
+from tf2_ros import TransformException
 
-from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from nav_msgs.msg import OccupancyGrid, Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 
 # ---------------------------------------------------------------------------
@@ -88,9 +90,8 @@ class AStarPlanner2(Node):
         # Topics
         self.declare_parameter('map_topic',        '/drone/map')
         self.declare_parameter('goal_topic',       '/aruco/goal/pose')
-        self.declare_parameter('pose_topic',       '/amr/ekf/odom')
-        self.declare_parameter('map_frame',        'map')
-        self.declare_parameter('robot_base_frame', 'base_link')
+        self.declare_parameter('world_frame',      'world')
+        self.declare_parameter('robot_base_frame', 'base_footprint')
 
         # Goal change detection
         self.declare_parameter('goal_change_threshold', 0.30)   # metres
@@ -114,8 +115,7 @@ class AStarPlanner2(Node):
         # Read all params
         self.map_topic        = self.get_parameter('map_topic').value
         self.goal_topic       = self.get_parameter('goal_topic').value
-        self.pose_topic       = self.get_parameter('pose_topic').value
-        self.map_frame        = self.get_parameter('map_frame').value
+        self.world_frame      = self.get_parameter('world_frame').value
         self.robot_base_frame = self.get_parameter('robot_base_frame').value
 
         self.goal_change_threshold    = float(self.get_parameter('goal_change_threshold').value)
@@ -142,11 +142,11 @@ class AStarPlanner2(Node):
         self.map_received   = False
         self._inflation_lut = {}      # {(di, dj): cost} — built once after first map
 
-        # Robot pose
-        self.robot_x       = 0.0
-        self.robot_y       = 0.0
-        self.robot_yaw     = 0.0
-        self.pose_received = False
+        # Robot pose (read from TF at plan time)
+        self.robot_x   = 0.0
+        self.robot_y   = 0.0
+        self.robot_yaw = 0.0
+        self.tf_ready  = False    # True once world→base_footprint is available
 
         # Goal
         self.goal_x        = None
@@ -162,6 +162,13 @@ class AStarPlanner2(Node):
         self.last_replan_time = 0.0
 
         # ------------------------------------------------------------------
+        # TF
+        # ------------------------------------------------------------------
+        self._tf_buffer   = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        self.create_timer(1.0, self._tf_probe)
+
+        # ------------------------------------------------------------------
         # QoS profiles
         # ------------------------------------------------------------------
         map_qos = QoSProfile(
@@ -175,6 +182,12 @@ class AStarPlanner2(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=10
         )
+        latched_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
 
         # ------------------------------------------------------------------
         # Subscribers
@@ -182,9 +195,7 @@ class AStarPlanner2(Node):
         self.map_sub  = self.create_subscription(
             OccupancyGrid,             self.map_topic,  self._map_callback,  map_qos)
         self.goal_sub = self.create_subscription(
-            PoseWithCovarianceStamped, self.goal_topic, self._goal_callback, reliable_qos)
-        self.pose_sub = self.create_subscription(
-            Odometry, self.pose_topic, self._pose_callback, reliable_qos)
+            PoseWithCovarianceStamped, self.goal_topic, self._goal_callback, latched_qos)
 
         # ------------------------------------------------------------------
         # Publishers
@@ -196,7 +207,7 @@ class AStarPlanner2(Node):
             'AStarPlanner2 ready\n'
             f'  map   → {self.map_topic}\n'
             f'  goal  → {self.goal_topic}\n'
-            f'  pose  → {self.pose_topic}\n'
+            f'  pose  ← TF {self.world_frame} → {self.robot_base_frame}\n'
             f'  out   → /trajectory_planner2/path\n'
             f'  collision_cost_threshold  = {self.collision_cost_threshold}\n'
             f'  global_change_threshold   = {self.global_change_threshold}\n'
@@ -204,6 +215,29 @@ class AStarPlanner2(Node):
             f'  path_proximity_radius     = {self.path_proximity_radius} m\n'
             f'  goal_change_threshold     = {self.goal_change_threshold} m'
         )
+
+    # ==========================================================================
+    # TF probe — 1 Hz, fires a first plan once TF becomes available
+    # ==========================================================================
+
+    def _tf_probe(self):
+        if self.tf_ready:
+            return
+        try:
+            self._tf_buffer.lookup_transform(
+                self.world_frame, self.robot_base_frame, rclpy.time.Time())
+        except TransformException:
+            self.get_logger().warn(
+                f'Waiting for TF {self.world_frame} → {self.robot_base_frame}…',
+                throttle_duration_sec=5.0)
+            return
+
+        self.tf_ready = True
+        self.get_logger().info(
+            f'TF {self.world_frame} → {self.robot_base_frame} available — ready to plan.')
+
+        if self.map_received and self.goal_received and not self.current_path:
+            self._rate_limited_plan('first plan after TF became available')
 
     # ==========================================================================
     # Callbacks
@@ -237,7 +271,7 @@ class AStarPlanner2(Node):
             self.map_received = True
             self.get_logger().info(
                 f'First map received: {w}×{h} cells @ {res:.3f} m/cell')
-            if self.pose_received and self.goal_received:
+            if self.tf_ready and self.goal_received:
                 self._rate_limited_plan('first plan after map arrived')
             return
 
@@ -245,7 +279,7 @@ class AStarPlanner2(Node):
         if not self.current_path:
             self.map_data     = new_inflated
             self.prev_raw_map = new_raw.copy()
-            if self.pose_received and self.goal_received:
+            if self.tf_ready and self.goal_received:
                 self._rate_limited_plan('no active path — planning after map update')
             return
 
@@ -327,25 +361,8 @@ class AStarPlanner2(Node):
         self.get_logger().info(
             f'New goal accepted: ({new_gx:.2f}, {new_gy:.2f})')
 
-        if self.map_received and self.pose_received:
+        if self.tf_ready and self.map_received:
             self._rate_limited_plan('new goal received')
-
-    def _pose_callback(self, msg: Odometry):
-
-        self.robot_x = msg.pose.pose.position.x
-        self.robot_y = msg.pose.pose.position.y
-
-        q = msg.pose.pose.orientation
-        self.robot_yaw = math.atan2(
-            2.0 * (q.w * q.z + q.x * q.y),
-            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-
-        first_pose         = not self.pose_received
-        self.pose_received = True
-
-        # Trigger first plan only when pose first arrives and everything else is ready
-        if first_pose and self.map_received and self.goal_received and not self.current_path:
-            self._rate_limited_plan('first plan after pose arrived')
 
     # ==========================================================================
     # Rate-limited planning
@@ -370,18 +387,31 @@ class AStarPlanner2(Node):
     def _plan(self):
 
         # Guard: all required data must be present
+        if not self.tf_ready:
+            self.get_logger().warn('Plan requested — waiting for TF.')
+            return
         if not self.map_received:
             self.get_logger().warn('Plan requested — waiting for map.')
-            return
-        if not self.pose_received:
-            self.get_logger().warn('Plan requested — waiting for robot pose.')
             return
         if not self.goal_received:
             self.get_logger().warn('Plan requested — waiting for goal.')
             return
 
-        sci, scj = self._world_to_cell(self.robot_x, self.robot_y)
-        gci, gcj = self._world_to_cell(self.goal_x,  self.goal_y)
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self.world_frame, self.robot_base_frame, rclpy.time.Time())
+            robot_x = tf.transform.translation.x
+            robot_y = tf.transform.translation.y
+        except TransformException as e:
+            self.get_logger().warn(f'Cannot get robot pose from TF: {e}')
+            return
+
+        self.get_logger().info(
+            f'Planning: robot=({robot_x:.2f},{robot_y:.2f}) '
+            f'→ goal=({self.goal_x:.2f},{self.goal_y:.2f})')
+
+        sci, scj = self._world_to_cell(robot_x, robot_y)
+        gci, gcj = self._world_to_cell(self.goal_x, self.goal_y)
 
         # Bounds check
         for label, ci, cj in [('Start', sci, scj), ('Goal', gci, gcj)]:
@@ -396,10 +426,6 @@ class AStarPlanner2(Node):
             self.get_logger().error(
                 f'Goal cell ({gci},{gcj}) is lethal — cannot plan.')
             return
-
-        self.get_logger().info(
-            f'Planning: robot=({self.robot_x:.2f},{self.robot_y:.2f}) '
-            f'→ goal=({self.goal_x:.2f},{self.goal_y:.2f})')
 
         t0   = time.time()
         path = self._astar(sci, scj, gci, gcj)
@@ -580,7 +606,7 @@ class AStarPlanner2(Node):
         """Serialises a list of (wx, wy) tuples into nav_msgs/Path and publishes it."""
         msg = Path()
         msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.map_frame
+        msg.header.frame_id = self.world_frame
 
         for wx, wy in waypoints:
             pose = PoseStamped()

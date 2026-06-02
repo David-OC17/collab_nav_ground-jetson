@@ -34,6 +34,7 @@ setup(
             'stub_drone_map_publisher = '
                 'amr_drone_nav.stub_drone_map_publisher:main',
             'stub_slam_map_publisher = amr_drone_nav.stub_slam_map_publisher:main',
+            'world_odom_tf_node = amr_drone_nav.world_odom_tf_node:main',
         ],
     },
 )
