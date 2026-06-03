@@ -52,7 +52,7 @@ from arena_map_builder_msgs.action import BuildArenaMap
 # Fixed inputs and server name
 # ══════════════════════════════════════════════════════════════════════════════
 
-VIDEO_PATH      = "/home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10/scan.mp4"
+VIDEO_PATH      = "/home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan18/scan.mp4"
 BACKGROUND_PATH = "/home/jetson/collab_nav_ground-jetson/src/arena_map_builder/config/background.png"
 SERVER_NODE     = "/build_arena_map_server"
 PROGRESS_FILE   = "progress.yaml"

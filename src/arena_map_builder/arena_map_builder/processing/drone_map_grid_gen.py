@@ -1239,24 +1239,31 @@ def _make_sp_lg_sessions(sp_path: str, lg_path: str, provider: str):
     return sp_sess, lg_sess
 
 
-def _sp_extract_feats(sp_session, img: np.ndarray):
+def _sp_extract_feats(
+    sp_session, img: np.ndarray, model_h: int, model_w: int
+):
     """Extract SuperPoint features from a single BGR frame.
 
-    The exported model has a static batch-2 input shape [2, 1, H, W], so the
-    frame is duplicated and only index 0 of each output is used.
+    The exported model has a static batch-2 input shape [2, 1, model_h, model_w],
+    so the frame is resized to that shape before inference and the returned
+    keypoint pixel coordinates are scaled back to the original frame space.
 
     Returns
     -------
-    kp_px   : (K, 2) float32   keypoint pixel coordinates (x, y)
+    kp_px   : (K, 2) float32   keypoint pixel coordinates (x, y) in original frame
     kp_norm : (1, K, 2) float32  keypoints normalised to [-1, 1] for LightGlue
     des     : (1, K, 256) float32  descriptors
     """
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-    pp = (gray.astype(np.float32) / 255.0)[np.newaxis, np.newaxis]      # (1,1,H,W)
-    pair = np.concatenate([pp, pp], axis=0)                              # (2,1,H,W)
+    if h != model_h or w != model_w:
+        gray = cv2.resize(gray, (model_w, model_h), interpolation=cv2.INTER_LINEAR)
+    pp = (gray.astype(np.float32) / 255.0)[np.newaxis, np.newaxis]      # (1,1,mH,mW)
+    pair = np.concatenate([pp, pp], axis=0)                              # (2,1,mH,mW)
     kp_out, _, des_out = sp_session.run(None, {"images": pair})
-    kp_px = kp_out[0]                                                    # (K,2) px coords
+    kp_model = kp_out[0]                                                 # (K,2) in model space
+    # Scale keypoints back to original frame pixel coordinates.
+    kp_px = kp_model * np.array([w / model_w, h / model_h], dtype=np.float32)
     kp_norm = (
         2.0 * kp_px / np.array([w, h], dtype=np.float32) - 1.0
     )[np.newaxis]                                                        # (1,K,2) in [-1,1]
@@ -1735,8 +1742,13 @@ class MapReconstructor:
             )
             self.detector = None
             self.norm = cv2.NORM_L2   # used if matcher == "ratio_test"
-            # SP warmup
-            _dummy = np.zeros((2, 1, 480, 640), dtype=np.float32)
+            # Derive the model's static spatial dimensions from its input metadata.
+            # Fall back to 480×640 if the model reports dynamic dims.
+            _sp_shape = self._sp_session.get_inputs()[0].shape  # [2, 1, H, W]
+            self._sp_model_h = _sp_shape[2] if isinstance(_sp_shape[2], int) else 480
+            self._sp_model_w = _sp_shape[3] if isinstance(_sp_shape[3], int) else 640
+            # SP warmup using the actual model dimensions
+            _dummy = np.zeros((2, 1, self._sp_model_h, self._sp_model_w), dtype=np.float32)
             kp_w, _, des_w = self._sp_session.run(None, {"images": _dummy})
             print("[drone_map] SP warmup done.")
         else:  # sift
@@ -1989,7 +2001,9 @@ class MapReconstructor:
 
         if self._sp_session is not None:
             # SuperPoint extractor: no mask support; full image is used.
-            kp_px, kp_norm, des_sp = _sp_extract_feats(self._sp_session, img)
+            kp_px, kp_norm, des_sp = _sp_extract_feats(
+                self._sp_session, img, self._sp_model_h, self._sp_model_w
+            )
             kp = kp_px                        # (K, 2) pixel coords
             if self._lg_session is not None:
                 des = (kp_norm, des_sp)       # packed tuple for LightGlue

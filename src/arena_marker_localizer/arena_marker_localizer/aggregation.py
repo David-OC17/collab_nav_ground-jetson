@@ -16,14 +16,22 @@ Two stages:
 The geometric median minimises the sum of L2 distances; it's robust to a
 substantial fraction of outliers (breakdown point ~50%) and is better
 behaved than the per-axis median when the noise is anisotropic.
+
+Drone attitude fields (mean_obs_drone_roll/pitch/yaw_rad)
+─────────────────────────────────────────────────────────
+All three angles are stored in the MAP frame, as extracted from
+R_map_from_drone = R_map_from_opti @ R_opti_from_drone(t).
+This means calibrate_bias can reconstruct R_map_from_drone directly via
+euler_zyx_to_R(roll, pitch, yaw) without needing T_map_from_opti again.
+When the CSV lacks roll/pitch columns (legacy mode) these default to 0.0.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
-
 import math
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
 import numpy as np
 
 
@@ -49,7 +57,13 @@ class AggregatedPose:
     pos_var_y:      float = 1.0   # sample variance of inlier y positions [m²]
     pos_cov_xy:     float = 0.0   # sample covariance of inlier (x,y) [m²]
     yaw_var:        float = 1.0   # -2·ln(R_mean), circular dispersion [rad²]
-    mean_obs_drone_yaw_rad: float = 0.0  # circular mean of drone heading across surviving observations
+    # ── Drone attitude in MAP frame across surviving observations ──────
+    # Used by calibrate_bias to build the full rotation design matrix.
+    # Circular mean via (sin, cos) averaging over inlier observations.
+    # All zero when the CSV lacks roll/pitch columns (legacy mode).
+    mean_obs_drone_roll_rad:  float = 0.0
+    mean_obs_drone_pitch_rad: float = 0.0
+    mean_obs_drone_yaw_rad:   float = 0.0
 
 
 def _mad(values: np.ndarray) -> Tuple[float, float]:
@@ -58,15 +72,18 @@ def _mad(values: np.ndarray) -> Tuple[float, float]:
     return m, float(np.median(np.abs(values - m)))
 
 
-def _circular_median_angle(angles: np.ndarray) -> float:
-    """Robust circular 'median' via the angle of the unit-vector median.
-    Not the true circular median in the formal sense, but is consistent
-    with the per-axis MAD-on-yaw used in the gating step."""
+def _circular_mean_angle(angles: np.ndarray) -> float:
+    """Circular mean via unit-vector averaging."""
     if len(angles) == 0:
         return 0.0
-    cs = np.cos(angles)
-    ss = np.sin(angles)
-    return float(math.atan2(np.median(ss), np.median(cs)))
+    return float(math.atan2(np.mean(np.sin(angles)), np.mean(np.cos(angles))))
+
+
+def _circular_median_angle(angles: np.ndarray) -> float:
+    """Robust circular 'median' via the angle of the unit-vector median."""
+    if len(angles) == 0:
+        return 0.0
+    return float(math.atan2(np.median(np.sin(angles)), np.median(np.cos(angles))))
 
 
 def _wrap_angle_signed(a: float) -> float:
@@ -102,12 +119,19 @@ def _geometric_median(points: np.ndarray, cfg: AggregationConfig) -> np.ndarray:
 
 
 def aggregate(
-    positions: np.ndarray,                    # (N, 3)
-    yaws_rad:  np.ndarray,                    # (N,)
+    positions: np.ndarray,                             # (N, 3)
+    yaws_rad:  np.ndarray,                             # (N,)
     cfg: Optional[AggregationConfig] = None,
-    drone_yaws_rad: Optional[np.ndarray] = None,  # (N,) drone heading in map frame per obs
+    drone_yaws_rad:   Optional[np.ndarray] = None,     # (N,) map-frame yaw
+    drone_rolls_rad:  Optional[np.ndarray] = None,     # (N,) map-frame roll
+    drone_pitches_rad: Optional[np.ndarray] = None,    # (N,) map-frame pitch
 ) -> AggregatedPose:
+    """Aggregate N per-frame observations into one robust pose estimate.
 
+    drone_rolls/pitches/yaws_rad should be the drone attitude in the MAP
+    frame for each observation (extracted from R_map_from_drone).  Only
+    the surviving-inlier subset is averaged.
+    """
     cfg       = cfg or AggregationConfig()
     positions = np.asarray(positions, dtype=np.float64)
     yaws_rad  = np.asarray(yaws_rad,  dtype=np.float64)
@@ -143,20 +167,22 @@ def aggregate(
     surviving   = positions[keep]    # (M, 3)
     surviving_y = yaws_rad[keep]     # (M,)
 
-    if drone_yaws_rad is not None:
-        surv_dy = np.asarray(drone_yaws_rad, dtype=np.float64)[keep]
-        mean_drone_yaw = float(math.atan2(
-            np.mean(np.sin(surv_dy)), np.mean(np.cos(surv_dy))))
-    else:
-        mean_drone_yaw = 0.0
+    # ── Drone attitude in MAP frame (circular mean over inliers) ─────────
+    def _circ_mean_inliers(arr: Optional[np.ndarray]) -> float:
+        if arr is None:
+            return 0.0
+        sub = np.asarray(arr, dtype=np.float64)[keep]
+        return _circular_mean_angle(sub)
+
+    mean_drone_yaw   = _circ_mean_inliers(drone_yaws_rad)
+    mean_drone_roll  = _circ_mean_inliers(drone_rolls_rad)
+    mean_drone_pitch = _circ_mean_inliers(drone_pitches_rad)
 
     # ── Robust pose estimate ─────────────────────────────────────────────
     pos = _geometric_median(surviving, cfg)
     yaw = _circular_median_angle(surviving_y)
 
     # ── Position covariance: residuals from the geometric median ─────────
-    # Using residuals from pos (the geometric median) rather than the
-    # sample mean so the spread is centred on the actual estimate.
     if len(surviving) > 1:
         res = surviving - pos   # (M, 3)
         dof = len(surviving) - 1
@@ -169,11 +195,9 @@ def aggregate(
         pos_cov_xy = 0.0
 
     # ── Circular dispersion of yaw [rad²] ────────────────────────────────
-    # -2·ln(R_mean) is the von Mises analogue of variance in rad²,
-    # dimensionally consistent unlike the [0,1] circular variance.
     R_mean  = math.sqrt(np.mean(np.sin(surviving_y))**2 +
                         np.mean(np.cos(surviving_y))**2)
-    R_mean  = min(R_mean, 1.0 - 1e-9)   # guard log(0) when all yaws identical
+    R_mean  = min(R_mean, 1.0 - 1e-9)   # guard log(0)
     yaw_var = float(-2.0 * math.log(R_mean))
 
     return AggregatedPose(
@@ -185,6 +209,7 @@ def aggregate(
         pos_var_y=pos_var_y,
         pos_cov_xy=pos_cov_xy,
         yaw_var=yaw_var,
+        mean_obs_drone_roll_rad=mean_drone_roll,
+        mean_obs_drone_pitch_rad=mean_drone_pitch,
         mean_obs_drone_yaw_rad=mean_drone_yaw,
     )
-        

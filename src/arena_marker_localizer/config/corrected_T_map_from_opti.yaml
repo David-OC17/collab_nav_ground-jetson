@@ -1,21 +1,21 @@
 T_drone_from_cam:
-  pitch: -0.051733
-  roll: 3.058117
-  x: -0.115
-  y: -0.15
-  yaw: -0.061856
+  pitch: 0.0
+  roll: 3.14159
+  x: -0.265
+  y: 0.3
+  yaw: -0.079912
   z: 0.0
 T_map_from_opti:
   pitch: 0.0
   roll: 0.0
-  x: 0.845127
-  y: 0.217236
+  x: 0.725882
+  y: 0.867996
   yaw: 1.570795
   z: 0.0
 correction_params:
-  c_x_m: -1.084873
-  c_y_m: -1.692764
-  degenerate_heading: true
-  delta_yaw_deg: -0.0742
-  dx_drone_m: 0.0
-  dy_drone_m: 0.0
+  c_x_m: -1.204118
+  c_y_m: -1.042004
+  degenerate_attitude: false
+  delta_yaw_deg: -4.5786
+  dx_drone_m: -0.3
+  dy_drone_m: 0.3

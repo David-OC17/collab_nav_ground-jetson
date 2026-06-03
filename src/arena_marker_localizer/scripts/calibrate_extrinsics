@@ -13,6 +13,13 @@ layout changes between recordings.  All sessions are optimised jointly.
 A single --csv applies to all videos (when the drone did not move between
 recordings); pass one --csv per --video when the drone was repositioned.
 
+Full-pose CSVs
+──────────────
+When the CSV contains 'roll' and 'pitch' columns, the static drone pose is
+computed by circular-averaging roll, pitch and yaw across all CSV rows and
+using the full ZYX rotation — giving a more accurate T_opti_from_drone even
+when the drone is not perfectly level on its mount.
+
 Setup
 ─────
 1. Fix the drone on a stable, level mount.
@@ -48,7 +55,7 @@ Ground-truth YAML format
     5:
       x: 1.20    # map frame, metres
       y: 0.85
-      z: 0.0     # optional, not yet used in cost
+      z: 0.0     # optional
       theta: 180 # facing direction in map frame, degrees — strongly recommended
     12:
       x: 2.40
@@ -57,17 +64,13 @@ Ground-truth YAML format
 
 Notes
 ─────
-- theta (degrees) is the direction the marker faces in the map frame
-  (same convention as the scan GT files).  When provided it adds an
-  orientation term to the cost function, which prevents the optimiser from
-  trading rotation accuracy for position accuracy — a common failure mode
-  when the drone is at a single fixed position.
+- theta (degrees) is the direction the marker faces in the map frame.
+  Providing theta adds an orientation term to the cost that prevents the
+  optimiser from trading rotation accuracy for position accuracy.
 - Without theta the optimisation is under-constrained for rotation when the
-  drone does not move between sessions.  Add theta to at least some markers.
+  drone does not move between sessions.
 - Translation is bounded to ±0.15 m from the config initial value; increase
   --max-translation if you expect a larger physical offset.
-- The optimiser is initialised from the current config values, so the result
-  is best interpreted as a refinement rather than a cold-start solution.
 - Results are printed ready to paste into config/default.yaml.
 """
 
@@ -186,26 +189,58 @@ def _collect_detections(video_path: str,
 # Drone pose from CSV (drone must be static — average all rows)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _circ_mean(angles: list) -> float:
+    """Circular mean of a list of angles in radians."""
+    return math.atan2(
+        sum(math.sin(a) for a in angles) / len(angles),
+        sum(math.cos(a) for a in angles) / len(angles),
+    )
+
+
 def _static_drone_pose(csv_path: str,
                        opti_cfg: OptiTrackAxisConfig,
                        verbose: bool = False) -> np.ndarray:
-    """Average all CSV rows and return T_opti_from_drone."""
+    """Average all CSV rows and return T_opti_from_drone.
+
+    Uses the full ZYX rotation when the CSV contains 'roll' and 'pitch'
+    columns; falls back to yaw-only otherwise.
+    """
     drone_poses = load_optitrack_csv(csv_path)
     if not drone_poses:
         sys.exit(f"ERROR: CSV is empty: {csv_path!r}")
-    mean_pos = np.mean([dp.pos_xyz for dp in drone_poses], axis=0)
-    mean_yaw = math.atan2(
-        np.mean([math.sin(dp.yaw_rad) for dp in drone_poses]),
-        np.mean([math.cos(dp.yaw_rad) for dp in drone_poses]),
-    )
+
+    mean_pos   = np.mean([dp.pos_xyz   for dp in drone_poses], axis=0)
+    mean_yaw   = _circ_mean([dp.yaw_rad   for dp in drone_poses])
+    mean_roll  = _circ_mean([dp.roll_rad  for dp in drone_poses])
+    mean_pitch = _circ_mean([dp.pitch_rad for dp in drone_poses])
+
+    has_full_pose = any(dp.roll_rad != 0.0 or dp.pitch_rad != 0.0
+                        for dp in drone_poses)
+
     if verbose:
         pos_std = np.std([dp.pos_xyz for dp in drone_poses], axis=0)
-        status = "OK" if pos_std.max() < 0.005 else "WARNING: drone may have moved"
-        print(f"  Drone mean pos : ({mean_pos[0]:.4f}, {mean_pos[1]:.4f}, {mean_pos[2]:.4f})"
-              f"  yaw : {math.degrees(mean_yaw):.2f}°")
-        print(f"  Drone pos std  : ({pos_std[0]:.4f}, {pos_std[1]:.4f}, {pos_std[2]:.4f})"
-              f"  [{status}]")
-    return opti_transform_from_pose(mean_pos, mean_yaw, opti_cfg)
+        status  = "OK" if pos_std.max() < 0.005 else "WARNING: drone may have moved"
+        print(f"  Drone mean pos   : ({mean_pos[0]:.4f}, {mean_pos[1]:.4f}, "
+              f"{mean_pos[2]:.4f})")
+        print(f"  Drone mean att.  : roll={math.degrees(mean_roll):.2f}°  "
+              f"pitch={math.degrees(mean_pitch):.2f}°  "
+              f"yaw={math.degrees(mean_yaw):.2f}°"
+              + ("  [full-pose]" if has_full_pose else "  [yaw-only legacy]"))
+        print(f"  Drone pos std    : ({pos_std[0]:.4f}, {pos_std[1]:.4f}, "
+              f"{pos_std[2]:.4f})  [{status}]")
+
+        roll_std  = np.std([dp.roll_rad  for dp in drone_poses])
+        pitch_std = np.std([dp.pitch_rad for dp in drone_poses])
+        yaw_std   = np.std([dp.yaw_rad   for dp in drone_poses])
+        if max(roll_std, pitch_std, yaw_std) > math.radians(2.0):
+            print(f"  [WARN] Attitude std: roll={math.degrees(roll_std):.2f}°  "
+                  f"pitch={math.degrees(pitch_std):.2f}°  "
+                  f"yaw={math.degrees(yaw_std):.2f}°  "
+                  f"— drone may not be static during recording.")
+
+    return opti_transform_from_pose(
+        mean_pos, mean_roll, mean_pitch, mean_yaw, opti_cfg,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,9 +259,7 @@ def _cost(params: np.ndarray,
     theta_weight  = relative weight of angular vs positional cost.
 
     Position cost : mean squared XY error in map frame [m²].
-    Orientation cost : mean squared yaw error in map frame [rad²], using the
-        same R_to_euler_zyx extraction as the live pipeline.  Only markers
-        that have a theta entry in their GT file contribute to this term.
+    Orientation cost : mean squared yaw error in map frame [rad²].
     """
     x, y, z, roll, pitch, yaw = params
     T_dfc = StaticTransform6DoF(
@@ -246,7 +279,7 @@ def _cost(params: np.ndarray,
             for T_cm in T_list:
                 T_marker_in_map = base @ T_cm
                 est_xy = T_marker_in_map[:2, 3]
-                diff = est_xy - gxy
+                diff   = est_xy - gxy
                 pos_total += float(np.dot(diff, diff))
                 n_pos += 1
                 if g_th is not None:
@@ -287,13 +320,11 @@ def main():
                     help="Use every Nth video frame. Default: 1.")
     ap.add_argument("--theta-weight", type=float, default=1.0, dest="theta_weight",
                     help="Weight of angular cost relative to position cost. "
-                         "Default: 1.0 (balanced; increase to prioritise "
-                         "orientation accuracy).")
+                         "Default: 1.0.")
     ap.add_argument("--max-translation", type=float, default=0.15,
                     dest="max_translation",
                     help="Half-width of the search bound for x/y/z [m]. "
-                         "Default: 0.15.  Increase only if the camera is known "
-                         "to be far from the drone body.")
+                         "Default: 0.15.  Increase if the camera offset is large.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -328,9 +359,6 @@ def main():
         x_dir=int(cfg_p.get("optitrack", {}).get("x_dir",    1)),
         y_dir=int(cfg_p.get("optitrack", {}).get("y_dir",    1)),
     )
-    # x_dir / y_dir axis remapping is applied inside opti_transform_from_pose
-    # when converting raw CSV positions to T_opti_from_drone.  It must NOT be
-    # re-applied here to T_map_from_opti — that would double-count the flip.
 
     detector = MultiDictDetector(_parse_dicts(cfg_p))
 
@@ -380,12 +408,10 @@ def main():
           f"{n_theta_total} marker(s) with theta constraints")
 
     if n_theta_total == 0:
-        print("[WARN] No theta values in any GT file — rotation is under-constrained.\n"
-              "       The optimiser may trade orientation accuracy for position\n"
-              "       accuracy.  Add theta to GT markers to prevent this.")
-    if len(all_known) == 1:
-        print("[NOTE] Only 1 known marker across all sessions — "
-              "6 DOF are not fully constrained.")
+        print("[WARN] No theta values in any GT file — rotation is under-constrained.")
+    if len(sessions) < 2:
+        print("[NOTE] Only 1 session — recommend adding more static poses at different "
+              "positions and orientations for a well-conditioned calibration.")
 
     # ── Optimise ───────────────────────────────────────────────────────
     x0 = np.array([
@@ -406,8 +432,7 @@ def main():
     if n_theta_total > 0:
         print(f"Theta weight         : {args.theta_weight}")
 
-    cost_args = (sessions, T_map_from_opti, args.theta_weight)
-    init_cost  = _cost(x0, *cost_args)
+    cost_args  = (sessions, T_map_from_opti, args.theta_weight)
     init_rms   = math.sqrt(max(0.0, _cost(x0, sessions, T_map_from_opti, 0.0))) * 100
     print(f"\nInitial RMS XY error : {init_rms:.1f} cm")
 
@@ -426,14 +451,14 @@ def main():
         print(f"Final  RMS θ  error : {math.degrees(ang_only):.1f} deg")
     if not result.success:
         print(f"[WARN] Optimiser: {result.message}")
+
     ox, oy, oz, oroll, opitch, oyaw = result.x
     for label, val, lo, hi in [("x", ox, bounds[0][0], bounds[0][1]),
                                 ("y", oy, bounds[1][0], bounds[1][1]),
                                 ("z", oz, bounds[2][0], bounds[2][1])]:
         if abs(val - lo) < 1e-4 or abs(val - hi) < 1e-4:
-            print(f"[WARN] {label} hit its bound ({val:+.4f} m) — the true minimum "
-                  f"may be outside the search region.  Consider increasing "
-                  f"--max-translation or checking GT accuracy.")
+            print(f"[WARN] {label} hit its bound ({val:+.4f} m) — consider "
+                  f"increasing --max-translation or checking GT accuracy.")
 
     print(f"\n{'─'*60}")
     print("Optimised T_drone_from_cam  (paste into config/default.yaml):")

@@ -37,9 +37,6 @@ mamba create -n collab_nav -c robostack-staging -c conda-forge \
 mamba activate arena
 
 pip install opencv-python numpy
-
-# Florence-2 only if needed:
-pip install transformers torch pillow einops timm
 ```
 
 If the system has a ROS2 installation we must unset some variables for the build to take those internal to the mamba environment:
@@ -66,10 +63,12 @@ Execute a test via:
 ros2 run arena_map_builder build_arena_map_server
 
 # Terminal 2
-ros2 param set /build_arena_map_server transfer.background_path /abs/path/background.png
+ros2 param set /build_arena_map_server transfer.background_path src/arena_map_builder/config/background.png
 
 python3 src/arena_map_builder/arena_map_builder/example_client.py /abs/path/video.mp4
 ```
+
+ONNX Runtime GPU: onnxruntime_gpu-1.19.0-cp310-cp310-linux_aarch64.whl
 
 ## Arena marker localizer   
 
@@ -94,13 +93,13 @@ Scripts:
 ```bash
 # Calibrate extrinsincs
 src/arena_marker_localizer/scripts/calibrate_extrinsics \
-    --video  src/arena_map_builder/data/static_scans/video1/scan.mp4 \
-    --gt     src/arena_marker_localizer/config/aruco_pose_gt/static_scan1.yaml \
-    --csv    src/arena_map_builder/data/static_scans/video1/telemetry.csv \
+    --video  src/arena_map_builder/data/static_scans/video3/scan.mp4 \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/static_scan3.yaml \
+    --csv    src/arena_map_builder/data/static_scans/video3/telemetry.csv \
     \
-    --video  src/arena_map_builder/data/static_scans/video2/scan.mp4 \
-    --gt     src/arena_marker_localizer/config/aruco_pose_gt/static_scan2.yaml \
-    --csv    src/arena_map_builder/data/static_scans/video2/telemetry.csv \
+    --video  src/arena_map_builder/data/static_scans/video4/scan.mp4 \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/static_scan4.yaml \
+    --csv    src/arena_map_builder/data/static_scans/video4/telemetry.csv \
     \
     --config     src/arena_marker_localizer/config/default.yaml \
     --intrinsics src/arena_marker_localizer/config/calibration.yaml \
@@ -111,20 +110,21 @@ src/arena_marker_localizer/scripts/check_sync --video /home/jetson/collab_nav_gr
 
 # Calibrate bias
 src/arena_marker_localizer/scripts/calibrate_bias \
-    --video  src/arena_map_builder/data/drone_scans/scan15/scan.mp4 \
-    --csv    src/arena_map_builder/data/drone_scans/scan15/telemetry.csv \
-    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan15.yaml \
-    \
-    --video  src/arena_map_builder/data/drone_scans/scan16/scan.mp4 \
-    --csv    src/arena_map_builder/data/drone_scans/scan16/telemetry.csv \
-    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan16.yaml \
-    \
-    --video  src/arena_map_builder/data/drone_scans/scan17/scan.mp4 \
-    --csv    src/arena_map_builder/data/drone_scans/scan17/telemetry.csv \
-    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan17.yaml \
+    --video  src/arena_map_builder/data/drone_scans/scan18/scan.mp4 \
+    --csv    src/arena_map_builder/data/drone_scans/scan18/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan18.yaml \
     \
     --config     src/arena_marker_localizer/config/default.yaml \
-    --intrinsics src/arena_map_builder/data/drone_scans/scan17/calibration.yaml \
+    --intrinsics src/arena_map_builder/data/drone_scans/scan18/calibration.yaml \
+    --out        src/arena_marker_localizer/config/corrected_T_map_from_opti.yaml
+
+src/arena_marker_localizer/scripts/calibrate_bias_v2 \
+    --video  src/arena_map_builder/data/manual_scans/scan1/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan1/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan1.yaml \
+    \
+    --config     src/arena_marker_localizer/config/default.yaml \
+    --intrinsics src/arena_map_builder/data/manual_scans/scan1/calibration.yaml \
     --out        src/arena_marker_localizer/config/corrected_T_map_from_opti.yaml
 ```
 
@@ -263,6 +263,12 @@ ros2 run tello_pos_control record_scan --ros-args \
 ros2 run tello_pos_control record_scan
 ```
 
+## Making async optitrack-drone videos
+
+```bash
+ros2 run tello_pos_control record_pose
+```
+
 ## Transform telemetry
 
 ```bash
@@ -279,4 +285,7 @@ home/jetson/collab_nav_ground-jetson/scripts/amr_teleop_optitrack.sh
 ```
 
 ## Run planner with custom coordinates 
-python3 run_hw_test_amr_nav.py --scan-id 10     --start-x 3.0 --start-y 0.8     --goal-x 2.0  --goal-y 2.0
+./scripts/custom_trajectory.sh 
+
+## Take pgm and yaml file from the map to generate occupancy grid 
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 4

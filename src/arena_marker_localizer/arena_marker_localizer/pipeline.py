@@ -63,17 +63,13 @@ class PipelineConfig:
     T_drone_from_cam: StaticTransform6DoF = field(
         default_factory=StaticTransform6DoF
     )
-    """Camera mounting on the drone. Includes both the camera position
-    on the body and the rotation from OpenCV's camera frame
-    (X right, Y down, Z forward) to your drone-body frame.
-    Default = identity (override per setup)."""
+    """Camera mounting on the drone."""
 
     T_map_from_opti: StaticTransform6DoF = field(
         default_factory=StaticTransform6DoF
     )
-    """Map-from-OptiTrack: where the arena origin (bottom-left) sits in
-    the OptiTrack frame, plus the rotation to align +X right / +Y up
-    with the map's nav2 convention. Default = identity (override)."""
+    """Map-from-OptiTrack: arena origin (bottom-left) in the OptiTrack
+    frame, plus the rotation to align +X right / +Y up."""
 
     optitrack_axis: OptiTrackAxisConfig = field(
         default_factory=OptiTrackAxisConfig
@@ -81,14 +77,10 @@ class PipelineConfig:
 
     # ── Detection-quality gates ───────────────────────────────────────
     max_reproj_err_px: float = 4.0
-    """Drop a single detection whose solvePnP reprojection error is
-    above this. Cheap noise filter before aggregation."""
 
     # ── Aggregation ────────────────────────────────────────────────────
     aggregation: AggregationConfig = field(default_factory=AggregationConfig)
     max_obs_per_marker: int = 200
-    """Cap on observations stored per marker. When exceeded the
-    oldest observations are dropped (FIFO)."""
 
     # ── Map → grid cell conversion ────────────────────────────────────
     resolution_m_per_cell: float = 0.05
@@ -97,23 +89,14 @@ class PipelineConfig:
 
     # ── Parallel processing ───────────────────────────────────────────
     max_workers: int = 4
-    """Number of parallel threads for frame processing. Each thread
-    holds its own MultiDictDetector instance. Set to 1 to disable
-    parallelism (useful for debugging)."""
-
     frame_stride: int = 1
-    """Process every Nth video frame. 1 = every frame. 2 = every other
-    frame (halves the workload at 30 fps, still yields ample observations
-    for aggregation at min_observations=50)."""
 
     # ── Velocity gate ─────────────────────────────────────────────────
     max_drone_velocity_m_s: float = 0.0
     """Drop frames where the drone speed exceeds this threshold [m/s].
-    0.0 = disabled (keep all frames).
-    When the drone is translating it maintains a pitch/roll proportional
-    to speed; dropping fast frames reduces the systematic position error
-    that results from ignoring pitch/roll in the transform chain.
-    Recommended starting value: 0.15 m/s."""
+    0.0 = disabled.  With full-pose CSVs, pitch/roll are now properly
+    modelled so this gate is less critical but still useful for
+    reducing motion-blur observations."""
 
     # ── Diagnostics ────────────────────────────────────────────────────
     verbose: bool = False
@@ -125,25 +108,31 @@ class PipelineConfig:
 
 @dataclass
 class _MarkerObservations:
-    positions:      List[np.ndarray] = field(default_factory=list)
-    yaws_rad:       List[float]      = field(default_factory=list)
-    drone_yaws_rad: List[float]      = field(default_factory=list)
-    sample_label:   List[str]        = field(default_factory=list)
-    """e.g. 'DICT_4X4_50' so the caller can audit which dict produced
-    the aggregate."""
+    positions:        List[np.ndarray] = field(default_factory=list)
+    yaws_rad:         List[float]      = field(default_factory=list)
+    drone_rolls_rad:  List[float]      = field(default_factory=list)
+    drone_pitches_rad: List[float]     = field(default_factory=list)
+    drone_yaws_rad:   List[float]      = field(default_factory=list)
+    sample_label:     List[str]        = field(default_factory=list)
 
     def add(self, pos: np.ndarray, yaw: float, label: str, cap: int,
+            drone_roll: float = 0.0,
+            drone_pitch: float = 0.0,
             drone_yaw: float = 0.0):
         self.positions.append(pos)
         self.yaws_rad.append(yaw)
+        self.drone_rolls_rad.append(drone_roll)
+        self.drone_pitches_rad.append(drone_pitch)
         self.drone_yaws_rad.append(drone_yaw)
         self.sample_label.append(label)
         # FIFO trim
         if len(self.positions) > cap:
-            self.positions      = self.positions[-cap:]
-            self.yaws_rad       = self.yaws_rad[-cap:]
-            self.drone_yaws_rad = self.drone_yaws_rad[-cap:]
-            self.sample_label   = self.sample_label[-cap:]
+            self.positions         = self.positions[-cap:]
+            self.yaws_rad          = self.yaws_rad[-cap:]
+            self.drone_rolls_rad   = self.drone_rolls_rad[-cap:]
+            self.drone_pitches_rad = self.drone_pitches_rad[-cap:]
+            self.drone_yaws_rad    = self.drone_yaws_rad[-cap:]
+            self.sample_label      = self.sample_label[-cap:]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -159,11 +148,14 @@ class MarkerResult:
     cell_x:         int
     cell_y:         int
     n_observations: int
-    pos_var_x:     float = 1.0  # ← Sample variance of inlier x positions [m²]
-    pos_var_y:     float = 1.0  # ← Sample variance of inlier y positions [m²]
-    pos_cov_xy:    float = 0.0  # ← Sample covariance of inlier (x,y) [m²]
-    yaw_var:       float = 1.0  # ← Circular dispersion of inlier yaws [rad²]
-    mean_obs_drone_yaw_rad: float = 0.0  # ← Circular mean of drone heading during inlier obs
+    pos_var_x:     float = 1.0
+    pos_var_y:     float = 1.0
+    pos_cov_xy:    float = 0.0
+    yaw_var:       float = 1.0
+    # ── Drone attitude in MAP frame, circular mean over inlier obs ────
+    mean_obs_drone_roll_rad:  float = 0.0
+    mean_obs_drone_pitch_rad: float = 0.0
+    mean_obs_drone_yaw_rad:   float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -171,9 +163,6 @@ class MarkerResult:
 # ─────────────────────────────────────────────────────────────────────────
 
 def _xyz_to_cell(pos: np.ndarray, cfg: PipelineConfig) -> Tuple[int, int]:
-    """Convert (x,y,z) in metres into the OccupancyGrid cell index.
-    Origin is the bottom-left of the arena bbox (nav2 standard); +x right,
-    +y up. Clamped to grid bounds."""
     cx = int(pos[0] / cfg.resolution_m_per_cell)
     cy = int(pos[1] / cfg.resolution_m_per_cell)
     cx = max(0, min(cfg.grid_width_cells  - 1, cx))
@@ -191,10 +180,7 @@ def run_pipeline(
     Returns
     ───────
     results       : {marker_id: MarkerResult} for each accepted marker.
-                    Markers rejected during aggregation are omitted.
-    drone_poses   : the full OptiTrack trajectory loaded from the CSV
-                    (one DronePose per CSV row), so downstream debug /
-                    visualization code doesn't need to re-read the file.
+    drone_poses   : the full OptiTrack trajectory from the CSV.
     """
     # ── 1) Load intrinsics, CSV, and pre-build the static transforms ──
     if not cfg.intrinsics_path:
@@ -212,8 +198,8 @@ def run_pipeline(
     T_drone_from_cam = cfg.T_drone_from_cam.as_matrix()
     T_map_from_opti  = cfg.T_map_from_opti.as_matrix()
 
-    # Apply the configurable x_dir / y_dir flip as part of T_map_from_opti.
-    # We multiply the rotation by a diagonal sign matrix on the right.
+    # x_dir / y_dir flip applied as a right-multiplied sign matrix on
+    # T_map_from_opti so it only affects the OptiTrack-frame interpretation.
     flip = np.diag([cfg.optitrack_axis.x_dir,
                     cfg.optitrack_axis.y_dir,
                     1, 1]).astype(np.float64)
@@ -225,9 +211,6 @@ def run_pipeline(
         raise IOError(f"Cannot open video: {video_path!r}")
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # ── Thread-local detector: one MultiDictDetector per worker thread ──
-    # ArucoDetector has internal mutable buffers; sharing across threads
-    # is unsafe. Each thread creates its own instance on first use.
     _tl = threading.local()
 
     def _get_detector() -> MultiDictDetector:
@@ -244,14 +227,18 @@ def run_pipeline(
         if not detections:
             return {"kind": "no_marker"}
 
+        # Full-pose drone transform (uses roll/pitch when available;
+        # gracefully falls back to yaw-only when they are 0.0).
         T_opti_drone = opti_transform_from_pose(
-            dp.pos_xyz, dp.yaw_rad, cfg.optitrack_axis,
+            dp.pos_xyz, dp.roll_rad, dp.pitch_rad, dp.yaw_rad,
+            cfg.optitrack_axis,
         )
 
-        # Drone heading in map frame — used by calibrate_bias to fit a
-        # heading-dependent correction model for T_drone_from_cam errors.
+        # Drone attitude in MAP frame — stored per-observation so
+        # calibrate_bias can build the full rotation design matrix.
         T_map_drone = T_map_from_opti @ T_opti_drone
-        _, _, drone_yaw_map = R_to_euler_zyx(T_map_drone[:3, :3])
+        drone_roll_map, drone_pitch_map, drone_yaw_map = \
+            R_to_euler_zyx(T_map_drone[:3, :3])
 
         obs_list = []
         n_pnp_fail = 0
@@ -265,15 +252,16 @@ def run_pipeline(
             )
             pos = T_map_marker[:3, 3].copy()
             _r, _p, yaw = R_to_euler_zyx(T_map_marker[:3, :3])
-            obs_list.append((det.marker_id, pos, yaw, det.dict_name, drone_yaw_map))
+            obs_list.append((
+                det.marker_id, pos, yaw, det.dict_name,
+                drone_roll_map, drone_pitch_map, drone_yaw_map,
+            ))
 
         if obs_list:
             return {"kind": "detected", "obs": obs_list, "pnp_fail": n_pnp_fail}
         return {"kind": "no_marker", "pnp_fail": n_pnp_fail}
 
     # ── Precompute per-frame drone speed ─────────────────────────────
-    # Central differences for interior frames; forward/backward at edges.
-    # Speed is in m/s using OptiTrack timestamps for Δt.
     n_poses = len(drone_poses)
     drone_speed_m_s: List[float] = [0.0] * n_poses
     for _i in range(n_poses):
@@ -292,9 +280,9 @@ def run_pipeline(
     stats = dict(read=0, quality_fail=0, no_marker=0, accepted=0,
                  csv_short=0, pnp_fail=0, vel_filtered=0)
 
-    n_workers = max(1, cfg.max_workers)
-    max_inflight = n_workers * 2     # bound frames held in memory
-    stride = max(1, cfg.frame_stride)
+    n_workers  = max(1, cfg.max_workers)
+    max_inflight = n_workers * 2
+    stride     = max(1, cfg.frame_stride)
     pending: List[Future] = []
 
     def _drain_one() -> None:
@@ -307,9 +295,13 @@ def run_pipeline(
             stats["pnp_fail"] += result.get("pnp_fail", 0)
         else:
             stats["pnp_fail"] += result.get("pnp_fail", 0)
-            for marker_id, pos, yaw, dict_name, drone_yaw in result["obs"]:
+            for (marker_id, pos, yaw, dict_name,
+                 d_roll, d_pitch, d_yaw) in result["obs"]:
                 obs = observations.setdefault(marker_id, _MarkerObservations())
-                obs.add(pos, yaw, dict_name, cfg.max_obs_per_marker, drone_yaw)
+                obs.add(pos, yaw, dict_name, cfg.max_obs_per_marker,
+                        drone_roll=d_roll,
+                        drone_pitch=d_pitch,
+                        drone_yaw=d_yaw)
                 dict_name_by_id[marker_id] = dict_name
                 stats["accepted"] += 1
 
@@ -349,16 +341,23 @@ def run_pipeline(
     # ── 3) Aggregate per marker ───────────────────────────────────────
     results: Dict[int, MarkerResult] = {}
     for marker_id, obs in observations.items():
-        positions      = np.stack(obs.positions, axis=0)
-        yaws_rad       = np.array(obs.yaws_rad,       dtype=np.float64)
-        drone_yaws_rad = np.array(obs.drone_yaws_rad, dtype=np.float64)
-        agg = aggregate(positions, yaws_rad, cfg.aggregation,
-                        drone_yaws_rad=drone_yaws_rad)
+        positions         = np.stack(obs.positions, axis=0)
+        yaws_rad          = np.array(obs.yaws_rad,          dtype=np.float64)
+        drone_rolls_rad   = np.array(obs.drone_rolls_rad,   dtype=np.float64)
+        drone_pitches_rad = np.array(obs.drone_pitches_rad, dtype=np.float64)
+        drone_yaws_rad    = np.array(obs.drone_yaws_rad,    dtype=np.float64)
+
+        agg = aggregate(
+            positions, yaws_rad, cfg.aggregation,
+            drone_yaws_rad=drone_yaws_rad,
+            drone_rolls_rad=drone_rolls_rad,
+            drone_pitches_rad=drone_pitches_rad,
+        )
         if agg.rejected:
             if cfg.verbose:
-                print(f"    [reject] id={marker_id} survivors="
-                      f"{agg.n_observations}")
+                print(f"    [reject] id={marker_id} survivors={agg.n_observations}")
             continue
+
         cell_x, cell_y = _xyz_to_cell(agg.position_m, cfg)
         results[marker_id] = MarkerResult(
             marker_id=marker_id,
@@ -372,6 +371,8 @@ def run_pipeline(
             pos_var_y=agg.pos_var_y,
             pos_cov_xy=agg.pos_cov_xy,
             yaw_var=agg.yaw_var,
+            mean_obs_drone_roll_rad=agg.mean_obs_drone_roll_rad,
+            mean_obs_drone_pitch_rad=agg.mean_obs_drone_pitch_rad,
             mean_obs_drone_yaw_rad=agg.mean_obs_drone_yaw_rad,
         )
 

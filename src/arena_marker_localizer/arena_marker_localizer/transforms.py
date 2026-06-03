@@ -17,7 +17,7 @@ Pieces
   T_drone_from_cam      : static, configurable as 6 numbers (x, y, z,
                           roll, pitch, yaw). Camera mounting on the drone.
   T_opti_from_drone(t)  : per-frame, built from one CSV row
-                          (translation + yaw-only rotation).
+                          (translation + full ZYX rotation).
   T_map_from_opti       : static, configurable as 6 numbers. The arena
                           map's bottom-left corner with optional axis
                           re-mapping (e.g. flip x or y if the OptiTrack
@@ -27,17 +27,20 @@ Conventions
 ───────────
   - All rotations are intrinsic Tait-Bryan ZYX (yaw, pitch, roll), i.e.
     Rz(yaw) @ Ry(pitch) @ Rx(roll), the standard "yaw about Z" convention.
-  - For OptiTrack the yaw axis can be configured to Y if your rig is
-    Y-up (this is handled in opti_transform_from_pose).
+  - CSV columns 'roll', 'pitch', 'yaw' are expected in ZYX Tait-Bryan
+    radians as exported by OptiTrack (Body or World convention may differ —
+    verify against your OptiTrack project settings).
+  - When the CSV only contains 'yaw' (legacy format), roll and pitch are
+    treated as 0.0, giving the old yaw-only rotation.
   - All inputs are radians.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Tuple
 
-import math
 import numpy as np
 
 
@@ -64,17 +67,14 @@ class StaticTransform6DoF:
 class OptiTrackAxisConfig:
     """How OptiTrack's coordinate frame relates to the map frame.
 
-    `yaw_axis` says about which axis the CSV's `yaw` column rotates:
-      "z"  (default) — OptiTrack Z-up: yaw = rotation about Z
-      "y"            — Y-up: yaw = rotation about Y
+    `yaw_axis` is kept for backward compatibility; with full-pose CSVs
+    (roll + pitch + yaw) all three angles are always used via ZYX.
 
     `x_dir` / `y_dir` let you flip OptiTrack X or Y to align with map
-    +X / +Y. Each is +1 or -1. The map origin is the *arena bottom-left*
-    (nav2 OccupancyGrid convention); the user-configurable `T_map_from_opti`
-    handles the translation from OptiTrack origin (typically arena
-    center) to the bottom-left, plus any axis swap if needed.
+    +X / +Y.  Each is +1 or -1.  The flip is applied to T_map_from_opti
+    in the pipeline, not to T_opti_from_drone.
     """
-    yaw_axis: str = "z"   # "z" or "y"
+    yaw_axis: str = "z"   # "z" or "y" (legacy; ignored when roll/pitch != 0)
     x_dir:    int = +1    # +1 or -1
     y_dir:    int = +1
 
@@ -171,34 +171,36 @@ def invert_T(T: np.ndarray) -> np.ndarray:
 # Per-frame OptiTrack pose -> homogeneous transform
 # ─────────────────────────────────────────────────────────────────────────
 
-def opti_transform_from_pose(pos_xyz: np.ndarray,
-                             yaw_rad: float,
-                             axis_cfg: OptiTrackAxisConfig,
-                             ) -> np.ndarray:
-    """T_opti_from_drone for one CSV row: rotation about the configured
-    yaw axis, plus translation. Pitch/roll are assumed 0 (the CSV
-    doesn't carry them; the OptiTrack rig presumably stabilizes the
-    drone well enough that we treat the yaw column as the only
-    rotational degree of freedom)."""
-    if axis_cfg.yaw_axis == "z":
-        R = euler_zyx_to_R(0.0, 0.0, yaw_rad)
-    elif axis_cfg.yaw_axis == "y":
-        # yaw about Y: equivalent to setting pitch in ZYX terms.
-        R = euler_zyx_to_R(0.0, yaw_rad, 0.0)
+def opti_transform_from_pose(
+    pos_xyz:   np.ndarray,
+    roll_rad:  float,
+    pitch_rad: float,
+    yaw_rad:   float,
+    axis_cfg:  "OptiTrackAxisConfig",
+) -> np.ndarray:
+    """T_opti_from_drone for one CSV row.
+
+    Uses the full ZYX rotation when roll_rad or pitch_rad are non-zero
+    (full-pose CSV).  Falls back to pure yaw rotation for legacy CSVs
+    (roll_rad == pitch_rad == 0.0), honouring axis_cfg.yaw_axis for the
+    Y-up corner case.
+
+    The x_dir / y_dir axis flips are NOT applied here — they are part of
+    the effective T_map_from_opti and are applied there in the pipeline.
+    """
+    if roll_rad != 0.0 or pitch_rad != 0.0:
+        # Full pose: always ZYX
+        R = euler_zyx_to_R(roll_rad, pitch_rad, yaw_rad)
     else:
-        raise ValueError(f"Unknown yaw_axis {axis_cfg.yaw_axis!r}; "
-                         f"expected 'z' or 'y'.")
+        # Legacy yaw-only path
+        if axis_cfg.yaw_axis == "z":
+            R = euler_zyx_to_R(0.0, 0.0, yaw_rad)
+        elif axis_cfg.yaw_axis == "y":
+            R = euler_zyx_to_R(0.0, yaw_rad, 0.0)
+        else:
+            raise ValueError(f"Unknown yaw_axis {axis_cfg.yaw_axis!r}; "
+                             f"expected 'z' or 'y'.")
     return compose_T(pos_xyz, R)
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# The static OpenCV-camera-to-body-frame rotation
-# ─────────────────────────────────────────────────────────────────────────
-# OpenCV camera frame: +X right, +Y down, +Z forward (into the scene).
-# A typical drone body frame: +X forward, +Y left, +Z up.
-# Going from camera to body requires a known fixed rotation, which is
-# baked into the user-supplied T_drone_from_cam (StaticTransform6DoF).
-# We don't hardcode a value here — let the user set the 6 numbers.
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -185,63 +185,85 @@ def _angle_diff(a: float, b: float) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fit_drone_correction(
-    est_pts:        np.ndarray,   # (N, 2)
-    gt_pts:         np.ndarray,   # (N, 2)
-    drone_rolls:    np.ndarray,   # (N,) map-frame roll  [rad]
-    drone_pitches:  np.ndarray,   # (N,) map-frame pitch [rad]
-    drone_yaws:     np.ndarray,   # (N,) map-frame yaw   [rad]
-    cond_thresh:    float = 200.0,
+    est_pts:        np.ndarray,        # (N, 2)
+    gt_pts:         np.ndarray,        # (N, 2)
+    drone_rolls:    np.ndarray,        # (N,) map-frame roll  [rad]
+    drone_pitches:  np.ndarray,        # (N,) map-frame pitch [rad]
+    drone_yaws:     np.ndarray,        # (N,) map-frame yaw   [rad]
+    cond_thresh:    float = 30.0,
+    max_cam_offset_m: float = 0.30,
+    max_map_offset_m: float = 5.00,
 ) -> tuple:
     """
-    Fit the 5-parameter physical model via least squares:
+    4-parameter, physically-bounded correction model:
 
-        correction_x = c_x + R[0,0]*dx_d + R[0,1]*dy_d + R[0,2]*dz_d
-        correction_y = c_y + R[1,0]*dx_d + R[1,1]*dy_d + R[1,2]*dz_d
+        correction_x = c_x  +  R[0,0]*dx_d  +  R[0,1]*dy_d
+        correction_y = c_y  +  R[1,0]*dx_d  +  R[1,1]*dy_d
 
-    where R = euler_zyx_to_R(roll, pitch, yaw)  (drone attitude in map frame).
+    dz_d is intentionally excluded: its xy contribution is R[0,2]*dz =
+    sin(pitch)*dz, which is near-zero for a near-level drone.  Including it
+    makes the (2N×3) R-block near-singular and causes lstsq to produce
+    physically impossible metre-scale "corrections".
 
-    Design matrix A is (2N × 5) for parameters [c_x, c_y, dx_d, dy_d, dz_d].
+    Bounds enforced via scipy.optimize.lsq_linear:
+        |c_x|, |c_y|   <= max_map_offset_m  (default 5 m)
+        |dx_d|, |dy_d| <= max_cam_offset_m  (default 0.30 m)
 
-    Degeneracy: if the SVD condition number of the (2N × 3) attitude-block
-    (columns 2–4) exceeds cond_thresh, the attitude diversity is insufficient
-    to separate dx_d/dy_d/dz_d and the fit falls back to a pure constant
-    offset (dx_d = dy_d = dz_d = 0).
+    Degeneracy threshold tightened to 30 (was 200): above this the R-block
+    is too ill-conditioned to separate dx_d/dy_d from c_x/c_y.
 
-    Returns (c_x, c_y, dx_d, dy_d, dz_d, degenerate: bool).
+    Returns (c_x, c_y, dx_d, dy_d, degenerate: bool).
     """
-    errors = gt_pts - est_pts   # (N, 2)
+    errors = gt_pts - est_pts
     n = len(est_pts)
 
-    A = np.zeros((2 * n, 5))
+    A = np.zeros((2 * n, 4))
     b = np.zeros(2 * n)
     for i, (roll, pitch, yaw) in enumerate(
             zip(drone_rolls, drone_pitches, drone_yaws)):
-        R   = euler_zyx_to_R(roll, pitch, yaw)
-        row = R[:2, :]          # (2, 3) — rows 0,1 of rotation matrix
-        A[2*i,   0] = 1.0;  A[2*i,   2:5] = row[0]   # x equation
-        A[2*i+1, 1] = 1.0;  A[2*i+1, 2:5] = row[1]   # y equation
+        R = euler_zyx_to_R(roll, pitch, yaw)
+        A[2*i,   0] = 1.0;  A[2*i,   2] = R[0, 0];  A[2*i,   3] = R[0, 1]
+        A[2*i+1, 1] = 1.0;  A[2*i+1, 2] = R[1, 0];  A[2*i+1, 3] = R[1, 1]
         b[2*i  ] = errors[i, 0]
         b[2*i+1] = errors[i, 1]
 
-    # Degeneracy check on the attitude-dependent sub-block (cols 2-4)
     _, sv, _ = np.linalg.svd(A[:, 2:], full_matrices=False)
     cond = sv[0] / max(sv[-1], 1e-12)
     degenerate = bool(cond > cond_thresh)
 
     if degenerate:
-        # Only constant offset is observable; drone-frame terms are zero.
-        c_x = float(np.mean(errors[:, 0]))
-        c_y = float(np.mean(errors[:, 1]))
-        return c_x, c_y, 0.0, 0.0, 0.0, True
+        c_x = float(np.clip(np.mean(errors[:, 0]), -max_map_offset_m, max_map_offset_m))
+        c_y = float(np.clip(np.mean(errors[:, 1]), -max_map_offset_m, max_map_offset_m))
+        return c_x, c_y, 0.0, 0.0, True
 
-    params, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    lo = np.array([-max_map_offset_m, -max_map_offset_m,
+                   -max_cam_offset_m,  -max_cam_offset_m])
+    hi = np.array([ max_map_offset_m,  max_map_offset_m,
+                    max_cam_offset_m,   max_cam_offset_m])
+
+    try:
+        from scipy.optimize import lsq_linear
+        res = lsq_linear(A, b, bounds=(lo, hi), method="bvls")
+        params = res.x
+    except ImportError:
+        params, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        params = np.clip(params, lo, hi)
+
+    for name, val, bound in [("c_x",  params[0], max_map_offset_m),
+                              ("c_y",  params[1], max_map_offset_m),
+                              ("dx_d", params[2], max_cam_offset_m),
+                              ("dy_d", params[3], max_cam_offset_m)]:
+        if abs(abs(val) - bound) < 1e-4:
+            print(f"  [WARN] {name} hit its physical bound ({val:+.4f} m). "
+                  f"Check GT accuracy and/or increase --max-cam-offset.")
+
     return (float(params[0]), float(params[1]),
-            float(params[2]), float(params[3]), float(params[4]),
+            float(params[2]), float(params[3]),
             False)
 
 
 def _apply_drone_correction(
-    c_x: float, c_y: float, dx_d: float, dy_d: float, dz_d: float,
+    c_x: float, c_y: float, dx_d: float, dy_d: float,
     est_pts:        np.ndarray,
     drone_rolls:    np.ndarray,
     drone_pitches:  np.ndarray,
@@ -251,13 +273,13 @@ def _apply_drone_correction(
     gt_thetas:  "np.ndarray | None" = None,
     delta_yaw:  float = 0.0,
 ):
-    """Apply correction and compute per-point errors."""
-    dt = np.array([dx_d, dy_d, dz_d])
+    """Apply 4-parameter correction and compute per-point errors."""
+    dt_xy = np.array([dx_d, dy_d])
     corrected = np.zeros((len(est_pts), 2))
     for i, (roll, pitch, yaw) in enumerate(
             zip(drone_rolls, drone_pitches, drone_yaws)):
         R = euler_zyx_to_R(roll, pitch, yaw)
-        delta_xy = np.array([c_x, c_y]) + R[:2, :] @ dt
+        delta_xy = np.array([c_x, c_y]) + R[:2, :2] @ dt_xy
         corrected[i] = est_pts[i] + delta_xy
 
     pos_errors = np.array([np.linalg.norm(c - g)
@@ -412,9 +434,14 @@ def main():
     ap.add_argument("--out", default="corrected_transforms.yaml")
     ap.add_argument("--k-folds", type=int, default=0, metavar="K",
                     help="Cross-validation folds (default: leave-one-out).")
-    ap.add_argument("--cond-thresh", type=float, default=200.0, dest="cond_thresh",
+    ap.add_argument("--cond-thresh", type=float, default=30.0, dest="cond_thresh",
                     help="SVD condition-number threshold for degeneracy detection "
-                         "(default: 200). Lower = stricter attitude-diversity requirement.")
+                         "(default: 30). Above this the fit falls back to constant-only.")
+    ap.add_argument("--max-cam-offset", type=float, default=0.30, dest="max_cam_offset",
+                    help="Physical bound on |dx_d|, |dy_d| [m] (default: 0.30). "
+                         "Increase only if calibrate_extrinsics left a known large residual.")
+    ap.add_argument("--max-map-offset", type=float, default=5.00, dest="max_map_offset",
+                    help="Physical bound on |c_x|, |c_y| [m] (default: 5.00).")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -519,9 +546,9 @@ def main():
                 print("  [SKIP] no training data for this fold.")
                 continue
 
-            c_x, c_y, dx_d, dy_d, dz_d, degen = _fit_drone_correction(
+            c_x, c_y, dx_d, dy_d, degen        = _fit_drone_correction(
                 tr_est, tr_gt, tr_rolls, tr_pitches, tr_yaws,
-                args.cond_thresh,
+                args.cond_thresh, args.max_cam_offset, args.max_map_offset,
             )
             delta_yaw = 0.0
             if tr_eth is not None and tr_gth is not None:
@@ -529,8 +556,7 @@ def main():
 
             note = " (degenerate — constant offset only)" if degen else ""
             print(f"  Fitted: c_x={c_x*100:+.2f} cm  c_y={c_y*100:+.2f} cm  "
-                  f"dx_d={dx_d*100:+.2f} cm  dy_d={dy_d*100:+.2f} cm  "
-                  f"dz_d={dz_d*100:+.2f} cm{note}")
+                  f"dx_d={dx_d*100:+.2f} cm  dy_d={dy_d*100:+.2f} cm{note}")
             if tr_eth is not None:
                 print(f"          Δyaw={math.degrees(delta_yaw):+.3f}°")
 
@@ -543,7 +569,7 @@ def main():
                 continue
 
             pos_err, corr, ang_err_deg = _apply_drone_correction(
-                c_x, c_y, dx_d, dy_d, dz_d,
+                c_x, c_y, dx_d, dy_d,
                 te_est, te_rolls, te_pitches, te_yaws, te_gt,
                 te_eth, te_gth, delta_yaw,
             )
@@ -564,7 +590,6 @@ def main():
                     "c_y_m":      round(float(c_y),   6),
                     "dx_drone_m": round(float(dx_d),  6),
                     "dy_drone_m": round(float(dy_d),  6),
-                    "dz_drone_m": round(float(dz_d),  6),
                     "degenerate": degen,
                 },
                 "test_marker_ids":   te_mids,
@@ -640,9 +665,9 @@ def main():
         all_mids, all_est, all_gt, all_pids,
         pre_pos_err, drone_yaws=all_yaws)
 
-    c_x, c_y, dx_d, dy_d, dz_d, degen = _fit_drone_correction(
+    c_x, c_y, dx_d, dy_d, degen = _fit_drone_correction(
         all_est, all_gt, all_rolls, all_pitches, all_yaws,
-        args.cond_thresh,
+        args.cond_thresh, args.max_cam_offset, args.max_map_offset,
     )
     delta_yaw = 0.0
     if all_eth is not None and all_gth is not None:
@@ -650,17 +675,16 @@ def main():
 
     print(f"\nCorrection (all pairs):")
     print(f"  Map-frame static  :  c_x={c_x*100:+.2f} cm   c_y={c_y*100:+.2f} cm")
-    print(f"  Drone-frame trans :  dx_d={dx_d*100:+.2f} cm  dy_d={dy_d*100:+.2f} cm  "
-          f"dz_d={dz_d*100:+.2f} cm")
+    print(f"  Drone-frame trans :  dx_d={dx_d*100:+.2f} cm  dy_d={dy_d*100:+.2f} cm")
     if all_eth is not None:
         print(f"  Angular offset    :  Δyaw={math.degrees(delta_yaw):+.3f}°")
     if degen:
         print("  [WARN] Attitude diversity insufficient (cond > threshold) — "
-              "dx_d/dy_d/dz_d set to 0; only c_x/c_y fitted.  "
-              "Add dynamic flights with varied headings/attitudes to fix this.")
+              "dx_d/dy_d set to 0; only c_x/c_y fitted.  "
+              "Add dynamic flights with varied yaw to fix this.")
 
     post_pos_err, corrected, post_ang_err = _apply_drone_correction(
-        c_x, c_y, dx_d, dy_d, dz_d,
+        c_x, c_y, dx_d, dy_d,
         all_est, all_rolls, all_pitches, all_yaws, all_gt,
         all_eth, all_gth, delta_yaw)
     _print_residuals(
@@ -686,7 +710,7 @@ def main():
 
     old_dfc = _parse_static(cfg_p, "T_drone_from_cam")
     new_dfc = StaticTransform6DoF(
-        x=old_dfc.x + dx_d, y=old_dfc.y + dy_d, z=old_dfc.z + dz_d,
+        x=old_dfc.x + dx_d, y=old_dfc.y + dy_d, z=old_dfc.z,   # z unchanged: dz_d excluded from model
         roll=old_dfc.roll, pitch=old_dfc.pitch, yaw=old_dfc.yaw + delta_yaw,
     )
 
@@ -713,7 +737,6 @@ def main():
             "c_y_m":          round(float(c_y),  6),
             "dx_drone_m":     round(float(dx_d), 6),
             "dy_drone_m":     round(float(dy_d), 6),
-            "dz_drone_m":     round(float(dz_d), 6),
             "delta_yaw_deg":  round(math.degrees(delta_yaw), 4),
             "degenerate_attitude": degen,
         },
