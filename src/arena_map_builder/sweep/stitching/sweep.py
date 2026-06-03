@@ -44,7 +44,7 @@ from action_msgs.msg import GoalStatus
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
-from run_matrix_v2 import RUNS
+from run_matrix_v3 import RUNS
 
 from arena_map_builder_msgs.action import BuildArenaMap
 
