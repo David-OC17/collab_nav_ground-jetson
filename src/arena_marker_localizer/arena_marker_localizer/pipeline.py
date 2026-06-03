@@ -31,7 +31,7 @@ from .quality          import QualityConfig, frame_passes
 from .optitrack        import DronePose, load_optitrack_csv
 from .transforms       import (
     StaticTransform6DoF, OptiTrackAxisConfig,
-    opti_transform_from_pose, marker_in_map,
+    compose_T, marker_in_map,
     R_to_euler_zyx,
 )
 from .marker_detection import (
@@ -94,9 +94,8 @@ class PipelineConfig:
     # ── Velocity gate ─────────────────────────────────────────────────
     max_drone_velocity_m_s: float = 0.0
     """Drop frames where the drone speed exceeds this threshold [m/s].
-    0.0 = disabled.  With full-pose CSVs, pitch/roll are now properly
-    modelled so this gate is less critical but still useful for
-    reducing motion-blur observations."""
+    0.0 = disabled.  With quaternion CSVs, attitude is always exact;
+    this gate is useful mainly for reducing motion-blur observations."""
 
     # ── Diagnostics ────────────────────────────────────────────────────
     verbose: bool = False
@@ -227,12 +226,9 @@ def run_pipeline(
         if not detections:
             return {"kind": "no_marker"}
 
-        # Full-pose drone transform (uses roll/pitch when available;
-        # gracefully falls back to yaw-only when they are 0.0).
-        T_opti_drone = opti_transform_from_pose(
-            dp.pos_xyz, dp.roll_rad, dp.pitch_rad, dp.yaw_rad,
-            cfg.optitrack_axis,
-        )
+        # Drone pose in OptiTrack frame — R_body built from quaternion in
+        # optitrack.py; no Euler conversion or singularity risk here.
+        T_opti_drone = compose_T(dp.pos_xyz, dp.R_body)
 
         # Drone attitude in MAP frame — stored per-observation so
         # calibrate_bias can build the full rotation design matrix.

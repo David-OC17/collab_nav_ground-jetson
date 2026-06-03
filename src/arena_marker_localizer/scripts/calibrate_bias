@@ -6,29 +6,33 @@ Runs the full localisation pipeline on one or more (video, CSV, GT-YAML) triplet
 compares estimated marker positions/headings against ground truth, and fits a
 physically-motivated correction model.
 
-Physical model (5-parameter, full-pose)
-────────────────────────────────────────
+Physical model (5-parameter)
+────────────────────────────
 A translation error [dx_d, dy_d, dz_d] in drone body frame (i.e. an error
 in T_drone_from_cam) manifests in map frame as:
 
     correction_xy(R) = [c_x, c_y]  +  R_map_from_drone[:2, :] @ [dx_d, dy_d, dz_d]
 
-where R_map_from_drone = euler_zyx_to_R(mean_roll, mean_pitch, mean_yaw)
-is built from the circular-mean drone attitude IN THE MAP FRAME recorded
-across each marker's inlier observations.
+where R_map_from_drone is the mean drone attitude in the MAP FRAME (extracted
+from the composed rotation matrix, not from raw CSV angles — so it works
+correctly regardless of whether the CSV stores quaternions or Euler angles).
 
-This is a linear system in [c_x, c_y, dx_d, dy_d, dz_d] that is assembled
-as a (2N × 5) least-squares problem.  All three body-frame translation
-components are jointly observable when the drone visits a range of attitudes
-(varied yaw AND pitch/roll variation from dynamic flight).
+This is a linear system in [c_x, c_y, dx_d, dy_d, dz_d] assembled as a
+(2N × 5) least-squares problem.  All three body-frame translation components
+are jointly observable when the drone visits a range of attitudes (varied yaw
+AND pitch/roll variation from dynamic flight).
+
+Note: calibrate_bias_v2 uses a 4-parameter bounded model (drops dz_d which
+contributes negligibly to XY error for a near-level drone) and is preferred
+for new data.  This script is retained for reference and backward compat.
 
 Degeneracy detection
 ────────────────────
-Instead of the old "> 15° yaw-range" heuristic, degeneracy is now detected
-via the SVD condition number of the (2N × 3) attitude-dependent sub-block
-(columns 2–4 of the design matrix).  A condition number above the threshold
-(default 200) means the attitude diversity is insufficient to separate
-dx_d / dy_d / dz_d, and the fit falls back to a 2-parameter constant offset.
+Detected via the SVD condition number of the (2N × 3) attitude-dependent
+sub-block (columns 2–4 of the design matrix).  A condition number above the
+threshold (default 200) means the attitude diversity is insufficient to
+separate dx_d / dy_d / dz_d, and the fit falls back to a 2-parameter constant
+offset.
 
 Angular correction (Δyaw)
 ─────────────────────────
@@ -56,14 +60,20 @@ Ground-truth YAML format
       y: 1.500
       theta: 0
 
+CSV format compatibility
+────────────────────────
+The pipeline auto-detects the CSV format (quaternion / full-pose Euler /
+yaw-only legacy).  Drone attitude used in the correction model is extracted
+from the composed map-frame rotation matrix after the pipeline runs, so all
+three formats produce correct results.
+
 Notes
 ─────
-- Dynamic flights (scan18, scan19, ...) with full-pose CSVs provide attitude
-  diversity that breaks the degeneracy encountered with yaw-only data.
-- Static scans (with the drone at rest) contribute clean, low-noise marker
-  observations; their attitude diversity is necessarily zero, so they inform
-  the constant offset (c_x, c_y) but not dx_d/dy_d/dz_d.
-- Re-run this script whenever T_drone_from_cam or marker size changes.
+- Dynamic flights provide attitude diversity that breaks the degeneracy
+  encountered with yaw-only data.
+- Static scans contribute clean observations but zero attitude diversity; they
+  inform (c_x, c_y) but not dx_d/dy_d/dz_d.
+- Re-run whenever T_drone_from_cam or marker size changes.
 """
 
 import argparse
@@ -104,7 +114,8 @@ def _parse_static(p: dict, prefix: str) -> StaticTransform6DoF:
     )
 
 
-def _build_pipeline_config(p: dict, intrinsics_path: str) -> PipelineConfig:
+def _build_pipeline_config(p: dict, intrinsics_path: str,
+                           verbose: bool = False) -> PipelineConfig:
     dicts = []
     for entry in p.get("dictionaries", ["DICT_4X4_50:0.135"]):
         name, size = entry.split(":")
@@ -144,6 +155,7 @@ def _build_pipeline_config(p: dict, intrinsics_path: str) -> PipelineConfig:
         resolution_m_per_cell=res,
         grid_width_cells=math.ceil(float(arena.get("width_m", 4.0)) / res),
         grid_height_cells=math.ceil(float(arena.get("height_m", 4.0)) / res),
+        verbose=verbose,
     )
 
 
@@ -436,7 +448,7 @@ def main():
     if not intrinsics_path:
         sys.exit("ERROR: intrinsics_path not set in config; pass --intrinsics.")
 
-    pipeline_cfg = _build_pipeline_config(cfg_p, intrinsics_path)
+    pipeline_cfg = _build_pipeline_config(cfg_p, intrinsics_path, args.verbose)
 
     # ── Ground truth ────────────────────────────────────────────────────
     per_pair_gts = []

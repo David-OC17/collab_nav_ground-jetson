@@ -6,14 +6,17 @@ For each row in the input CSV the script computes:
 
     T_opti_from_cam = T_opti_from_drone(row)  @  T_drone_from_cam
 
-and writes the resulting camera position (x, y, z) and yaw back to the
-same CSV format.  This is useful to pre-bake the extrinsic calibration so
-that the pipeline can be run with T_drone_from_cam = identity.
+and writes the resulting camera position (x, y, z) and orientation back to
+the same CSV format.  This is useful to pre-bake the extrinsic calibration
+so that the pipeline can be run with T_drone_from_cam = identity.
 
-Input CSV format  (produced by pos_controller_node / record_scan):
-    timestamp_sec,frame_id,pos_x,pos_y,pos_z,yaw
+Input CSV format (produced by pos_controller_node / record_scan):
+    timestamp_sec,frame_id,pos_x,pos_y,pos_z,yaw                 (legacy)
+    timestamp_sec,frame_id,pos_x,pos_y,pos_z,yaw,pitch,roll      (full-pose)
 
-Output: <input_dir>/telemetry-transformed.csv  (same format)
+Output: <input_dir>/telemetry-transformed.csv
+    Full-pose input  → full-pose output (yaw,pitch,roll preserved)
+    Legacy yaw-only  → legacy yaw-only output
 
 Usage:
     transform_telemetry --csv telemetry.csv \\
@@ -52,6 +55,48 @@ def _euler_zyx_to_R(roll: float, pitch: float, yaw: float) -> np.ndarray:
 def _R_to_yaw(R: np.ndarray) -> float:
     """Extract the yaw (Z-axis rotation) from a ZYX rotation matrix."""
     return math.atan2(R[1, 0], R[0, 0])
+
+
+def _R_to_euler_zyx(R: np.ndarray) -> tuple:
+    """Decompose ZYX rotation matrix to (roll, pitch, yaw) in radians."""
+    sp = max(-1.0, min(1.0, -R[2, 0]))
+    pitch = math.asin(sp)
+    if abs(sp) > 0.999999:
+        roll = math.atan2(-R[1, 2], R[1, 1])
+        yaw  = 0.0
+    else:
+        roll = math.atan2(R[2, 1], R[2, 2])
+        yaw  = math.atan2(R[1, 0], R[0, 0])
+    return roll, pitch, yaw
+
+
+def _quaternion_to_R(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Unit quaternion (x,y,z,w) → 3×3 rotation matrix."""
+    x2, y2, z2 = qx*qx, qy*qy, qz*qz
+    xy, xz, yz = qx*qy, qx*qz, qy*qz
+    wx, wy, wz = qw*qx, qw*qy, qw*qz
+    return np.array([
+        [1-2*(y2+z2), 2*(xy-wz),   2*(xz+wy)],
+        [2*(xy+wz),   1-2*(x2+z2), 2*(yz-wx)],
+        [2*(xz-wy),   2*(yz+wx),   1-2*(x2+y2)],
+    ], dtype=np.float64)
+
+
+def _R_to_quaternion(R: np.ndarray) -> tuple:
+    """3×3 rotation matrix → (x, y, z, w) quaternion."""
+    t = R[0,0] + R[1,1] + R[2,2]
+    if t > 0:
+        s = math.sqrt(t + 1.0) * 2
+        return (R[2,1]-R[1,2])/s, (R[0,2]-R[2,0])/s, (R[1,0]-R[0,1])/s, 0.25*s
+    elif R[0,0] > R[1,1] and R[0,0] > R[2,2]:
+        s = math.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2]) * 2
+        return 0.25*s, (R[0,1]+R[1,0])/s, (R[0,2]+R[2,0])/s, (R[2,1]-R[1,2])/s
+    elif R[1,1] > R[2,2]:
+        s = math.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2]) * 2
+        return (R[0,1]+R[1,0])/s, 0.25*s, (R[1,2]+R[2,1])/s, (R[0,2]-R[2,0])/s
+    else:
+        s = math.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1]) * 2
+        return (R[0,2]+R[2,0])/s, (R[1,2]+R[2,1])/s, 0.25*s, (R[1,0]-R[0,1])/s
 
 
 def _make_T(x: float, y: float, z: float, R: np.ndarray) -> np.ndarray:
@@ -98,9 +143,20 @@ def main() -> None:
     rows_in = rows_out = 0
     with open(args.csv, newline="") as fin, open(out_path, "w", newline="") as fout:
         reader = csv.DictReader(fin)
+        fieldnames = set(reader.fieldnames or [])
+        has_quat  = {"qx", "qy", "qz", "qw"}.issubset(fieldnames)
+        full_euler = "roll" in fieldnames and "pitch" in fieldnames
+
         writer = csv.writer(fout)
-        writer.writerow(["timestamp_sec", "frame_id",
-                         "pos_x", "pos_y", "pos_z", "yaw"])
+        if has_quat:
+            writer.writerow(["timestamp_sec", "frame_id",
+                             "pos_x", "pos_y", "pos_z", "qx", "qy", "qz", "qw"])
+        elif full_euler:
+            writer.writerow(["timestamp_sec", "frame_id",
+                             "pos_x", "pos_y", "pos_z", "yaw", "pitch", "roll"])
+        else:
+            writer.writerow(["timestamp_sec", "frame_id",
+                             "pos_x", "pos_y", "pos_z", "yaw"])
 
         for row in reader:
             rows_in += 1
@@ -110,25 +166,46 @@ def main() -> None:
                 px       = float(row["pos_x"])
                 py       = float(row["pos_y"])
                 pz       = float(row["pos_z"])
-                drone_yaw = float(row["yaw"])
+
+                if has_quat:
+                    qx, qy, qz, qw = (float(row["qx"]), float(row["qy"]),
+                                      float(row["qz"]), float(row["qw"]))
+                    n = (qx*qx + qy*qy + qz*qz + qw*qw) ** 0.5
+                    if n > 1e-9:
+                        qx, qy, qz, qw = qx/n, qy/n, qz/n, qw/n
+                    R_drone = _quaternion_to_R(qx, qy, qz, qw)
+                elif full_euler:
+                    R_drone = _euler_zyx_to_R(
+                        float(row["roll"]), float(row["pitch"]), float(row["yaw"]))
+                else:
+                    R_drone = _euler_zyx_to_R(0.0, 0.0, float(row["yaw"]))
             except (KeyError, ValueError) as e:
                 sys.exit(f"ERROR: malformed row {rows_in}: {e}")
 
-            # T_opti_from_drone uses yaw-only rotation (pitch=roll=0),
-            # matching the assumption in the pipeline.
-            T_opti_drone = _make_T(px, py, pz,
-                                   _euler_zyx_to_R(0.0, 0.0, drone_yaw))
-
-            T_opti_cam = T_opti_drone @ T_dfc
+            T_opti_cam = _make_T(px, py, pz, R_drone) @ T_dfc
 
             new_pos = T_opti_cam[:3, 3]
-            new_yaw = _R_to_yaw(T_opti_cam[:3, :3])
-
-            writer.writerow([
-                f"{t_sec:.3f}", frame_id,
-                f"{new_pos[0]:.3f}", f"{new_pos[1]:.3f}", f"{new_pos[2]:.3f}",
-                f"{new_yaw:.3f}",
-            ])
+            if has_quat:
+                nqx, nqy, nqz, nqw = _R_to_quaternion(T_opti_cam[:3, :3])
+                writer.writerow([
+                    f"{t_sec:.3f}", frame_id,
+                    f"{new_pos[0]:.6f}", f"{new_pos[1]:.6f}", f"{new_pos[2]:.6f}",
+                    f"{nqx:.6f}", f"{nqy:.6f}", f"{nqz:.6f}", f"{nqw:.6f}",
+                ])
+            elif full_euler:
+                new_roll, new_pitch, new_yaw = _R_to_euler_zyx(T_opti_cam[:3, :3])
+                writer.writerow([
+                    f"{t_sec:.3f}", frame_id,
+                    f"{new_pos[0]:.6f}", f"{new_pos[1]:.6f}", f"{new_pos[2]:.6f}",
+                    f"{new_yaw:.6f}", f"{new_pitch:.6f}", f"{new_roll:.6f}",
+                ])
+            else:
+                new_yaw = _R_to_yaw(T_opti_cam[:3, :3])
+                writer.writerow([
+                    f"{t_sec:.3f}", frame_id,
+                    f"{new_pos[0]:.3f}", f"{new_pos[1]:.3f}", f"{new_pos[2]:.3f}",
+                    f"{new_yaw:.3f}",
+                ])
             rows_out += 1
 
     print(f"Transformed {rows_out}/{rows_in} rows")

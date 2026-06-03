@@ -115,6 +115,18 @@ def R_to_euler_zyx(R: np.ndarray) -> Tuple[float, float, float]:
     return roll, pitch, yaw
 
 
+def quaternion_to_R(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Convert a unit quaternion (x, y, z, w) to a 3x3 rotation matrix."""
+    x2, y2, z2 = qx*qx, qy*qy, qz*qz
+    xy, xz, yz = qx*qy, qx*qz, qy*qz
+    wx, wy, wz = qw*qx, qw*qy, qw*qz
+    return np.array([
+        [1 - 2*(y2+z2),  2*(xy - wz),   2*(xz + wy)],
+        [  2*(xy + wz),  1 - 2*(x2+z2), 2*(yz - wx)],
+        [  2*(xz - wy),  2*(yz + wx),   1 - 2*(x2+y2)],
+    ], dtype=np.float64)
+
+
 def R_to_quaternion(R: np.ndarray) -> Tuple[float, float, float, float]:
     """Convert a 3x3 rotation matrix to (x, y, z, w) quaternion."""
     t = R[0, 0] + R[1, 1] + R[2, 2]

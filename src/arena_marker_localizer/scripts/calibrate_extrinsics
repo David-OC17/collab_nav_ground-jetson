@@ -92,7 +92,7 @@ from arena_marker_localizer.marker_detection import MultiDictDetector, Dictionar
 from arena_marker_localizer.optitrack        import load_optitrack_csv
 from arena_marker_localizer.transforms       import (
     StaticTransform6DoF, OptiTrackAxisConfig,
-    opti_transform_from_pose, R_to_euler_zyx,
+    compose_T, R_to_euler_zyx, R_to_quaternion,
 )
 
 
@@ -189,58 +189,58 @@ def _collect_detections(video_path: str,
 # Drone pose from CSV (drone must be static — average all rows)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _circ_mean(angles: list) -> float:
-    """Circular mean of a list of angles in radians."""
-    return math.atan2(
-        sum(math.sin(a) for a in angles) / len(angles),
-        sum(math.cos(a) for a in angles) / len(angles),
-    )
+def _mean_R_from_poses(drone_poses) -> np.ndarray:
+    """Average rotation matrices via quaternion mean (safe for static drone).
+
+    Collects (x,y,z,w) from each R_body, signs-aligns to the first sample to
+    avoid the q / -q ambiguity, then normalises the vector mean.  Valid when
+    all orientations are clustered tightly (< ~30° spread), which is always
+    true for a static calibration mount.
+    """
+    quats = np.array([R_to_quaternion(dp.R_body) for dp in drone_poses])  # (N,4)
+    # Flip any quaternion whose dot-product with the first is negative
+    signs = np.sign(quats @ quats[0])
+    signs[signs == 0] = 1.0
+    quats *= signs[:, None]
+    mean_q = quats.mean(axis=0)
+    mean_q /= np.linalg.norm(mean_q)
+    from arena_marker_localizer.transforms import quaternion_to_R
+    return quaternion_to_R(*mean_q)
 
 
 def _static_drone_pose(csv_path: str,
                        opti_cfg: OptiTrackAxisConfig,
                        verbose: bool = False) -> np.ndarray:
-    """Average all CSV rows and return T_opti_from_drone.
-
-    Uses the full ZYX rotation when the CSV contains 'roll' and 'pitch'
-    columns; falls back to yaw-only otherwise.
-    """
+    """Average all CSV rows and return T_opti_from_drone."""
     drone_poses = load_optitrack_csv(csv_path)
     if not drone_poses:
         sys.exit(f"ERROR: CSV is empty: {csv_path!r}")
 
-    mean_pos   = np.mean([dp.pos_xyz   for dp in drone_poses], axis=0)
-    mean_yaw   = _circ_mean([dp.yaw_rad   for dp in drone_poses])
-    mean_roll  = _circ_mean([dp.roll_rad  for dp in drone_poses])
-    mean_pitch = _circ_mean([dp.pitch_rad for dp in drone_poses])
-
-    has_full_pose = any(dp.roll_rad != 0.0 or dp.pitch_rad != 0.0
-                        for dp in drone_poses)
+    mean_pos = np.mean([dp.pos_xyz for dp in drone_poses], axis=0)
+    mean_R   = _mean_R_from_poses(drone_poses)
 
     if verbose:
         pos_std = np.std([dp.pos_xyz for dp in drone_poses], axis=0)
         status  = "OK" if pos_std.max() < 0.005 else "WARNING: drone may have moved"
+        roll_m, pitch_m, yaw_m = R_to_euler_zyx(mean_R)
         print(f"  Drone mean pos   : ({mean_pos[0]:.4f}, {mean_pos[1]:.4f}, "
               f"{mean_pos[2]:.4f})")
-        print(f"  Drone mean att.  : roll={math.degrees(mean_roll):.2f}°  "
-              f"pitch={math.degrees(mean_pitch):.2f}°  "
-              f"yaw={math.degrees(mean_yaw):.2f}°"
-              + ("  [full-pose]" if has_full_pose else "  [yaw-only legacy]"))
+        print(f"  Drone mean att.  : roll={math.degrees(roll_m):.2f}°  "
+              f"pitch={math.degrees(pitch_m):.2f}°  "
+              f"yaw={math.degrees(yaw_m):.2f}°")
         print(f"  Drone pos std    : ({pos_std[0]:.4f}, {pos_std[1]:.4f}, "
               f"{pos_std[2]:.4f})  [{status}]")
 
-        roll_std  = np.std([dp.roll_rad  for dp in drone_poses])
-        pitch_std = np.std([dp.pitch_rad for dp in drone_poses])
-        yaw_std   = np.std([dp.yaw_rad   for dp in drone_poses])
-        if max(roll_std, pitch_std, yaw_std) > math.radians(2.0):
-            print(f"  [WARN] Attitude std: roll={math.degrees(roll_std):.2f}°  "
-                  f"pitch={math.degrees(pitch_std):.2f}°  "
-                  f"yaw={math.degrees(yaw_std):.2f}°  "
+        # Attitude spread: convert each R_body to ZYX, check std
+        from arena_marker_localizer.transforms import R_to_euler_zyx as _r2e
+        angles = np.array([_r2e(dp.R_body) for dp in drone_poses])  # (N,3)
+        att_std = np.degrees(np.std(angles, axis=0))
+        if att_std.max() > 2.0:
+            print(f"  [WARN] Attitude std: roll={att_std[0]:.2f}°  "
+                  f"pitch={att_std[1]:.2f}°  yaw={att_std[2]:.2f}°  "
                   f"— drone may not be static during recording.")
 
-    return opti_transform_from_pose(
-        mean_pos, mean_roll, mean_pitch, mean_yaw, opti_cfg,
-    )
+    return compose_T(mean_pos, mean_R)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
