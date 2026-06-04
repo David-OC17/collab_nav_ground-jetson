@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+euler_to_quat.py  —  Convert a drone pose CSV from Euler angles to quaternions.
+
+Convention
+----------
+  Euler order : intrinsic ZYX  (yaw → pitch → roll), radians.
+  Quaternion  : scalar-first   [qw, qx, qy, qz].
+
+This is the standard aerospace / ROS convention produced by OptiTrack.
+
+Verified library versions
+-------------------------
+  numpy   1.21.5
+  scipy   1.8.0
+  pandas  2.0.3   ← highest version whose numpy floor (≥1.21.0 on Py3.10)
+                    still admits numpy 1.21.5; pandas 2.1+ requires ≥1.22.4
+  (Python 3.8 – 3.10 only; numpy 1.21.x and scipy 1.8.x both cap at <3.11)
+
+Usage
+-----
+  python euler_to_quat.py poses.csv                   # → poses_quat.csv
+  python euler_to_quat.py poses.csv -o custom_out.csv # explicit output path
+  python euler_to_quat.py poses.csv --verify          # round-trip check printed
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.spatial.transform import Rotation
+
+# --------------------------------------------------------------------------- #
+# Constants
+# --------------------------------------------------------------------------- #
+
+EULER_COLS = ["yaw", "pitch", "roll"]   # column names to replace
+QUAT_COLS  = ["qw", "qx", "qy", "qz"]  # replacement column names
+
+# scipy's from_euler 'ZYX' == intrinsic Z-first, i.e. yaw first.
+# Angles are passed as [yaw, pitch, roll] — order matches EULER_COLS.
+EULER_SEQ = "ZYX"
+
+# Quaternion components need more decimal places than the source Euler angles
+# to allow a faithful round-trip.  9 d.p. gives ~1e-9 rad residual, well
+# below the 1e-3 rad resolution that was stored in the original CSV.
+QUAT_DECIMALS = 9
+
+
+# --------------------------------------------------------------------------- #
+# Core conversion
+# --------------------------------------------------------------------------- #
+
+def euler_to_quaternion(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replace yaw / pitch / roll columns with qw / qx / qy / qz.
+
+    The insertion position in the DataFrame is preserved so that the
+    column order stays logical (pos_x, pos_y, pos_z, qw, qx, qy, qz).
+    """
+    angles = df[EULER_COLS].to_numpy(dtype=np.float64)  # (N, 3): yaw, pitch, roll
+
+    # Build Rotation objects — scipy expects [z, y, x] for intrinsic 'ZYX',
+    # which maps directly to [yaw, pitch, roll].
+    rot = Rotation.from_euler(EULER_SEQ, angles, degrees=False)
+
+    # as_quat() returns [x, y, z, w]; reorder to scalar-first [w, x, y, z].
+    q_xyzw = rot.as_quat()               # (N, 4)
+    q_wxyz = q_xyzw[:, [3, 0, 1, 2]]    # (N, 4)
+
+    quat_df = pd.DataFrame(q_wxyz, columns=QUAT_COLS, index=df.index)
+
+    # Record where the Euler block starts so we can slot quaternions in.
+    insert_at = df.columns.get_loc(EULER_COLS[0])
+
+    df_out = df.drop(columns=EULER_COLS)
+    for offset, col in enumerate(QUAT_COLS):
+        df_out.insert(insert_at + offset, col, quat_df[col])
+
+    return df_out
+
+
+# --------------------------------------------------------------------------- #
+# Precision-aware CSV writer
+# --------------------------------------------------------------------------- #
+
+def _detect_decimals(series: pd.Series) -> int:
+    """Return the maximum number of decimal places found in a numeric column."""
+    max_dp = 0
+    for val in series.dropna():
+        s = f"{val}"
+        if "." in s:
+            max_dp = max(max_dp, len(s.split(".")[1]))
+    return max_dp
+
+
+def to_csv_preserving_precision(df: pd.DataFrame,
+                                 path: Path,
+                                 source_df: pd.DataFrame) -> None:
+    """
+    Write `df` to CSV, keeping original column precisions where possible
+    and using QUAT_DECIMALS for the new quaternion columns.
+    """
+    # Build a per-column format string from the *source* data.
+    fmt: dict[str, str] = {}
+    for col in df.columns:
+        if col in QUAT_COLS:
+            fmt[col] = f"%.{QUAT_DECIMALS}f"
+        elif col in source_df.columns and pd.api.types.is_float_dtype(source_df[col]):
+            dp = _detect_decimals(source_df[col])
+            fmt[col] = f"%.{dp}f"
+
+    # Build formatted string columns so we control every value individually.
+    out = df.copy()
+    for col, spec in fmt.items():
+        out[col] = df[col].map(lambda v, s=spec: s % v)
+
+    out.to_csv(path, index=False)
+
+
+# --------------------------------------------------------------------------- #
+# Optional round-trip verification
+# --------------------------------------------------------------------------- #
+
+def verify_roundtrip(original_euler: np.ndarray,
+                     quaternions: np.ndarray) -> None:
+    """Convert quaternions back to Euler and print residuals."""
+    # quaternions are [w, x, y, z]; scipy wants [x, y, z, w]
+    q_xyzw = quaternions[:, [1, 2, 3, 0]]
+    recovered = Rotation.from_quat(q_xyzw).as_euler(EULER_SEQ, degrees=False)
+
+    residual = np.abs(original_euler - recovered)
+    print("\n[verify] Round-trip residuals (rad)  —  should be < 1e-7")
+    print(f"  max  : {residual.max():.2e}")
+    print(f"  mean : {residual.mean():.2e}")
+
+    labels = EULER_COLS
+    for i, label in enumerate(labels):
+        print(f"  {label:5s}: max {residual[:, i].max():.2e}")
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def build_output_path(input_path: Path) -> Path:
+    """Append '_quat' to the stem; never shadow the source file."""
+    return input_path.with_stem(input_path.stem + "_quat")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Convert Euler-angle pose CSV to quaternion pose CSV.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("input", type=Path,
+                   help="Source CSV file with yaw / pitch / roll columns (radians).")
+    p.add_argument("-o", "--output", type=Path, default=None,
+                   help="Destination CSV path (default: <input>_quat.csv).")
+    p.add_argument("--verify", action="store_true",
+                   help="Print round-trip residual statistics after conversion.")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    input_path: Path = args.input.resolve()
+    if not input_path.exists():
+        sys.exit(f"[ERROR] File not found: {input_path}")
+
+    output_path: Path = (
+        args.output.resolve() if args.output else build_output_path(input_path)
+    )
+    if output_path == input_path:
+        sys.exit("[ERROR] Output path must differ from input path. "
+                 "Use -o to specify a different destination.")
+
+    # ---- Read ------------------------------------------------------------ #
+    df = pd.read_csv(input_path)
+
+    missing = [c for c in EULER_COLS if c not in df.columns]
+    if missing:
+        sys.exit(f"[ERROR] Missing expected column(s): {missing}\n"
+                 f"        Found: {list(df.columns)}")
+
+    # Keep the raw Euler values for verification before we drop them.
+    euler_raw = df[EULER_COLS].to_numpy(dtype=np.float64)
+
+    # ---- Convert --------------------------------------------------------- #
+    df_out = euler_to_quaternion(df)
+
+    # ---- Optional round-trip check --------------------------------------- #
+    if args.verify:
+        quat_raw = df_out[QUAT_COLS].to_numpy(dtype=np.float64)
+        verify_roundtrip(euler_raw, quat_raw)
+
+    # ---- Write ----------------------------------------------------------- #
+    to_csv_preserving_precision(df_out, output_path, source_df=df)
+
+    print(f"\n[OK] {input_path.name}  →  {output_path.name}")
+    print(f"     Rows      : {len(df_out)}")
+    print(f"     Columns   : {list(df_out.columns)}")
+    print(f"     Convention: intrinsic ZYX (yaw→pitch→roll), scalar-first quat [qw qx qy qz]")
+
+
+if __name__ == "__main__":
+    main()
