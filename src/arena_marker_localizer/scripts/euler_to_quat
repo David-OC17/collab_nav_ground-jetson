@@ -5,7 +5,7 @@ euler_to_quat.py  —  Convert a drone pose CSV from Euler angles to quaternions
 Convention
 ----------
   Euler order : intrinsic ZYX  (yaw → pitch → roll), radians.
-  Quaternion  : scalar-first   [qw, qx, qy, qz].
+  Quaternion  : scalar-last    [qx, qy, qz, qw].
 
 This is the standard aerospace / ROS convention produced by OptiTrack.
 
@@ -37,7 +37,7 @@ from scipy.spatial.transform import Rotation
 # --------------------------------------------------------------------------- #
 
 EULER_COLS = ["yaw", "pitch", "roll"]   # column names to replace
-QUAT_COLS  = ["qw", "qx", "qy", "qz"]  # replacement column names
+QUAT_COLS  = ["qx", "qy", "qz", "qw"]  # replacement column names (scalar-last)
 
 # scipy's from_euler 'ZYX' == intrinsic Z-first, i.e. yaw first.
 # Angles are passed as [yaw, pitch, roll] — order matches EULER_COLS.
@@ -66,11 +66,10 @@ def euler_to_quaternion(df: pd.DataFrame) -> pd.DataFrame:
     # which maps directly to [yaw, pitch, roll].
     rot = Rotation.from_euler(EULER_SEQ, angles, degrees=False)
 
-    # as_quat() returns [x, y, z, w]; reorder to scalar-first [w, x, y, z].
-    q_xyzw = rot.as_quat()               # (N, 4)
-    q_wxyz = q_xyzw[:, [3, 0, 1, 2]]    # (N, 4)
+    # as_quat() returns [x, y, z, w] — already the target scalar-last order.
+    q = rot.as_quat()                    # (N, 4): [qx, qy, qz, qw]
 
-    quat_df = pd.DataFrame(q_wxyz, columns=QUAT_COLS, index=df.index)
+    quat_df = pd.DataFrame(q, columns=QUAT_COLS, index=df.index)
 
     # Record where the Euler block starts so we can slot quaternions in.
     insert_at = df.columns.get_loc(EULER_COLS[0])
@@ -127,9 +126,8 @@ def to_csv_preserving_precision(df: pd.DataFrame,
 def verify_roundtrip(original_euler: np.ndarray,
                      quaternions: np.ndarray) -> None:
     """Convert quaternions back to Euler and print residuals."""
-    # quaternions are [w, x, y, z]; scipy wants [x, y, z, w]
-    q_xyzw = quaternions[:, [1, 2, 3, 0]]
-    recovered = Rotation.from_quat(q_xyzw).as_euler(EULER_SEQ, degrees=False)
+    # quaternions are already [x, y, z, w] (scipy's native order)
+    recovered = Rotation.from_quat(quaternions).as_euler(EULER_SEQ, degrees=False)
 
     residual = np.abs(original_euler - recovered)
     print("\n[verify] Round-trip residuals (rad)  —  should be < 1e-7")
@@ -204,7 +202,7 @@ def main() -> None:
     print(f"\n[OK] {input_path.name}  →  {output_path.name}")
     print(f"     Rows      : {len(df_out)}")
     print(f"     Columns   : {list(df_out.columns)}")
-    print(f"     Convention: intrinsic ZYX (yaw→pitch→roll), scalar-first quat [qw qx qy qz]")
+    print(f"     Convention: intrinsic ZYX (yaw→pitch→roll), scalar-last quat [qx qy qz qw]")
 
 
 if __name__ == "__main__":

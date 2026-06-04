@@ -6,6 +6,18 @@ Runs the full localisation pipeline on one or more (video, CSV, GT-YAML) triplet
 compares estimated marker positions/headings against ground truth, and fits a
 physically-motivated correction model.
 
+Telemetry CSV formats (auto-detected by column names)
+──────────────────────────────────────────────────────
+Both formats are accepted and detected automatically:
+
+  Quaternion (preferred):
+    timestamp_sec,frame_id,pos_x,pos_y,pos_z,qx,qy,qz,qw
+
+  Full-pose Euler (legacy):
+    timestamp_sec,frame_id,pos_x,pos_y,pos_z,yaw,pitch,roll
+
+The detected format is printed for each CSV at startup.
+
 Physical model (5-parameter, full-pose)
 ────────────────────────────────────────
 A translation error [dx_d, dy_d, dz_d] in drone body frame (i.e. an error
@@ -67,6 +79,7 @@ Notes
 """
 
 import argparse
+import csv
 import math
 import os
 import sys
@@ -168,6 +181,23 @@ def _load_gt(path: str) -> dict:
             "theta_rad": math.radians(float(theta_raw)) if theta_raw is not None else None,
         }
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV format detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_csv_format(path: str) -> str:
+    """Return a short label for the telemetry format detected in *path*."""
+    with open(path, newline="") as f:
+        cols = set(csv.DictReader(f).fieldnames or [])
+    if {"qx", "qy", "qz", "qw"}.issubset(cols):
+        return "quaternion (qx,qy,qz,qw)"
+    if "roll" in cols and "pitch" in cols:
+        return "full-pose Euler (roll,pitch,yaw)"
+    if "yaw" in cols:
+        return "yaw-only / legacy"
+    return "unknown"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,7 +454,9 @@ def main():
     ap.add_argument("--video", required=True, action="append", dest="videos",
                     metavar="VIDEO")
     ap.add_argument("--csv", required=True, action="append", dest="csvs",
-                    metavar="CSV")
+                    metavar="CSV",
+                    help="OptiTrack telemetry CSV.  Auto-detects format: "
+                         "quaternion (qx,qy,qz,qw) or full-pose Euler (roll,pitch,yaw).")
     ap.add_argument("--gt", required=True, action="append", dest="gts",
                     metavar="GT",
                     help="Ground-truth YAML.  One per --video (same order), "
@@ -486,7 +518,9 @@ def main():
     per_pair_results: list[dict] = []
 
     for idx, (video_path, csv_path, _) in enumerate(pairs):
+        fmt = _detect_csv_format(csv_path)
         print(f"\n[{idx+1}/{n_pairs}] {video_path!r}")
+        print(f"  CSV format : {fmt}  ({csv_path!r})")
         try:
             results, _ = run_pipeline(video_path, csv_path, pipeline_cfg)
         except Exception as e:
