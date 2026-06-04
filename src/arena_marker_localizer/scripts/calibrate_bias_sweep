@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""
+calibrate_bias_sweep -- exhaustive training-subset search for ArUco bias calibration.
+
+Wraps calibrate_bias: runs the full pipeline on every provided (video, CSV, GT)
+pair, then tries every non-empty subset of those pairs as a calibration training
+set.  Each fitted correction is evaluated on ALL pairs (not just the held-out
+ones), and the results are ranked by whole-dataset RMS position error.
+
+Use this to identify which combination of scans generalises best to the entire
+dataset — especially useful when scans differ in drone attitude diversity
+(static vs. dynamic, different yaw ranges, etc.).
+
+For N input pairs this evaluates 2^N − 1 subset configurations.
+Practical limit: N ≤ 10.  Above that, prefer calibrate_bias with --k-folds.
+
+Usage
+─────
+  calibrate_bias_sweep \\
+      --video v1.mp4 --csv c1.csv --gt gt1.yaml \\
+      --video v2.mp4 --csv c2.csv --gt gt2.yaml \\
+      --video v3.mp4 --csv c3.csv --gt gt3.yaml \\
+      --config config/default.yaml              \\
+      --intrinsics config/calibration.yaml      \\
+      --out best_correction.yaml                \\
+      --top-k 8
+
+Output
+──────
+Ranked table printed to stdout (values in cm):
+
+  Rank | Train  | RMS all | RMS train | RMS OOS | c_x   c_y   dx_d   dy_d   dz_d | Degen
+  ─────────────────────────────────────────────────────────────────────────────────────────
+     1 |  [2,3] |   3.1   |    2.8    |   3.5   | ...
+     2 |  [1,3] |   3.4   |    3.1    |   3.9   | ...
+
+  RMS all   = evaluated on all N pairs (primary ranking metric).
+  RMS train = in-sample subset error.
+  RMS OOS   = out-of-sample subset error (pairs NOT in training set; n/a when
+              all pairs are used for training).
+
+The best correction (lowest RMS all) is written to --out in the same format
+as calibrate_bias, ready to paste into config/default.yaml.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import itertools
+import math
+import os
+import sys
+
+import numpy as np
+import yaml
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Import helper functions from calibrate_bias (same directory, no .py extension)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _import_calibrate_bias():
+    import importlib.machinery
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "calibrate_bias")
+    if not os.path.isfile(path):
+        sys.exit(f"ERROR: cannot find calibrate_bias at {path!r}")
+    # Scripts have no .py extension — supply the loader explicitly.
+    loader = importlib.machinery.SourceFileLoader("_calibrate_bias_impl", path)
+    spec   = importlib.util.spec_from_loader("_calibrate_bias_impl", loader)
+    mod    = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+_cb = _import_calibrate_bias()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Subset enumeration
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _all_nonempty_subsets(n: int):
+    """Yield all non-empty subsets of {0..n-1}, shortest first."""
+    for size in range(1, n + 1):
+        yield from itertools.combinations(range(n), size)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-subset evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _evaluate_subset(
+    train_ids: tuple,
+    all_ids:   list,
+    per_pair_results: list,
+    per_pair_gts:     list,
+    cond_thresh: float,
+) -> dict | None:
+    """
+    Fit correction on train_ids, evaluate on all_ids (and separately on
+    the out-of-sample subset).
+
+    Returns None when there are no common GT markers in the training set.
+    """
+    tr_est, tr_gt, _, _, tr_eth, tr_gth, tr_rolls, tr_pitches, tr_yaws = \
+        _cb._collect_fit_data(train_ids, per_pair_results, per_pair_gts)
+    if tr_est is None:
+        return None
+
+    c_x, c_y, dx_d, dy_d, dz_d, degen = _cb._fit_drone_correction(
+        tr_est, tr_gt, tr_rolls, tr_pitches, tr_yaws, cond_thresh)
+
+    delta_yaw = 0.0
+    if tr_eth is not None and tr_gth is not None:
+        delta_yaw = _cb._fit_angular_correction(tr_eth, tr_gth)
+
+    def _rms_for(ids):
+        est, gt, _, _, eth, gth, rolls, pitches, yaws = \
+            _cb._collect_fit_data(ids, per_pair_results, per_pair_gts)
+        if est is None:
+            return None
+        errs, _, _ = _cb._apply_drone_correction(
+            c_x, c_y, dx_d, dy_d, dz_d,
+            est, rolls, pitches, yaws, gt,
+            eth, gth, delta_yaw,
+        )
+        return math.sqrt(float(np.mean(errs ** 2)))
+
+    rms_all   = _rms_for(all_ids)
+    rms_train = _rms_for(list(train_ids))
+    oos_ids   = [i for i in all_ids if i not in set(train_ids)]
+    rms_oos   = _rms_for(oos_ids) if oos_ids else None
+
+    if rms_all is None:
+        return None
+
+    return {
+        "train_ids":  list(train_ids),
+        "rms_all":    rms_all,
+        "rms_train":  rms_train,
+        "rms_oos":    rms_oos,
+        "c_x":        c_x,
+        "c_y":        c_y,
+        "dx_d":       dx_d,
+        "dy_d":       dy_d,
+        "dz_d":       dz_d,
+        "delta_yaw":  delta_yaw,
+        "degenerate": degen,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reporting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pair_label(ids: list) -> str:
+    return "[" + ",".join(str(i + 1) for i in ids) + "]"
+
+
+def _print_table(rows: list, n_pairs: int) -> None:
+    hdr = (f"{'Rank':>4}  {'Train':^10}  "
+           f"{'RMS all':>8}  {'RMS train':>9}  {'RMS OOS':>8}  "
+           f"{'c_x':>7}  {'c_y':>7}  "
+           f"{'dx_d':>7}  {'dy_d':>7}  {'dz_d':>7}  Degen")
+    sep = "─" * len(hdr)
+    print("\n" + "═" * len(hdr))
+    print(hdr)
+    print(sep)
+    for rank, r in enumerate(rows, 1):
+        oos = f"{r['rms_oos']*100:6.1f}" if r["rms_oos"] is not None else "   n/a"
+        d   = "YES" if r["degenerate"] else " no"
+        print(
+            f"{rank:4d}  "
+            f"{_pair_label(r['train_ids']):^10}  "
+            f"{r['rms_all']*100:6.1f} cm  "
+            f"{r['rms_train']*100:7.1f} cm  "
+            f"{oos} cm  "
+            f"{r['c_x']*100:+6.1f}  "
+            f"{r['c_y']*100:+6.1f}  "
+            f"{r['dx_d']*100:+6.1f}  "
+            f"{r['dy_d']*100:+6.1f}  "
+            f"{r['dz_d']*100:+6.1f}  "
+            f"{d}"
+        )
+    print("═" * len(hdr))
+    print(f"  All values in cm.  RMS all = error on all {n_pairs} pairs "
+          f"(primary ranking metric).")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description=(
+            "Exhaustive training-subset search: fits the bias correction on every "
+            "non-empty subset of the provided pairs and ranks by all-pairs RMS."
+        )
+    )
+    ap.add_argument("--video", required=True, action="append", dest="videos")
+    ap.add_argument("--csv",   required=True, action="append", dest="csvs")
+    ap.add_argument("--gt",    required=True, action="append", dest="gts",
+                    help="One per --video, or a single file applied to all.")
+    ap.add_argument("--config",     required=True)
+    ap.add_argument("--intrinsics", default=None)
+    ap.add_argument("--out", default="best_correction.yaml",
+                    help="YAML to write the best correction to.")
+    ap.add_argument("--top-k", type=int, default=0, dest="top_k",
+                    help="Print only the top K rows in the table (0 = all).")
+    ap.add_argument("--cond-thresh", type=float, default=200.0, dest="cond_thresh",
+                    help="SVD condition-number threshold for degeneracy "
+                         "detection (default: 200).")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    n_pairs = len(args.videos)
+    if len(args.csvs) != n_pairs:
+        sys.exit("ERROR: --video and --csv counts must match.")
+    if len(args.gts) == 1:
+        gt_paths = args.gts * n_pairs
+    elif len(args.gts) == n_pairs:
+        gt_paths = args.gts
+    else:
+        sys.exit(f"ERROR: --gt count must be 1 or equal to {n_pairs}.")
+
+    n_configs = 2 ** n_pairs - 1
+    print(f"Pairs: {n_pairs}   Subset configurations to evaluate: {n_configs}")
+    if n_pairs > 10:
+        print(f"[WARN] {n_configs} configurations — consider --k-folds in "
+              f"calibrate_bias instead.")
+
+    # ── Config ────────────────────────────────────────────────────────────
+    cfg_p = _cb._load_ros_yaml(args.config)
+    intrinsics_path = args.intrinsics or str(cfg_p.get("intrinsics_path", ""))
+    if not intrinsics_path:
+        sys.exit("ERROR: intrinsics_path not set in config; pass --intrinsics.")
+
+    pipeline_cfg = _cb._build_pipeline_config(cfg_p, intrinsics_path, args.verbose)
+
+    # ── Ground truth ──────────────────────────────────────────────────────
+    per_pair_gts: list = []
+    for i, gt_path in enumerate(gt_paths):
+        gt = _cb._load_gt(gt_path)
+        if not gt:
+            sys.exit(f"ERROR: no markers in GT YAML: {gt_path!r}")
+        per_pair_gts.append(gt)
+        has_theta = sum(1 for v in gt.values() if v["theta_rad"] is not None)
+        print(f"GT [{i+1}] {gt_path!r}: {len(gt)} marker(s) "
+              f"{sorted(gt.keys())}  ({has_theta} with theta)")
+
+    # ── Run pipeline on every pair ────────────────────────────────────────
+    from arena_marker_localizer.pipeline import run_pipeline
+
+    per_pair_results: list = []
+    for idx, (video_path, csv_path) in enumerate(zip(args.videos, args.csvs)):
+        print(f"\n[{idx+1}/{n_pairs}] {video_path!r}")
+        try:
+            results, _ = run_pipeline(video_path, csv_path, pipeline_cfg)
+        except Exception as e:
+            print(f"  [WARN] pipeline failed: {e}  — skipping.")
+            per_pair_results.append({})
+            continue
+
+        pair_res: dict = {}
+        for mid, r in results.items():
+            xy = r.position_m[:2].copy()
+            pair_res[mid] = (
+                xy,
+                r.n_observations,
+                float(r.yaw_rad),
+                float(r.mean_obs_drone_roll_rad),
+                float(r.mean_obs_drone_pitch_rad),
+                float(r.mean_obs_drone_yaw_rad),
+            )
+            if args.verbose:
+                print(f"  Marker {mid:3d}: ({xy[0]:.3f}, {xy[1]:.3f})  "
+                      f"yaw={math.degrees(r.yaw_rad):.1f}°  "
+                      f"n={r.n_observations}")
+        per_pair_results.append(pair_res)
+
+    if all(not r for r in per_pair_results):
+        sys.exit("ERROR: pipeline produced no results from any video.")
+
+    # ── Exhaustive subset sweep ───────────────────────────────────────────
+    all_ids = list(range(n_pairs))
+    sweep_results: list = []
+
+    print(f"\nEvaluating {n_configs} training subset(s)...")
+    for subset in _all_nonempty_subsets(n_pairs):
+        entry = _evaluate_subset(
+            subset, all_ids,
+            per_pair_results, per_pair_gts,
+            args.cond_thresh,
+        )
+        if entry is not None:
+            sweep_results.append(entry)
+
+    if not sweep_results:
+        sys.exit("ERROR: no valid configurations found (no common GT markers).")
+
+    sweep_results.sort(key=lambda r: r["rms_all"])
+    best = sweep_results[0]
+
+    # ── Print ranked table ────────────────────────────────────────────────
+    top_k = args.top_k if args.top_k > 0 else None
+    _print_table(sweep_results[:top_k] if top_k else sweep_results, n_pairs)
+
+    print(f"\nBest training subset: {_pair_label(best['train_ids'])}")
+    print(f"  RMS (all pairs) : {best['rms_all']*100:.1f} cm")
+    print(f"  RMS (train)     : {best['rms_train']*100:.1f} cm")
+    if best["rms_oos"] is not None:
+        print(f"  RMS (OOS)       : {best['rms_oos']*100:.1f} cm")
+    print(f"  c_x={best['c_x']*100:+.2f} cm  c_y={best['c_y']*100:+.2f} cm  "
+          f"dx_d={best['dx_d']*100:+.2f} cm  "
+          f"dy_d={best['dy_d']*100:+.2f} cm  "
+          f"dz_d={best['dz_d']*100:+.2f} cm")
+    if best["delta_yaw"] != 0.0:
+        print(f"  Δyaw={math.degrees(best['delta_yaw']):+.3f}°")
+    if best["degenerate"]:
+        print("  [WARN] Degenerate fit — only constant offset applied.")
+
+    # ── Absorb best correction into transforms ────────────────────────────
+    from arena_marker_localizer.transforms import StaticTransform6DoF
+
+    c_x, c_y = best["c_x"], best["c_y"]
+    dx_d, dy_d, dz_d = best["dx_d"], best["dy_d"], best["dz_d"]
+    delta_yaw = best["delta_yaw"]
+
+    old_mfo = _cb._parse_static(cfg_p, "T_map_from_opti")
+    new_mfo = StaticTransform6DoF(
+        x=old_mfo.x + c_x, y=old_mfo.y + c_y, z=old_mfo.z,
+        roll=old_mfo.roll, pitch=old_mfo.pitch, yaw=old_mfo.yaw,
+    )
+    old_dfc = _cb._parse_static(cfg_p, "T_drone_from_cam")
+    new_dfc = StaticTransform6DoF(
+        x=old_dfc.x + dx_d, y=old_dfc.y + dy_d, z=old_dfc.z + dz_d,
+        roll=old_dfc.roll, pitch=old_dfc.pitch, yaw=old_dfc.yaw + delta_yaw,
+    )
+
+    out_data = {
+        "best_training_pairs": [i + 1 for i in best["train_ids"]],
+        "rms_all_pairs_m":     round(float(best["rms_all"]),   6),
+        "rms_train_m":         round(float(best["rms_train"]), 6),
+        "T_map_from_opti": {
+            "x":     round(float(new_mfo.x),     6),
+            "y":     round(float(new_mfo.y),     6),
+            "z":     round(float(new_mfo.z),     6),
+            "roll":  round(float(new_mfo.roll),  6),
+            "pitch": round(float(new_mfo.pitch), 6),
+            "yaw":   round(float(new_mfo.yaw),   6),
+        },
+        "T_drone_from_cam": {
+            "x":     round(float(new_dfc.x),     6),
+            "y":     round(float(new_dfc.y),     6),
+            "z":     round(float(new_dfc.z),     6),
+            "roll":  round(float(new_dfc.roll),  6),
+            "pitch": round(float(new_dfc.pitch), 6),
+            "yaw":   round(float(new_dfc.yaw),   6),
+        },
+        "correction_params": {
+            "c_x_m":               round(float(c_x),       6),
+            "c_y_m":               round(float(c_y),       6),
+            "dx_drone_m":          round(float(dx_d),      6),
+            "dy_drone_m":          round(float(dy_d),      6),
+            "dz_drone_m":          round(float(dz_d),      6),
+            "delta_yaw_deg":       round(math.degrees(delta_yaw), 4),
+            "degenerate_attitude": best["degenerate"],
+        },
+        "all_results": [
+            {
+                "train_pairs":  [i + 1 for i in r["train_ids"]],
+                "rms_all_cm":   round(float(r["rms_all"])   * 100, 3),
+                "rms_train_cm": round(float(r["rms_train"]) * 100, 3),
+                "rms_oos_cm":   (round(float(r["rms_oos"]) * 100, 3)
+                                 if r["rms_oos"] is not None else None),
+                "degenerate":   r["degenerate"],
+            }
+            for r in sweep_results
+        ],
+    }
+    with open(args.out, "w") as f:
+        yaml.dump(out_data, f, default_flow_style=False, sort_keys=False)
+
+    print(f"\nBest correction written to: {args.out!r}")
+    print("\nPaste both blocks into config/default.yaml:\n")
+    print(f"    T_map_from_opti:")
+    print(f"      x    : {new_mfo.x:.6f}")
+    print(f"      y    : {new_mfo.y:.6f}")
+    print(f"      z    : {new_mfo.z:.6f}")
+    print(f"      roll : {new_mfo.roll:.6f}   # {math.degrees(new_mfo.roll):.3f} deg")
+    print(f"      pitch: {new_mfo.pitch:.6f}   # {math.degrees(new_mfo.pitch):.3f} deg")
+    print(f"      yaw  : {new_mfo.yaw:.6f}   # {math.degrees(new_mfo.yaw):.3f} deg")
+    print(f"\n    T_drone_from_cam:")
+    print(f"      x    : {new_dfc.x:.6f}")
+    print(f"      y    : {new_dfc.y:.6f}")
+    print(f"      z    : {new_dfc.z:.6f}")
+    print(f"      roll : {new_dfc.roll:.6f}   # {math.degrees(new_dfc.roll):.3f} deg")
+    print(f"      pitch: {new_dfc.pitch:.6f}   # {math.degrees(new_dfc.pitch):.3f} deg")
+    print(f"      yaw  : {new_dfc.yaw:.6f}   # {math.degrees(new_dfc.yaw):.3f} deg\n")
+
+
+if __name__ == "__main__":
+    main()

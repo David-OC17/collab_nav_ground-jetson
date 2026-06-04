@@ -1,0 +1,60 @@
+summary:
+  n_folds: 2
+  total_test_points: 3
+  min_pos_error_m: 0.08667
+  mean_pos_error_m: 0.227477
+  max_pos_error_m: 0.322842
+  min_ang_error_deg: 7.2783
+  mean_ang_error_deg: 19.1452
+  max_ang_error_deg: 32.357
+folds:
+- fold: 1
+  train_pairs:
+  - 2
+  test_pairs:
+  - 1
+  fitted_correction:
+    c_x_m: -0.442842
+    c_y_m: -0.16038
+    dx_drone_m: -0.186524
+    dy_drone_m: 0.430859
+    dz_drone_m: 0.037418
+    degenerate: false
+    delta_yaw_deg: 168.1677
+  test_marker_ids:
+  - 1
+  - 3
+  test_pair_ids:
+  - 1
+  - 1
+  test_pos_errors_m:
+  - 0.08667
+  - 0.322842
+  rms_pos_m: 0.236367
+  test_ang_errors_deg:
+  - 17.8003
+  - 32.357
+  mean_ang_err_deg: 25.0786
+- fold: 2
+  train_pairs:
+  - 1
+  test_pairs:
+  - 2
+  fitted_correction:
+    c_x_m: -2.032464
+    c_y_m: 1.04167
+    dx_drone_m: -1.081293
+    dy_drone_m: -1.445128
+    dz_drone_m: 0.276819
+    degenerate: false
+    delta_yaw_deg: 160.8894
+  test_marker_ids:
+  - 1
+  test_pair_ids:
+  - 2
+  test_pos_errors_m:
+  - 0.272919
+  rms_pos_m: 0.272919
+  test_ang_errors_deg:
+  - 7.2783
+  mean_ang_err_deg: 7.2783

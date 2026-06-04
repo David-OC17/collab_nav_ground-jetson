@@ -118,13 +118,30 @@ src/arena_marker_localizer/scripts/calibrate_bias \
     --intrinsics src/arena_map_builder/data/drone_scans/scan18/calibration.yaml \
     --out        src/arena_marker_localizer/config/corrected_T_map_from_opti.yaml
 
-src/arena_marker_localizer/scripts/calibrate_bias_v2 \
-    --video  src/arena_map_builder/data/manual_scans/scan1/scan.mp4 \
-    --csv    src/arena_map_builder/data/manual_scans/scan1/telemetry.csv \
-    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan1.yaml \
+# src/arena_marker_localizer/scripts/calibrate_bias_v2 \
+src/arena_marker_localizer/scripts/calibrate_bias \
+    --video  src/arena_map_builder/data/drone_scans/scan18/scan.mp4 \
+    --csv    src/arena_map_builder/data/drone_scans/scan18/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan18.yaml \
+    \
+    --video  src/arena_map_builder/data/drone_scans/scan19/scan.mp4 \
+    --csv    src/arena_map_builder/data/drone_scans/scan19/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan19.yaml \
+    \
+    --video  src/arena_map_builder/data/drone_scans/scan20/scan.mp4 \
+    --csv    src/arena_map_builder/data/drone_scans/scan20/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan20.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan2/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan2/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan2.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan3/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan3/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan3.yaml \
     \
     --config     src/arena_marker_localizer/config/default.yaml \
-    --intrinsics src/arena_map_builder/data/manual_scans/scan1/calibration.yaml \
+    --intrinsics src/arena_map_builder/data/drone_scans/scan18/calibration.yaml \
     --out        src/arena_marker_localizer/config/corrected_T_map_from_opti.yaml
 ```
 
@@ -289,3 +306,31 @@ home/jetson/collab_nav_ground-jetson/scripts/amr_teleop_optitrack.sh
 
 ## Take pgm and yaml file from the map to generate occupancy grid 
 python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 4
+
+
+```bash
+src/arena_marker_localizer/scripts/calibrate_bias \
+    --video  src/arena_map_builder/data/drone_scans/scan18/scan.mp4 \
+    --csv    src/arena_map_builder/data/drone_scans/scan18/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan18.yaml \
+    \
+    --video  src/arena_map_builder/data/drone_scans/scan19/scan.mp4 \
+    --csv    src/arena_map_builder/data/drone_scans/scan19/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan19.yaml \
+    \
+    --video  src/arena_map_builder/data/drone_scans/scan20/scan.mp4 \
+    --csv    src/arena_map_builder/data/drone_scans/scan20/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan20.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan2/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan2/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan2.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan3/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan3/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan3.yaml \
+    \
+    --config     src/arena_marker_localizer/config/default.yaml \
+    --intrinsics src/arena_map_builder/data/drone_scans/scan18/calibration.yaml \
+    --out        src/arena_marker_localizer/config/corrected_T_map_from_opti.yaml
+```
