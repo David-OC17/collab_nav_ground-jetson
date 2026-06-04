@@ -1,0 +1,931 @@
+#!/usr/bin/env python3
+"""
+calibrate_bias_v3 -- physically-grounded bias correction for ArUco localisation
+                     with a Tello drone + 45° mirror rig.
+
+KEY DIFFERENCES FROM v2
+────────────────────────
+Problem diagnosis
+  v2 allowed dx_d / dy_d up to ±30 cm while the camera is physically < 10 cm
+  from the Tello CoM.  The solver exploited the loose bound to absorb a
+  map-frame origin error into drone-frame parameters — making the fit look
+  good on training data but generalise badly (54 cm mean CV error).
+
+What this script fits instead
+  The error decomposition is:
+
+      err_map = [c_x, c_y]                   ← map-frame origin shift
+              + R_map_from_drone[:2,:] @ [dx_d, dy_d, dz_d]  ← cam offset (cm-scale)
+              + scale_err * est_vec           ← radial scale bias
+              + T_map_from_opti rot error     ← handled by c_x/c_y + delta_yaw
+
+  For a Tello with camera < 10 cm from CoM the drone-frame terms are small
+  corrections on top of c_x/c_y.  Fitting them reliably requires the
+  camera lever arm to project differently at different drone attitudes —
+  which IS available in your dynamic scans.
+
+  This script:
+    1. Sets --max-cam-offset default to 0.10 m (physical reality).
+    2. Reports a "leverage score" per scan so you know which scans add
+       the most information.
+    3. Runs leave-one-out CV (or k-fold) and flags when the model is
+       underdetermined (too few distinct drone attitudes).
+    4. Optionally fits a radial scale correction (--fit-scale) for cases
+       where altitude error causes a systematic scale bias.
+    5. Prints a clear diagnosis with actionable advice when parameters
+       hit their bounds.
+    6. Produces a drop-in replacement YAML block for default.yaml.
+
+Usage
+─────
+  python calibrate_bias_v3.py \\
+      --video scan2/scan.mp4  --csv scan2/telemetry.csv  --gt gt.yaml \\
+      --video scan3/scan.mp4  --csv scan3/telemetry.csv  --gt gt.yaml \\
+      --video scan4/scan.mp4  --csv scan4/telemetry.csv  --gt gt.yaml \\
+      --config  config/default.yaml \\
+      --intrinsics config/calibration.yaml \\
+      --max-cam-offset 0.10 \\
+      --fit-scale
+
+Ground-truth YAML (unchanged from v2)
+──────────────────────────────────────
+  markers:
+    3:
+      x: 1.200
+      y: 0.850
+      theta: 180   # degrees, optional
+    7:
+      x: 2.100
+      y: 1.500
+      theta: 0
+
+Recommendations for good calibration data
+──────────────────────────────────────────
+  • You need ≥ 6 (marker × scan) pairs to robustly fit the 5 free params.
+  • Include both slow hover scans (low noise, good for c_x/c_y) AND
+    dynamic flight scans (pitch/roll diversity, needed for dz_d).
+  • Each scan should see ≥ 3 different markers.
+  • Aim for 30°+ spread in drone pitch across scans for dz_d observability.
+"""
+
+import argparse
+import math
+import os
+import sys
+
+import numpy as np
+import yaml
+
+# ── Lazy imports from your existing package ───────────────────────────────────
+from arena_marker_localizer.pipeline import run_pipeline, PipelineConfig
+from arena_marker_localizer.aggregation import AggregationConfig
+from arena_marker_localizer.marker_detection import DictionaryConfig
+from arena_marker_localizer.quality import QualityConfig
+from arena_marker_localizer.transforms import (
+    StaticTransform6DoF, OptiTrackAxisConfig,
+    euler_zyx_to_R,
+)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Config / GT helpers  (unchanged API from v2)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _load_ros_yaml(path: str) -> dict:
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    return raw.get("marker_localizer_service", {}).get("ros__parameters", raw)
+
+
+def _parse_static(p: dict, prefix: str) -> StaticTransform6DoF:
+    s = p.get(prefix, {})
+    return StaticTransform6DoF(
+        x=float(s.get("x", 0.0)), y=float(s.get("y", 0.0)),
+        z=float(s.get("z", 0.0)), roll=float(s.get("roll", 0.0)),
+        pitch=float(s.get("pitch", 0.0)), yaw=float(s.get("yaw", 0.0)),
+    )
+
+
+def _build_pipeline_config(p: dict, intrinsics_path: str) -> PipelineConfig:
+    dicts = []
+    for entry in p.get("dictionaries", ["DICT_4X4_50:0.135"]):
+        name, size = entry.split(":")
+        dicts.append(DictionaryConfig(name=name.strip(), marker_size_m=float(size.strip())))
+
+    agg   = p.get("aggregation", {})
+    proc  = p.get("processing",  {})
+    grid  = p.get("grid",        {})
+    arena = p.get("arena",       {})
+    res   = float(grid.get("resolution_m_per_cell", 0.05))
+
+    return PipelineConfig(
+        intrinsics_path=intrinsics_path,
+        dictionaries=dicts,
+        quality=QualityConfig(
+            blur_thresh=float(p.get("quality", {}).get("blur_thresh", 60.0)),
+            artifact_thresh=float(p.get("quality", {}).get("artifact_thresh", 2.0)),
+        ),
+        T_drone_from_cam=_parse_static(p, "T_drone_from_cam"),
+        T_map_from_opti=_parse_static(p, "T_map_from_opti"),
+        optitrack_axis=OptiTrackAxisConfig(
+            yaw_axis=str(p.get("optitrack", {}).get("yaw_axis", "z")),
+            x_dir=int(p.get("optitrack", {}).get("x_dir", 1)),
+            y_dir=int(p.get("optitrack", {}).get("y_dir", 1)),
+        ),
+        max_reproj_err_px=float(p.get("max_reproj_err_px", 4.0)),
+        aggregation=AggregationConfig(
+            mad_k=float(agg.get("mad_k", 3.5)),
+            min_observations=int(agg.get("min_observations", 50)),
+            max_iterations=int(agg.get("max_iterations", 100)),
+            convergence_eps=float(agg.get("convergence_eps", 1e-5)),
+        ),
+        max_obs_per_marker=int(p.get("max_obs_per_marker", 200)),
+        max_workers=int(proc.get("max_workers", 4)),
+        frame_stride=int(proc.get("frame_stride", 1)),
+        max_drone_velocity_m_s=float(proc.get("max_drone_velocity_m_s", 0.0)),
+        resolution_m_per_cell=res,
+        grid_width_cells=math.ceil(float(arena.get("width_m", 4.0)) / res),
+        grid_height_cells=math.ceil(float(arena.get("height_m", 4.0)) / res),
+    )
+
+
+def _load_gt(path: str) -> dict:
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    entries = raw.get("markers", raw)
+    result = {}
+    for mid_str, vals in entries.items():
+        try:
+            mid = int(mid_str)
+        except (ValueError, TypeError):
+            continue
+        theta_raw = vals.get("theta")
+        result[mid] = {
+            "x":         float(vals["x"]),
+            "y":         float(vals["y"]),
+            "theta_rad": math.radians(float(theta_raw)) if theta_raw is not None else None,
+        }
+    return result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Math helpers
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _angle_diff(a: float, b: float) -> float:
+    d = a - b
+    return (d + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _circular_mean(angles) -> float:
+    return float(math.atan2(np.mean(np.sin(angles)), np.mean(np.cos(angles))))
+
+
+def _leverage_score(A: np.ndarray) -> np.ndarray:
+    """Hat-matrix diagonal — how much each row influences the fit (0..1)."""
+    Q, _ = np.linalg.qr(A, mode="reduced")
+    return np.sum(Q ** 2, axis=1)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Core model: physically bounded least squares with scale option
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_design_matrix(
+    est_pts: np.ndarray,       # (N, 2)
+    drone_rolls: np.ndarray,   # (N,) map-frame
+    drone_pitches: np.ndarray,
+    drone_yaws: np.ndarray,
+    fit_scale: bool = False,
+) -> np.ndarray:
+    """
+    Build the (2N × n_params) design matrix.
+
+    Parameters (columns):
+        0 : c_x       — map-frame x offset
+        1 : c_y       — map-frame y offset
+        2 : dx_d      — drone-frame camera x offset
+        3 : dy_d      — drone-frame camera y offset
+        4 : dz_d      — drone-frame camera z offset (altitude)
+      [ 5 : s ]       — radial scale correction (optional)
+                         correction += s * est_pt
+
+    The scale term models a proportional error that grows with distance
+    from the map origin — e.g. caused by wrong flying altitude or a small
+    error in marker_size_m.  It's only identifiable when markers span a
+    wide range of map positions.
+    """
+    n = len(est_pts)
+    n_params = 6 if fit_scale else 5
+    A = np.zeros((2 * n, n_params))
+    for i, (roll, pitch, yaw) in enumerate(zip(drone_rolls, drone_pitches, drone_yaws)):
+        R = euler_zyx_to_R(roll, pitch, yaw)
+        # x row
+        A[2*i,   0] = 1.0          # c_x
+        A[2*i,   2] = R[0, 0]      # dx_d
+        A[2*i,   3] = R[0, 1]      # dy_d
+        A[2*i,   4] = R[0, 2]      # dz_d
+        # y row
+        A[2*i+1, 1] = 1.0          # c_y
+        A[2*i+1, 2] = R[1, 0]      # dx_d
+        A[2*i+1, 3] = R[1, 1]      # dy_d
+        A[2*i+1, 4] = R[1, 2]      # dz_d
+        if fit_scale:
+            A[2*i,   5] = est_pts[i, 0]   # s * est_x
+            A[2*i+1, 5] = est_pts[i, 1]   # s * est_y
+    return A
+
+
+def _fit_correction(
+    est_pts: np.ndarray,
+    gt_pts: np.ndarray,
+    drone_rolls: np.ndarray,
+    drone_pitches: np.ndarray,
+    drone_yaws: np.ndarray,
+    max_cam_offset_m: float = 0.10,
+    max_map_offset_m: float = 5.00,
+    max_scale: float = 0.30,
+    cond_thresh: float = 50.0,
+    fit_scale: bool = False,
+    irls_iters: int = 5,
+    irls_sigma: float = 0.30,
+    verbose: bool = True,
+) -> dict:
+    """
+    Fit the correction model with IRLS (robust to outlier GT measurements).
+
+    Returns a dict with keys:
+        c_x, c_y, dx_d, dy_d, dz_d, scale,
+        degenerate, model_dof, condition_number,
+        leverage_scores (per observation),
+        residuals_before, residuals_after (per observation, metres)
+    """
+    n = len(est_pts)
+    errors = gt_pts - est_pts  # what we need to add to est to reach gt
+
+    # ── Degeneracy analysis ──────────────────────────────────────────────────
+    # Check the attitude sub-block (cols 2-4) for rank.
+    A_full = _build_design_matrix(est_pts, drone_rolls, drone_pitches,
+                                  drone_yaws, fit_scale=False)
+    _, sv, _ = np.linalg.svd(A_full[:, 2:5], full_matrices=False)
+    cond = float(sv[0] / max(sv[-1], 1e-12))
+    degenerate_dxdy = cond > cond_thresh
+
+    # Decide which model to use
+    if degenerate_dxdy:
+        # Attitude diversity is insufficient — fit only c_x, c_y (+ scale)
+        model_dof = 3 if fit_scale else 2
+        if verbose:
+            print(f"  [DIAG] Attitude sub-block condition={cond:.1f} > {cond_thresh} "
+                  f"— dx_d/dy_d/dz_d not observable. Fitting c_x, c_y only.")
+            print(f"         → Add dynamic scans with varied pitch/roll to fix this.")
+    else:
+        model_dof = 6 if fit_scale else 5
+        if verbose:
+            print(f"  [DIAG] Attitude sub-block condition={cond:.1f} ≤ {cond_thresh} "
+                  f"— full {model_dof}-parameter model.")
+
+    # Parameter bounds
+    if degenerate_dxdy:
+        # Only c_x, c_y (and optionally scale)
+        cols = [0, 1] + ([5] if fit_scale and model_dof == 3 else [])
+        lo = np.array([-max_map_offset_m, -max_map_offset_m]
+                       + ([-max_scale] if fit_scale else []))
+        hi = np.array([ max_map_offset_m,  max_map_offset_m]
+                       + ([ max_scale] if fit_scale else []))
+    else:
+        cols = list(range(model_dof))
+        lo = np.array([-max_map_offset_m, -max_map_offset_m,
+                       -max_cam_offset_m,  -max_cam_offset_m, -max_cam_offset_m]
+                       + ([-max_scale] if fit_scale else []))
+        hi = np.array([ max_map_offset_m,  max_map_offset_m,
+                        max_cam_offset_m,   max_cam_offset_m,  max_cam_offset_m]
+                       + ([ max_scale] if fit_scale else []))
+
+    A_fit_full = _build_design_matrix(est_pts, drone_rolls, drone_pitches,
+                                      drone_yaws, fit_scale=fit_scale)
+    A_fit = A_fit_full[:, cols]
+    b = errors.flatten()  # [ex0, ey0, ex1, ey1, ...]
+
+    # ── IRLS ────────────────────────────────────────────────────────────────
+    irls_w = np.ones(n)
+    params = np.zeros(len(cols))
+
+    for irls_iter in range(irls_iters):
+        # Apply per-observation IRLS weights (broadcasted to 2 rows each)
+        W = np.repeat(irls_w, 2)
+        Aw = A_fit * W[:, None]
+        bw = b * W
+
+        try:
+            from scipy.optimize import lsq_linear
+            res = lsq_linear(Aw, bw, bounds=(lo, hi), method="bvls")
+            params = res.x
+        except ImportError:
+            params, _, _, _ = np.linalg.lstsq(Aw, bw, rcond=None)
+            params = np.clip(params, lo, hi)
+
+        # Compute per-observation position residuals
+        pred = A_fit @ params               # (2N,)
+        residuals_vec = b - pred            # (2N,) signed
+        per_obs_err = np.sqrt(
+            residuals_vec[0::2]**2 + residuals_vec[1::2]**2)  # (N,)
+
+        new_w = irls_sigma / np.maximum(per_obs_err, irls_sigma)
+
+        if verbose:
+            print(f"  [IRLS {irls_iter+1}/{irls_iters}] "
+                  f"pos err — min={per_obs_err.min()*100:.1f} cm  "
+                  f"mean={per_obs_err.mean()*100:.1f} cm  "
+                  f"max={per_obs_err.max()*100:.1f} cm  "
+                  f"weights={np.round(new_w, 3)}")
+
+        if np.allclose(new_w, irls_w, atol=1e-4):
+            if verbose:
+                print(f"  [IRLS] Converged at iteration {irls_iter+1}.")
+            break
+        irls_w = new_w
+
+    # ── Unpack params ────────────────────────────────────────────────────────
+    param_map = dict(zip(cols, params))
+    c_x  = float(param_map.get(0, 0.0))
+    c_y  = float(param_map.get(1, 0.0))
+    dx_d = float(param_map.get(2, 0.0))
+    dy_d = float(param_map.get(3, 0.0))
+    dz_d = float(param_map.get(4, 0.0))
+    scale = float(param_map.get(5, 0.0))
+
+    # ── Bound warnings ───────────────────────────────────────────────────────
+    name_bound = [("c_x", c_x, max_map_offset_m),
+                  ("c_y", c_y, max_map_offset_m),
+                  ("dx_d", dx_d, max_cam_offset_m),
+                  ("dy_d", dy_d, max_cam_offset_m),
+                  ("dz_d", dz_d, max_cam_offset_m)]
+    for name, val, bound in name_bound:
+        if abs(abs(val) - bound) < 1e-4 and not degenerate_dxdy:
+            print(f"  [WARN] {name}={val:+.4f} m hit its bound (±{bound:.3f} m).")
+            if name in ("dx_d", "dy_d", "dz_d"):
+                print(f"         Camera is physically < 10 cm from CoM — "
+                      f"this suggests a GT or T_map_from_opti error, not a real "
+                      f"camera offset. Check your ground-truth measurements.")
+
+    # ── Leverage scores ──────────────────────────────────────────────────────
+    leverage = _leverage_score(A_fit)          # (2N,) per row
+    # Average x and y rows for each observation
+    lev_per_obs = (leverage[0::2] + leverage[1::2]) / 2.0
+
+    # ── Residuals BEFORE correction ──────────────────────────────────────────
+    res_before = np.linalg.norm(errors, axis=1)
+
+    return dict(
+        c_x=c_x, c_y=c_y, dx_d=dx_d, dy_d=dy_d, dz_d=dz_d, scale=scale,
+        degenerate=degenerate_dxdy,
+        model_dof=model_dof,
+        condition_number=cond,
+        leverage_scores=lev_per_obs,
+        residuals_before=res_before,
+        residuals_after=per_obs_err,
+    )
+
+
+def _apply_correction(
+    result: dict,
+    est_pts: np.ndarray,
+    drone_rolls: np.ndarray,
+    drone_pitches: np.ndarray,
+    drone_yaws: np.ndarray,
+    gt_pts: np.ndarray,
+    est_thetas=None,
+    gt_thetas=None,
+    delta_yaw: float = 0.0,
+):
+    """Return (corrected_xy, pos_errors, ang_errors_deg_or_None)."""
+    c_x, c_y = result["c_x"], result["c_y"]
+    dx_d, dy_d, dz_d = result["dx_d"], result["dy_d"], result["dz_d"]
+    scale = result["scale"]
+    dt_xyz = np.array([dx_d, dy_d, dz_d])
+
+    corrected = np.zeros_like(est_pts)
+    for i, (roll, pitch, yaw) in enumerate(zip(drone_rolls, drone_pitches, drone_yaws)):
+        R = euler_zyx_to_R(roll, pitch, yaw)
+        delta = np.array([c_x, c_y]) + R[:2, :] @ dt_xyz + scale * est_pts[i]
+        corrected[i] = est_pts[i] + delta
+
+    pos_errors = np.linalg.norm(corrected - gt_pts, axis=1)
+
+    ang_errors_deg = None
+    if est_thetas is not None and gt_thetas is not None:
+        corr_th = est_thetas + delta_yaw
+        ang_errors_deg = np.degrees(np.array([
+            abs(_angle_diff(ct, gt)) for ct, gt in zip(corr_th, gt_thetas)]))
+
+    return corrected, pos_errors, ang_errors_deg
+
+
+def _fit_angular_correction(est_thetas, gt_thetas) -> float:
+    diffs = [_angle_diff(gt, est) for gt, est in zip(gt_thetas, est_thetas)]
+    return _circular_mean(diffs)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Data collection
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _collect(pair_indices, per_pair_results, per_pair_gts):
+    """Gather aligned (est, gt) arrays from a subset of pairs."""
+    est_list, gt_list, mids, pair_ids          = [], [], [], []
+    est_theta_list, gt_theta_list              = [], []
+    roll_list, pitch_list, yaw_list            = [], [], []
+
+    for i in pair_indices:
+        results = per_pair_results[i]
+        gt      = per_pair_gts[i]
+        for mid in sorted(set(results) & set(gt)):
+            xy, _n, yaw_rad, d_roll, d_pitch, d_yaw = results[mid]
+            est_list.append(xy)
+            gt_list.append(np.array([gt[mid]["x"], gt[mid]["y"]]))
+            mids.append(mid)
+            pair_ids.append(i)
+            roll_list.append(d_roll)
+            pitch_list.append(d_pitch)
+            yaw_list.append(d_yaw)
+            if gt[mid]["theta_rad"] is not None:
+                est_theta_list.append(yaw_rad)
+                gt_theta_list.append(gt[mid]["theta_rad"])
+
+    if not est_list:
+        return None, None, None, None, None, None, None, None, None
+
+    est_thetas = np.array(est_theta_list) if est_theta_list else None
+    gt_thetas  = np.array(gt_theta_list)  if gt_theta_list  else None
+    return (
+        np.array(est_list), np.array(gt_list), mids, pair_ids,
+        est_thetas, gt_thetas,
+        np.array(roll_list), np.array(pitch_list), np.array(yaw_list),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# K-fold
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _kfold_indices(n: int, k: int):
+    indices = list(range(n))
+    fold_sizes = [n // k + (1 if i < n % k else 0) for i in range(k)]
+    folds, start = [], 0
+    for size in fold_sizes:
+        folds.append(indices[start:start + size])
+        start += size
+    for i in range(k):
+        test  = folds[i]
+        train = [idx for j, fold in enumerate(folds) if j != i for idx in fold]
+        yield train, test
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Reporting
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _print_residuals(label, mids, est_pts, gt_pts, pair_ids,
+                     pos_errors, corrected=None, ang_errors_deg=None,
+                     drone_yaws=None, leverage=None, show_percentiles=False):
+    print(f"\n{label}  ({len(mids)} point(s)):")
+    for k, mid in enumerate(mids):
+        pi   = pair_ids[k]
+        gp   = gt_pts[k]
+        e_cm = pos_errors[k] * 100.0
+
+        pos_str = (f"corr=({corrected[k][0]:.3f}, {corrected[k][1]:.3f})"
+                   if corrected is not None
+                   else f"est=({est_pts[k][0]:.3f}, {est_pts[k][1]:.3f})")
+
+        extras = ""
+        if drone_yaws is not None:
+            extras += f"  ψ={math.degrees(drone_yaws[k]):+.1f}°"
+        if ang_errors_deg is not None:
+            extras += f"  θ_err={ang_errors_deg[k]:.1f}°"
+        if leverage is not None:
+            extras += f"  lev={leverage[k]:.2f}"
+
+        print(f"  Marker {mid:3d} [pair {pi+1}]: {pos_str}  "
+              f"gt=({gp[0]:.3f}, {gp[1]:.3f})  err={e_cm:.1f} cm{extras}")
+
+    rms = math.sqrt(np.mean(pos_errors ** 2))
+    err_cm = pos_errors * 100.0
+    print(f"  RMS position : {rms * 100:.1f} cm")
+    if show_percentiles and len(pos_errors) >= 2:
+        p25, p50, p75, p90, p95 = np.percentile(err_cm, [25, 50, 75, 90, 95])
+        print(f"  Percentiles  : p25={p25:.1f} cm  p50={p50:.1f} cm  "
+              f"p75={p75:.1f} cm  p90={p90:.1f} cm  p95={p95:.1f} cm")
+    if ang_errors_deg is not None and len(ang_errors_deg):
+        print(f"  Mean θ error : {ang_errors_deg.mean():.1f}°  "
+              f"max={ang_errors_deg.max():.1f}°")
+        if show_percentiles and len(ang_errors_deg) >= 2:
+            ap50, ap75, ap90 = np.percentile(ang_errors_deg, [50, 75, 90])
+            print(f"  θ percentiles: p50={ap50:.1f}°  p75={ap75:.1f}°  "
+                  f"p90={ap90:.1f}°")
+
+
+def _print_diagnosis(all_cv_pos_err, all_cv_ang_err, n_obs_total, model_dof):
+    """Print actionable diagnosis after cross-validation."""
+    print(f"\n{'─'*62}")
+    print("  DIAGNOSIS & RECOMMENDATIONS")
+    print(f"{'─'*62}")
+    mean_cv = np.mean(all_cv_pos_err) * 100 if all_cv_pos_err else float("nan")
+    print(f"  Generalisation error (CV mean): {mean_cv:.1f} cm")
+    print(f"  Observations used: {n_obs_total}  |  Model DOF: {model_dof}")
+    ratio = n_obs_total / max(model_dof, 1)
+    print(f"  Obs/DOF ratio: {ratio:.1f}  (recommend ≥ 3× for stable fit)")
+    if ratio < 2:
+        print("  ⚠  UNDERDETERMINED — add more scans before trusting this calibration.")
+    elif ratio < 3:
+        print("  ⚠  MARGINAL — results may be noisy; more scans recommended.")
+    else:
+        print("  ✓  Sufficient data for the model complexity.")
+    if mean_cv > 20:
+        print("  ⚠  CV error > 20 cm — model is not generalising well.")
+        print("     Possible causes:")
+        print("     • GT positions are inaccurate (measure them more carefully).")
+        print("     • T_map_from_opti has a large yaw error (check optitrack alignment).")
+        print("     • marker_size_m in config is wrong (affects scale, hence distance).")
+        print("     • Scans are too similar (need more varied drone attitudes).")
+    else:
+        print("  ✓  CV error within acceptable range.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Main
+# ═════════════════════════════════════════════════════════════════════════════
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Physically-grounded bias correction for ArUco localisation "
+                    "(Tello + 45° mirror rig).  v3."
+    )
+    ap.add_argument("--video",    required=True, action="append", dest="videos")
+    ap.add_argument("--csv",      required=True, action="append", dest="csvs")
+    ap.add_argument("--gt",       required=True, action="append", dest="gts")
+    ap.add_argument("--config",   required=True)
+    ap.add_argument("--intrinsics", default=None)
+    ap.add_argument("--out", default="corrected_transforms_v3.yaml")
+    ap.add_argument("--k-folds", type=int, default=0, metavar="K",
+                    help="CV folds (default: leave-one-out = n_pairs).")
+    ap.add_argument("--cond-thresh", type=float, default=50.0, dest="cond_thresh",
+                    help="SVD condition threshold for attitude degeneracy (default 50).")
+    ap.add_argument("--max-cam-offset", type=float, default=0.10, dest="max_cam_offset",
+                    help="Physical bound on |dx_d|,|dy_d|,|dz_d| in metres. "
+                         "Default 0.10 m (Tello camera is < 10 cm from CoM). "
+                         "ONLY increase if you have physically measured a larger offset.")
+    ap.add_argument("--max-map-offset", type=float, default=5.00, dest="max_map_offset",
+                    help="Bound on |c_x|,|c_y| (map-frame origin shift).")
+    ap.add_argument("--fit-scale", action="store_true", dest="fit_scale",
+                    help="Also fit a radial scale correction (useful when altitude "
+                         "or marker size is uncertain). Requires markers at varied "
+                         "distances from the map origin.")
+    ap.add_argument("--irls-sigma", type=float, default=0.30, dest="irls_sigma",
+                    help="IRLS outlier threshold in metres (default 0.30). "
+                         "Observations with residual > sigma are downweighted.")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    n_pairs = len(args.videos)
+    if len(args.csvs) != n_pairs:
+        sys.exit("ERROR: --video and --csv counts must match.")
+    if len(args.gts) == 1:
+        gt_paths = args.gts * n_pairs
+    elif len(args.gts) == n_pairs:
+        gt_paths = args.gts
+    else:
+        sys.exit(f"ERROR: --gt must have 1 entry or one per --video ({n_pairs}).")
+
+    pairs = list(zip(args.videos, args.csvs, gt_paths))
+
+    # ── Config ─────────────────────────────────────────────────────────
+    cfg_p = _load_ros_yaml(args.config)
+    intrinsics_path = args.intrinsics or str(cfg_p.get("intrinsics_path", ""))
+    if not intrinsics_path:
+        sys.exit("ERROR: intrinsics_path not set; pass --intrinsics.")
+    pipeline_cfg = _build_pipeline_config(cfg_p, intrinsics_path)
+
+    # ── Ground truth ────────────────────────────────────────────────────
+    per_pair_gts = []
+    for i, (_, _, gt_path) in enumerate(pairs):
+        gt = _load_gt(gt_path)
+        if not gt:
+            sys.exit(f"ERROR: no markers in GT YAML: {gt_path!r}")
+        per_pair_gts.append(gt)
+        has_theta = sum(1 for v in gt.values() if v["theta_rad"] is not None)
+        print(f"GT [{i+1}] {gt_path!r}: {len(gt)} marker(s) {sorted(gt.keys())} "
+              f"({has_theta} with theta)")
+
+    print(f"Videos: {n_pairs}")
+    if args.max_cam_offset > 0.15:
+        print(f"\n[WARN] --max-cam-offset={args.max_cam_offset:.3f} m is larger than "
+              f"the Tello's physical camera offset (< 0.10 m).\n"
+              f"       This allows the solver to absorb map-frame errors into "
+              f"drone-frame parameters (the v2 bug). Consider using 0.10 m.")
+
+    # ── Run pipeline ────────────────────────────────────────────────────
+    per_pair_results: list[dict] = []
+    for idx, (video_path, csv_path, _) in enumerate(pairs):
+        print(f"\n[{idx+1}/{n_pairs}] {video_path!r}")
+        try:
+            results, _ = run_pipeline(video_path, csv_path, pipeline_cfg)
+        except Exception as e:
+            print(f"  [WARN] pipeline failed: {e} — skipping.")
+            per_pair_results.append({})
+            continue
+
+        pair_res: dict = {}
+        for mid, r in results.items():
+            xy = r.position_m[:2].copy()
+            pair_res[mid] = (
+                xy, r.n_observations, float(r.yaw_rad),
+                float(r.mean_obs_drone_roll_rad),
+                float(r.mean_obs_drone_pitch_rad),
+                float(r.mean_obs_drone_yaw_rad),
+            )
+            if args.verbose:
+                print(f"  Marker {mid:3d}: ({xy[0]:.3f}, {xy[1]:.3f})  "
+                      f"yaw={math.degrees(r.yaw_rad):.1f}°  "
+                      f"drone_att=[r={math.degrees(r.mean_obs_drone_roll_rad):.1f}°  "
+                      f"p={math.degrees(r.mean_obs_drone_pitch_rad):.1f}°  "
+                      f"y={math.degrees(r.mean_obs_drone_yaw_rad):.1f}°]  "
+                      f"n={r.n_observations}")
+        per_pair_results.append(pair_res)
+
+    if all(not r for r in per_pair_results):
+        sys.exit("ERROR: pipeline produced no results from any video.")
+
+    # ── K-fold CV ───────────────────────────────────────────────────────
+    all_cv_pos_err: list[float] = []
+    all_cv_ang_err: list[float] = []
+    fold_results:   list[dict]  = []
+    final_model_dof = 5  # updated after final fit
+
+    if n_pairs >= 2:
+        k = min(args.k_folds if args.k_folds >= 2 else n_pairs, n_pairs)
+        print(f"\n{'═'*62}")
+        print(f"  K-FOLD CROSS-VALIDATION  (k={k}, n_pairs={n_pairs})")
+        print(f"{'═'*62}")
+
+        for fold_idx, (train_ids, test_ids) in enumerate(_kfold_indices(n_pairs, k)):
+            print(f"\n── Fold {fold_idx+1}/{k} ──")
+            print(f"  Train: pair(s) {[i+1 for i in train_ids]}")
+            print(f"  Test : pair(s) {[i+1 for i in test_ids]}")
+
+            tr = _collect(train_ids, per_pair_results, per_pair_gts)
+            (tr_est, tr_gt, tr_mids, _,
+             tr_eth, tr_gth,
+             tr_rolls, tr_pitches, tr_yaws) = tr
+
+            if tr_est is None:
+                print("  [SKIP] No training data for this fold.")
+                continue
+            if len(tr_est) < 2:
+                print(f"  [SKIP] Only {len(tr_est)} training point(s) — "
+                      f"need ≥ 2 to fit.")
+                continue
+
+            fit = _fit_correction(
+                tr_est, tr_gt, tr_rolls, tr_pitches, tr_yaws,
+                max_cam_offset_m=args.max_cam_offset,
+                max_map_offset_m=args.max_map_offset,
+                cond_thresh=args.cond_thresh,
+                fit_scale=args.fit_scale,
+                irls_sigma=args.irls_sigma,
+                verbose=True,
+            )
+            delta_yaw = (
+                _fit_angular_correction(tr_eth, tr_gth)
+                if tr_eth is not None and tr_gth is not None else 0.0
+            )
+
+            degen_str = " (degenerate — constant only)" if fit["degenerate"] else ""
+            print(f"  Fitted: c_x={fit['c_x']*100:+.2f} cm  "
+                  f"c_y={fit['c_y']*100:+.2f} cm  "
+                  f"dx_d={fit['dx_d']*100:+.2f} cm  "
+                  f"dy_d={fit['dy_d']*100:+.2f} cm  "
+                  f"dz_d={fit['dz_d']*100:+.2f} cm{degen_str}")
+            if args.fit_scale:
+                print(f"         scale={fit['scale']:+.4f}")
+            if tr_eth is not None:
+                print(f"         Δyaw={math.degrees(delta_yaw):+.3f}°")
+
+            te = _collect(test_ids, per_pair_results, per_pair_gts)
+            (te_est, te_gt, te_mids, te_pids,
+             te_eth, te_gth,
+             te_rolls, te_pitches, te_yaws) = te
+
+            if te_est is None:
+                print("  [SKIP] No test data for this fold.")
+                continue
+
+            corr, pos_err, ang_err = _apply_correction(
+                fit, te_est, te_rolls, te_pitches, te_yaws, te_gt,
+                te_eth, te_gth, delta_yaw)
+
+            all_cv_pos_err.extend(pos_err.tolist())
+            if ang_err is not None:
+                all_cv_ang_err.extend(ang_err.tolist())
+
+            _print_residuals("  Test errors", te_mids, te_est, te_gt,
+                             te_pids, pos_err, corr, ang_err, te_yaws)
+
+            fold_entry = {
+                "fold": fold_idx + 1,
+                "train_pairs": [i+1 for i in train_ids],
+                "test_pairs":  [i+1 for i in test_ids],
+                "fitted": {k: round(float(v), 6)
+                           for k, v in fit.items()
+                           if k in ("c_x","c_y","dx_d","dy_d","dz_d","scale")},
+                "condition_number": round(fit["condition_number"], 2),
+                "degenerate": fit["degenerate"],
+                "rms_pos_m": round(float(math.sqrt(np.mean(pos_err**2))), 6),
+                "test_pos_errors_m": [round(float(e), 6) for e in pos_err],
+            }
+            if ang_err is not None:
+                fold_entry["mean_ang_err_deg"] = round(float(ang_err.mean()), 4)
+            fold_results.append(fold_entry)
+
+        if all_cv_pos_err:
+            print(f"\n{'─'*62}")
+            print(f"  K-FOLD SUMMARY  ({len(fold_results)} folds, "
+                  f"{len(all_cv_pos_err)} test point(s))")
+            print(f"{'─'*62}")
+            print(f"  Position error — "
+                  f"min={min(all_cv_pos_err)*100:.1f} cm  "
+                  f"mean={np.mean(all_cv_pos_err)*100:.1f} cm  "
+                  f"max={max(all_cv_pos_err)*100:.1f} cm")
+            if all_cv_ang_err:
+                print(f"  Angular error  — "
+                      f"min={min(all_cv_ang_err):.1f}°  "
+                      f"mean={np.mean(all_cv_ang_err):.1f}°  "
+                      f"max={max(all_cv_ang_err):.1f}°")
+        else:
+            print("\n[WARN] No CV errors collected — add more scans.")
+    else:
+        print("\n[NOTE] Only 1 pair — skipping cross-validation.")
+
+    # Save fold YAML
+    if fold_results:
+        kfold_out = os.path.splitext(args.out)[0] + "_kfold.yaml"
+        summary = {
+            "n_folds": len(fold_results),
+            "total_test_points": len(all_cv_pos_err),
+            "min_pos_error_m":  round(float(min(all_cv_pos_err)), 6),
+            "mean_pos_error_m": round(float(np.mean(all_cv_pos_err)), 6),
+            "max_pos_error_m":  round(float(max(all_cv_pos_err)), 6),
+        }
+        if all_cv_ang_err:
+            summary["mean_ang_error_deg"] = round(float(np.mean(all_cv_ang_err)), 4)
+        with open(kfold_out, "w") as f:
+            yaml.dump({"summary": summary, "folds": fold_results},
+                      f, default_flow_style=False, sort_keys=False)
+        print(f"\nK-fold results saved to: {kfold_out!r}")
+
+    # ── Final fit on all pairs ───────────────────────────────────────────
+    print(f"\n{'═'*62}")
+    print("  FINAL FIT (all pairs)")
+    print(f"{'═'*62}")
+
+    fa = _collect(range(n_pairs), per_pair_results, per_pair_gts)
+    (all_est, all_gt, all_mids, all_pids,
+     all_eth, all_gth,
+     all_rolls, all_pitches, all_yaws) = fa
+
+    if all_est is None:
+        sys.exit("ERROR: no matching markers found for final fit.")
+
+    pre_err = np.linalg.norm(all_gt - all_est, axis=1)
+    _print_residuals("Residuals BEFORE correction",
+                     all_mids, all_est, all_gt, all_pids,
+                     pre_err, drone_yaws=all_yaws,
+                     show_percentiles=True)
+
+    final_fit = _fit_correction(
+        all_est, all_gt, all_rolls, all_pitches, all_yaws,
+        max_cam_offset_m=args.max_cam_offset,
+        max_map_offset_m=args.max_map_offset,
+        cond_thresh=args.cond_thresh,
+        fit_scale=args.fit_scale,
+        irls_sigma=args.irls_sigma,
+        verbose=True,
+    )
+    final_model_dof = final_fit["model_dof"]
+
+    delta_yaw = (
+        _fit_angular_correction(all_eth, all_gth)
+        if all_eth is not None and all_gth is not None else 0.0
+    )
+
+    c_x  = final_fit["c_x"]
+    c_y  = final_fit["c_y"]
+    dx_d = final_fit["dx_d"]
+    dy_d = final_fit["dy_d"]
+    dz_d = final_fit["dz_d"]
+    scale = final_fit["scale"]
+
+    print(f"\nCorrection (all pairs):")
+    print(f"  Map-frame static  :  c_x={c_x*100:+.2f} cm   c_y={c_y*100:+.2f} cm")
+    print(f"  Drone-frame trans :  dx_d={dx_d*100:+.2f} cm  "
+          f"dy_d={dy_d*100:+.2f} cm  dz_d={dz_d*100:+.2f} cm")
+    if args.fit_scale:
+        print(f"  Radial scale      :  s={scale:+.5f}  "
+              f"({'shrink' if scale < 0 else 'expand'} estimated positions by "
+              f"{abs(scale)*100:.2f}%)")
+    if all_eth is not None:
+        print(f"  Angular offset    :  Δyaw={math.degrees(delta_yaw):+.3f}°")
+    print(f"  Model condition # :  {final_fit['condition_number']:.1f}")
+
+    corr_xy, post_err, post_ang_err = _apply_correction(
+        final_fit, all_est, all_rolls, all_pitches, all_yaws, all_gt,
+        all_eth, all_gth, delta_yaw)
+
+    _print_residuals("Residuals AFTER correction",
+                     all_mids, all_est, all_gt, all_pids,
+                     post_err, corr_xy, post_ang_err, all_yaws,
+                     leverage=final_fit["leverage_scores"],
+                     show_percentiles=True)
+
+    if all_cv_pos_err:
+        print(f"\nGeneralisation estimate (k-fold CV): "
+              f"pos min={min(all_cv_pos_err)*100:.1f} cm  "
+              f"mean={np.mean(all_cv_pos_err)*100:.1f} cm  "
+              f"max={max(all_cv_pos_err)*100:.1f} cm")
+
+    _print_diagnosis(all_cv_pos_err, all_cv_ang_err,
+                     len(all_est), final_model_dof)
+
+    # ── Absorb corrections into transforms ───────────────────────────────
+    old_mfo = _parse_static(cfg_p, "T_map_from_opti")
+    new_mfo = StaticTransform6DoF(
+        x=old_mfo.x + c_x, y=old_mfo.y + c_y, z=old_mfo.z,
+        roll=old_mfo.roll, pitch=old_mfo.pitch, yaw=old_mfo.yaw,
+    )
+    old_dfc = _parse_static(cfg_p, "T_drone_from_cam")
+    new_dfc = StaticTransform6DoF(
+        x=old_dfc.x + dx_d,
+        y=old_dfc.y + dy_d,
+        z=old_dfc.z + dz_d,
+        roll=old_dfc.roll,
+        pitch=old_dfc.pitch,
+        yaw=old_dfc.yaw + delta_yaw,
+    )
+
+    # ── Write YAML ───────────────────────────────────────────────────────
+    out_data = {
+        "T_map_from_opti": {
+            "x":     round(float(new_mfo.x),     6),
+            "y":     round(float(new_mfo.y),     6),
+            "z":     round(float(new_mfo.z),     6),
+            "roll":  round(float(new_mfo.roll),  6),
+            "pitch": round(float(new_mfo.pitch), 6),
+            "yaw":   round(float(new_mfo.yaw),   6),
+        },
+        "T_drone_from_cam": {
+            "x":     round(float(new_dfc.x),     6),
+            "y":     round(float(new_dfc.y),     6),
+            "z":     round(float(new_dfc.z),     6),
+            "roll":  round(float(new_dfc.roll),  6),
+            "pitch": round(float(new_dfc.pitch), 6),
+            "yaw":   round(float(new_dfc.yaw),   6),
+        },
+        "correction_params": {
+            "c_x_m":               round(float(c_x),   6),
+            "c_y_m":               round(float(c_y),   6),
+            "dx_drone_m":          round(float(dx_d),  6),
+            "dy_drone_m":          round(float(dy_d),  6),
+            "dz_drone_m":          round(float(dz_d),  6),
+            "scale":               round(float(scale), 6),
+            "delta_yaw_deg":       round(math.degrees(delta_yaw), 4),
+            "degenerate_attitude": final_fit["degenerate"],
+            "condition_number":    round(final_fit["condition_number"], 2),
+            "model_dof":           final_model_dof,
+            "n_observations":      len(all_est),
+        },
+    }
+    with open(args.out, "w") as f:
+        yaml.dump(out_data, f, default_flow_style=False, sort_keys=False)
+    print(f"\nCorrected transforms written to: {args.out!r}")
+
+    # ── Print paste-in block ──────────────────────────────────────────────
+    print("\nPaste both blocks into config/default.yaml:\n")
+    for name, t in [("T_map_from_opti", new_mfo), ("T_drone_from_cam", new_dfc)]:
+        print(f"    {name}:")
+        print(f"      x    : {t.x:.6f}")
+        print(f"      y    : {t.y:.6f}")
+        print(f"      z    : {t.z:.6f}")
+        print(f"      roll : {t.roll:.6f}   # {math.degrees(t.roll):.3f} deg")
+        print(f"      pitch: {t.pitch:.6f}   # {math.degrees(t.pitch):.3f} deg")
+        print(f"      yaw  : {t.yaw:.6f}   # {math.degrees(t.yaw):.3f} deg")
+        print()
+
+    if args.fit_scale and abs(scale) > 0.01:
+        print(f"[NOTE] A significant scale correction was fitted ({scale:+.4f}). "
+              f"This often means marker_size_m or flying altitude is wrong.\n"
+              f"       Consider correcting the root cause instead of relying on this.")
+
+
+if __name__ == "__main__":
+    main()
