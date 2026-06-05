@@ -585,6 +585,18 @@ def main():
     ap.add_argument("--irls-sigma", type=float, default=0.30, dest="irls_sigma",
                     help="IRLS outlier threshold in metres (default 0.30). "
                          "Observations with residual > sigma are downweighted.")
+    ap.add_argument("--test-video", action="append", dest="test_videos", default=[],
+                    metavar="VIDEO",
+                    help="Held-out test video(s). Pipeline runs with the original "
+                         "transforms; the fitted correction is applied and errors are "
+                         "reported before and after. Requires --test-csv and --test-gt.")
+    ap.add_argument("--test-csv", action="append", dest="test_csvs", default=[],
+                    metavar="CSV",
+                    help="OptiTrack CSV for each --test-video (one per video).")
+    ap.add_argument("--test-gt", action="append", dest="test_gts", default=[],
+                    metavar="GT",
+                    help="Ground-truth YAML for test video(s). One shared file or one "
+                         "per --test-video.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -597,6 +609,16 @@ def main():
         gt_paths = args.gts
     else:
         sys.exit(f"ERROR: --gt must have 1 entry or one per --video ({n_pairs}).")
+
+    if args.test_videos:
+        n_test = len(args.test_videos)
+        if len(args.test_csvs) != n_test:
+            sys.exit("ERROR: --test-video and --test-csv counts must match.")
+        if len(args.test_gts) not in (1, n_test):
+            sys.exit(f"ERROR: --test-gt must have 1 entry or one per "
+                     f"--test-video ({n_test}).")
+    elif args.test_csvs or args.test_gts:
+        sys.exit("ERROR: --test-csv / --test-gt require --test-video.")
 
     pairs = list(zip(args.videos, args.csvs, gt_paths))
 
@@ -925,6 +947,76 @@ def main():
         print(f"[NOTE] A significant scale correction was fitted ({scale:+.4f}). "
               f"This often means marker_size_m or flying altitude is wrong.\n"
               f"       Consider correcting the root cause instead of relying on this.")
+
+    # ── Test-set evaluation ──────────────────────────────────────────────
+    if args.test_videos:
+        n_test = len(args.test_videos)
+        test_gt_paths = (args.test_gts * n_test
+                         if len(args.test_gts) == 1 else args.test_gts)
+
+        print(f"\n{'═'*62}")
+        print(f"  TEST-SET EVALUATION  ({n_test} video(s))")
+        print(f"{'═'*62}")
+
+        per_test_gts: list[dict] = []
+        for i, gt_path in enumerate(test_gt_paths):
+            gt = _load_gt(gt_path)
+            if not gt:
+                print(f"[WARN] No markers in test GT {gt_path!r} — skipping.")
+                per_test_gts.append({})
+                continue
+            per_test_gts.append(gt)
+            has_theta = sum(1 for v in gt.values() if v["theta_rad"] is not None)
+            print(f"Test GT [{i+1}] {gt_path!r}: {len(gt)} marker(s) "
+                  f"{sorted(gt.keys())}  ({has_theta} with theta)")
+
+        per_test_results: list[dict] = []
+        for idx, (video_path, csv_path) in enumerate(
+                zip(args.test_videos, args.test_csvs)):
+            print(f"\n[test {idx+1}/{n_test}] {video_path!r}")
+            try:
+                results, _ = run_pipeline(video_path, csv_path, pipeline_cfg)
+            except Exception as e:
+                print(f"  [WARN] pipeline failed: {e} — skipping.")
+                per_test_results.append({})
+                continue
+
+            pair_res: dict = {}
+            for mid, r in results.items():
+                xy = r.position_m[:2].copy()
+                pair_res[mid] = (
+                    xy, r.n_observations, float(r.yaw_rad),
+                    float(r.mean_obs_drone_roll_rad),
+                    float(r.mean_obs_drone_pitch_rad),
+                    float(r.mean_obs_drone_yaw_rad),
+                )
+                if args.verbose:
+                    print(f"  Marker {mid:3d}: ({xy[0]:.3f}, {xy[1]:.3f})  "
+                          f"yaw={math.degrees(r.yaw_rad):.1f}°  "
+                          f"n={r.n_observations}")
+            per_test_results.append(pair_res)
+
+        te = _collect(range(n_test), per_test_results, per_test_gts)
+        (te_est, te_gt, te_mids, te_pids,
+         te_eth, te_gth,
+         te_rolls, te_pitches, te_yaws) = te
+
+        if te_est is None:
+            print("\n[WARN] No matching markers found in test videos.")
+        else:
+            pre_te = np.linalg.norm(te_gt - te_est, axis=1)
+            _print_residuals("Test-set BEFORE correction",
+                             te_mids, te_est, te_gt, te_pids,
+                             pre_te, drone_yaws=te_yaws, show_percentiles=True)
+
+            corr_te, post_te, ang_te = _apply_correction(
+                final_fit, te_est, te_rolls, te_pitches, te_yaws, te_gt,
+                te_eth, te_gth, delta_yaw)
+
+            _print_residuals("Test-set AFTER correction",
+                             te_mids, te_est, te_gt, te_pids,
+                             post_te, corr_te, ang_te, te_yaws,
+                             show_percentiles=True)
 
 
 if __name__ == "__main__":

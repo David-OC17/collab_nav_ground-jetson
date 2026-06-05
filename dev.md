@@ -232,6 +232,9 @@ python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 10 --aruco-
 python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 15 --aruco-ids '[5, 0]'
 python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 16 --aruco-ids '[5, 3]'
 python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 17 --aruco-ids '[3, 2]'
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 18 --aruco-ids '[3, 2]'
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 20 --aruco-ids '[2, 0]'
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 21 --aruco-ids '[2, 0]'
 
 # Many times (fast — only AMR bringup + planning):
 python3 src/mission_orchestrator/scripts/run_hw_test_amr_nav.py --scan-id 10
@@ -304,24 +307,9 @@ home/jetson/collab_nav_ground-jetson/scripts/amr_teleop_optitrack.sh
 ## Run planner with custom coordinates 
 ./scripts/custom_trajectory.sh 
 
-## Take pgm and yaml file from the map to generate occupancy grid 
-python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 4
-
-
+Obstain starting with:
 ```bash
-src/arena_marker_localizer/scripts/calibrate_bias \
-    --video  src/arena_map_builder/data/drone_scans/scan18/scan.mp4 \
-    --csv    src/arena_map_builder/data/drone_scans/scan18/telemetry.csv \
-    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan18.yaml \
-    \
-    --video  src/arena_map_builder/data/drone_scans/scan19/scan.mp4 \
-    --csv    src/arena_map_builder/data/drone_scans/scan19/telemetry.csv \
-    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan19.yaml \
-    \
-    --video  src/arena_map_builder/data/drone_scans/scan20/scan.mp4 \
-    --csv    src/arena_map_builder/data/drone_scans/scan20/telemetry.csv \
-    --gt     src/arena_marker_localizer/config/aruco_pose_gt/scan20.yaml \
-    \
+src/arena_marker_localizer/scripts/calibrate_bias_v3 \
     --video  src/arena_map_builder/data/manual_scans/scan2/scan.mp4 \
     --csv    src/arena_map_builder/data/manual_scans/scan2/telemetry.csv \
     --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan2.yaml \
@@ -331,6 +319,82 @@ src/arena_marker_localizer/scripts/calibrate_bias \
     --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan3.yaml \
     \
     --config     src/arena_marker_localizer/config/default.yaml \
-    --intrinsics src/arena_map_builder/data/drone_scans/scan18/calibration.yaml \
-    --out        src/arena_marker_localizer/config/corrected_T_map_from_opti.yaml
+    --intrinsics src/arena_map_builder/data/manual_scans/scan1/calibration.yaml \
+    --out        src/arena_marker_localizer/config/corrected_T_map_from_opti.yaml \
+    --max-cam-offset 0.10
+```
+Starting:
+```YAML
+    T_map_from_opti:
+      x    : 1.785956
+      y    : 1.809220
+      z    : 0.000000
+      roll : 0.000000   # 0.000 deg
+      pitch: 0.000000   # 0.000 deg
+      yaw  : 1.570795   # 90.000 deg
+
+    T_drone_from_cam:
+      x    : 0.035000
+      y    : 0.000000
+      z    : 0.000000
+      roll : 3.141590   # 180.000 deg
+      pitch: 0.000000   # 0.000 deg
+      yaw  : 0.044292   # 2.538 deg
+```
+```bash
+src/arena_marker_localizer/scripts/calibrate_bias_v3 \
+    --test-video  src/arena_map_builder/data/drone_scans/scan18/scan.mp4 \
+    --test-csv    src/arena_map_builder/data/drone_scans/scan18/telemetry.csv \
+    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan18.yaml \
+    \
+    --test-video  src/arena_map_builder/data/drone_scans/scan19/scan.mp4 \
+    --test-csv    src/arena_map_builder/data/drone_scans/scan19/telemetry.csv \
+    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan19.yaml \
+    \
+    --test-video  src/arena_map_builder/data/drone_scans/scan20/scan.mp4 \
+    --test-csv    src/arena_map_builder/data/drone_scans/scan20/telemetry.csv \
+    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan20.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan2/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan2/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan-config1.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan3/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan3/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan-config1.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan4/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan4/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan-config1.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan5/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan5/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan-config1.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan6/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan6/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan-config1.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan8/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan8/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan-config1.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan9/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan9/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan-config1.yaml \
+    \
+    --video  src/arena_map_builder/data/manual_scans/scan10/scan.mp4 \
+    --csv    src/arena_map_builder/data/manual_scans/scan10/telemetry.csv \
+    --gt     src/arena_marker_localizer/config/aruco_pose_gt/manual_scan-config1.yaml \
+    \
+    --config     src/arena_marker_localizer/config/default.yaml \
+    --intrinsics src/arena_marker_localizer/config/calibration.yaml \
+    --out        src/arena_marker_localizer/config/corrected_T_map_from_opti.yaml \
+    --max-cam-offset 0.10
+```
+After correction:
+```YAML
+  Percentiles  : p25=34.6 cm  p50=80.2 cm  p75=101.5 cm  p90=119.8 cm  p95=133.5 cm
+  Mean θ error : 1.6°  max=7.2°
+  θ percentiles: p50=0.7°  p75=1.4°  p90=4.1
 ```
