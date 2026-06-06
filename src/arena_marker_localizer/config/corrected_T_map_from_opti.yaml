@@ -1,0 +1,26 @@
+T_map_from_opti:
+  x: 1.88082
+  y: 1.948471
+  z: 0.0
+  roll: 0.0
+  pitch: 0.0
+  yaw: 1.570795
+T_drone_from_cam:
+  x: -0.065
+  y: -0.061992
+  z: 0.1
+  roll: 3.14159
+  pitch: 0.0
+  yaw: 0.045556
+correction_params:
+  c_x_m: -0.04918
+  c_y_m: 0.038471
+  dx_drone_m: -0.1
+  dy_drone_m: -0.061992
+  dz_drone_m: 0.1
+  scale: 0.0
+  delta_yaw_deg: 2.6102
+  degenerate_attitude: false
+  condition_number: 17.73
+  model_dof: 5
+  n_observations: 14

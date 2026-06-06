@@ -233,8 +233,8 @@ python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 15 --aruco-
 python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 16 --aruco-ids '[5, 3]'
 python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 17 --aruco-ids '[3, 2]'
 python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 18 --aruco-ids '[3, 2]'
-python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 20 --aruco-ids '[2, 0]'
-python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 21 --aruco-ids '[2, 0]'
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 20 --aruco-ids '[5, 0]' --ground-truth src/arena_marker_localizer/config/aruco_pose_gt/scan20.yaml
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 21 --aruco-ids '[5, 0]' --ground-truth src/arena_marker_localizer/config/aruco_pose_gt/scan21.yaml
 
 # Many times (fast — only AMR bringup + planning):
 python3 src/mission_orchestrator/scripts/run_hw_test_amr_nav.py --scan-id 10
@@ -397,4 +397,12 @@ After correction:
   Percentiles  : p25=34.6 cm  p50=80.2 cm  p75=101.5 cm  p90=119.8 cm  p95=133.5 cm
   Mean θ error : 1.6°  max=7.2°
   θ percentiles: p50=0.7°  p75=1.4°  p90=4.1
+```
+
+# Isaac Ros Visual Slam
+
+```bash
+  docker start isaac_ros_vslam
+  docker exec -it isaac_ros_vslam bash
+  ros2 launch isaac_ros_visual_slam isaac_ros_visual_slam_realsense.launch.py
 ```

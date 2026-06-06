@@ -66,7 +66,7 @@ import math
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Generator, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional, Tuple
 
 # Global-consistency back-end (fiducial loop closure + pose-graph optimisation).
 # Imported flexibly so the module works both as a ROS package and standalone.
@@ -1376,6 +1376,53 @@ def _apply_color_masks(img: np.ndarray, masks: List[ColorRangeMask]) -> np.ndarr
     return result
 
 
+# ── solid BGR fill colours for ArUco markers ─────────────────────────────────
+# Distinct from the magenta/green and grid/obstacle colours already used
+# elsewhere in the map, so recoloured markers stand out unambiguously.
+CYAN_BGR: Tuple[int, int, int] = (255, 255, 0)
+RED_BGR:  Tuple[int, int, int] = (0, 0, 255)
+
+
+def _recolor_aruco_markers(
+    img: np.ndarray,
+    markers: list,
+    color_map: Dict[int, Tuple[int, int, int]],
+) -> np.ndarray:
+    """
+    Replace each detected ArUco marker with a solid BGR colour keyed by its ID.
+
+    Unlike _apply_color_masks (which thresholds on HSV colour), this masks by
+    GEOMETRY: each marker's exact 4-corner quad — as returned subpixel-accurate
+    by FiducialDetector.detect() — is filled with color_map[marker_id].  This
+    sidesteps the black/white abundance problem entirely: only the polygon the
+    detector reports as a marker is touched, nothing else.
+
+    Behaviour
+    ─────────
+    • Markers whose ID is not in color_map are left untouched.
+    • Only the exact detected quad is filled (no quiet-zone / margin expansion).
+    • `img` is never mutated: a copy is made lazily on the first marker that
+      actually matches, so when nothing matches the original array is returned
+      unchanged (and stays safe for feature detection on the caller side).
+
+    Returns the (possibly recoloured) image.
+    """
+    if not color_map or not markers:
+        return img
+
+    result: Optional[np.ndarray] = None
+    for m in markers:
+        bgr = color_map.get(m.marker_id)
+        if bgr is None:
+            continue
+        if result is None:
+            result = img.copy()
+        quad = np.round(m.corners_px).astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillConvexPoly(result, quad, bgr)
+
+    return result if result is not None else img
+
+
 @dataclass
 class ReconstructConfig:
     """Tunable parameters for incremental frame stitching."""
@@ -1438,6 +1485,30 @@ class ReconstructConfig:
                                s_lo=60, s_hi=255, v_lo=60, v_hi=255,
                                replace_bgr=(255, 255, 255)),
             ]
+        )
+    """
+
+    marker_color_map: Dict[int, Tuple[int, int, int]] = field(default_factory=dict)
+    """
+    Map of ArUco marker ID → solid BGR colour to paint that marker before it is
+    stitched onto the canvas.  Empty (default) → no marker recolouring at all.
+
+    This is a GEOMETRIC mask, separate from color_masks: a dedicated
+    FiducialDetector runs per frame and each listed marker's exact 4-corner
+    quad is filled with its colour (no quiet-zone margin).  Markers whose ID is
+    not in the map are left untouched.  Detection is independent of
+    use_fiducials, so visual recolouring works even with the pose-graph
+    fiducial back-end disabled.
+
+    As with color_masks, feature detection / homography estimation still run on
+    the original unmasked frame, so alignment quality is unaffected.
+
+    Convenience BGR constants CYAN_BGR and RED_BGR are provided for distinct,
+    unused colours.  Example — paint markers 0/1/2 cyan and 10/11 red:
+
+        ReconstructConfig(
+            marker_color_map={0: CYAN_BGR, 1: CYAN_BGR, 2: CYAN_BGR,
+                              10: RED_BGR, 11: RED_BGR},
         )
     """
 
@@ -1806,6 +1877,13 @@ class MapReconstructor:
             FiducialDetector(FiducialConfig(dictionary=self.cfg.fiducial_dictionary))
             if self.cfg.use_fiducials else None
         )
+        # Dedicated detector for visual marker recolouring (marker_color_map).
+        # Kept separate from self._fiducial so recolouring works regardless of
+        # use_fiducials; instantiated only when there is a colour map to apply.
+        self._fiducial_mask = (
+            FiducialDetector(FiducialConfig(dictionary=self.cfg.fiducial_dictionary))
+            if self.cfg.marker_color_map else None
+        )
         self._sg = (
             StitchGraph(StitchGraphConfig(
                 marker_weight=self.cfg.pg_marker_weight,
@@ -1820,6 +1898,17 @@ class MapReconstructor:
         self._cache_dir: Optional[str] = None
         self._finalized = False
         self._last_finalize_report: Optional[dict] = None  # set by finalize()
+
+        # Opaque marker overlay (marker_color_map). Each placed frame's detected
+        # marker quads are projected into canvas coords and queued here, then
+        # painted solid as the LAST step (see _paint_marker_overlays). Painting
+        # after all feather/pyramid blending is what keeps the fill opaque —
+        # per-frame recolouring alone gets diluted wherever overlapping frames
+        # missed the marker, leaving the see-through pattern.
+        self._marker_paints: List[Tuple[np.ndarray, Tuple[int, int, int]]] = []
+        # rec_idx → mask_markers, kept only when a pose-graph re-render will
+        # rebuild the overlay at the globally-corrected poses.
+        self._marker_obs: Dict[int, list] = {}
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -1943,6 +2032,10 @@ class MapReconstructor:
         if self.cfg.use_pose_graph and not self._finalized:
             self.finalize(verbose=False)
 
+        # Paint the solid marker overlay LAST — after all blending / re-render —
+        # so the fill stays opaque instead of being feather-diluted to a tint.
+        self._paint_marker_overlays()
+
         canvas = self._canvas
         self._canvas = None   # drop reference; allows GC during resize below
 
@@ -1997,6 +2090,19 @@ class MapReconstructor:
         # used only for warping onto the canvas.  Feature extraction always
         # operates on the original unmasked img so no scene content is hidden.
         img_stitch = _apply_color_masks(img, self.cfg.color_masks)
+
+        # Geometric ArUco recolouring (marker_color_map): fill each listed
+        # marker's exact quad with a solid colour on the stitch image only.
+        # Detected on the unmasked img so colour replacement above doesn't
+        # interfere with marker decoding; corners apply directly to img_stitch
+        # since both share the same (possibly downscaled) resolution.
+        mask_markers: list = []
+        if self._fiducial_mask is not None:
+            mask_markers = self._fiducial_mask.detect(img)
+            img_stitch = _recolor_aruco_markers(
+                img_stitch, mask_markers, self.cfg.marker_color_map
+            )
+
         h, w = img.shape[:2]
 
         if self._sp_session is not None:
@@ -2065,6 +2171,7 @@ class MapReconstructor:
             "des": des,
             "grid_pts": grid_pts,
             "markers": markers,
+            "mask_markers": mask_markers,
             "h": h,
             "w": w,
         }
@@ -2080,6 +2187,7 @@ class MapReconstructor:
         des        = prep["des"]
         grid_pts   = prep["grid_pts"]
         markers    = prep.get("markers", [])
+        mask_markers = prep.get("mask_markers", [])
         h, w       = prep["h"], prep["w"]
 
         # ── first frame: initialise canvas ──────────────────────────────────
@@ -2098,12 +2206,14 @@ class MapReconstructor:
                 H0 = np.array([[1, 0, m], [0, 1, m], [0, 0, 1]], dtype=np.float64)
                 self._canvas = np.zeros((h + 2 * m, w + 2 * m, 3), dtype=np.uint8)
             self._warp_and_blend_roi(img_stitch, H0)
+            self._accumulate_marker_paints(mask_markers, H0)
             self._n_placed = 1
             # Pose graph: first frame is the FIXED gauge keyframe.
             # Call before _register so the returned kf_id can be stored in the
             # keyframe entry that _register is about to add.
             kf_id_assigned = self._graph_on_placed(
-                img_stitch, H0, True, w, h, markers, fixed=True
+                img_stitch, H0, True, w, h, markers, fixed=True,
+                mask_markers=mask_markers,
             )
             self._register(kp, des, H0, grid_pts=grid_pts, kf_id=kf_id_assigned)
             return True
@@ -2185,6 +2295,7 @@ class MapReconstructor:
 
         # ── warp and blend (ROI only) ────────────────────────────────────────
         self._warp_and_blend_roi(img_stitch, best_H)
+        self._accumulate_marker_paints(mask_markers, best_H)
         self._n_placed += 1
 
         # Feed the pose graph BEFORE _register so the returned kf_id can be
@@ -2197,6 +2308,7 @@ class MapReconstructor:
             matched_kf_id=winner_kf_id,
             matched_H_pair=winner_H_pair,
             matched_n_inliers=best_n,
+            mask_markers=mask_markers,
         )
         self._register(kp, des, best_H, grid_pts=grid_pts, kf_id=kf_id_assigned)
         return True
@@ -2215,6 +2327,7 @@ class MapReconstructor:
         matched_kf_id: Optional[int] = None,
         matched_H_pair: Optional[np.ndarray] = None,
         matched_n_inliers: int = 0,
+        mask_markers=(),
     ) -> Optional[int]:
         """Feed a just-placed frame to the pose graph and cache its pixels for
         the finalize() re-render.
@@ -2244,6 +2357,11 @@ class MapReconstructor:
         )
         self._sg.on_markers(markers)
         self._cache_frame(self._render_idx, img_stitch)
+        # Keep this frame's recolour-marker detections so finalize() can rebuild
+        # the opaque overlay at the globally-corrected pose (the online quads in
+        # self._marker_paints are in pre-correction coords and get discarded).
+        if self.cfg.marker_color_map and len(mask_markers):
+            self._marker_obs[self._render_idx] = mask_markers
         self._render_idx += 1
         return kf_id
 
@@ -2269,6 +2387,37 @@ class MapReconstructor:
             shutil.rmtree(self._cache_dir, ignore_errors=True)
         self._cache_dir = None
 
+    def _accumulate_marker_paints(self, mask_markers, H: np.ndarray) -> None:
+        """Project each recolour-listed marker's quad into canvas coords via the
+        frame's placement homography H and queue it for the final opaque overlay.
+
+        Queuing (rather than painting now) is deliberate: the paint must land
+        AFTER every frame has been blended, otherwise a later overlapping frame
+        feather-blends over it and the dilution returns.
+        """
+        cmap = self.cfg.marker_color_map
+        if not cmap or not mask_markers:
+            return
+        for m in mask_markers:
+            bgr = cmap.get(m.marker_id)
+            if bgr is None:
+                continue
+            pts = m.corners_px.reshape(-1, 1, 2).astype(np.float64)
+            quad = np.round(cv2.perspectiveTransform(pts, H)).astype(np.int32)
+            self._marker_paints.append((quad, bgr))
+
+    def _paint_marker_overlays(self) -> None:
+        """Fill every queued marker quad opaquely onto the canvas.
+
+        Called as the LAST step of map generation (after all blending and any
+        pose-graph re-render) so the solid colour cannot be diluted. Quads that
+        fall partly outside the canvas are clipped by fillConvexPoly.
+        """
+        if self._canvas is None or not self._marker_paints:
+            return
+        for quad, bgr in self._marker_paints:
+            cv2.fillConvexPoly(self._canvas, quad, bgr)
+
     def finalize(self, verbose: bool = True) -> Optional[dict]:
         """Run the global pose-graph solve and re-render the corrected map.
 
@@ -2291,12 +2440,16 @@ class MapReconstructor:
         del old_canvas
         # Reset the coverage mask so the re-render rebuilds it from scratch.
         self._coverage = np.zeros(fresh.shape[:2], dtype=np.bool_)
+        # Discard the online overlay quads (pre-correction coords) and rebuild
+        # them below at the corrected poses.
+        self._marker_paints = []
         n = 0
         for rec_idx, H_corr in self._sg.iter_corrections():
             img = self._load_cached_frame(rec_idx)
             if img is None:
                 continue
             self._warp_and_blend_roi(img, H_corr)
+            self._accumulate_marker_paints(self._marker_obs.get(rec_idx, ()), H_corr)
             n += 1
         self._cleanup_cache()
         self._finalized = True
@@ -2446,6 +2599,11 @@ class MapReconstructor:
         T = np.array([[1, 0, pl], [0, 1, pt], [0, 0, 1]], dtype=np.float64)
         for rec in (*self._recent, *self._keyframes):
             rec["H"] = T @ rec["H"]
+
+        # Already-queued marker overlays live in canvas coords → shift them too.
+        if self._marker_paints:
+            shift = np.array([[[pl, pt]]], dtype=np.int32)
+            self._marker_paints = [(q + shift, c) for q, c in self._marker_paints]
 
         return T @ H
 

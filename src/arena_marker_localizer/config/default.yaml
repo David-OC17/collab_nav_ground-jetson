@@ -31,13 +31,13 @@ marker_localizer_service:
     #   yaw: 0.0
     
     # Bad result from calibrate_extrinsics without theta constraints — reverted
-    # T_drone_from_cam:
-    #   x    : 0.035
-    #   y    : 0.0
-    #   z    : 0.0
-    #   roll : 3.14159   # 180 deg — flip camera +Z to point along drone -Z
-    #   pitch: 0.0 # 90.0 deg
-    #   yaw  : 0.0
+    T_drone_from_cam:
+      x    : 0.035
+      y    : 0.0
+      z    : 0.0
+      roll : 3.14159   # 180 deg — flip camera +Z to point along drone -Z
+      pitch: 0.0 # 90.0 deg
+      yaw  : 0.0
     # T_drone_from_cam:
     #   x    : -0.265000
     #   y    : 0.000000
@@ -48,28 +48,28 @@ marker_localizer_service:
 
     # ── Static transform: map-frame from OptiTrack-frame ──
     #    (where the OccupancyGrid origin sits in the OptiTrack frame)
-    # T_map_from_opti:
-    #   x: 1.93 # cm
-    #   y: 1.91 # cm
-    #   z: 0.0
-    #   roll: 0.0
-    #   pitch: 0.0
-    #   yaw: 1.570795 # 90.000 deg
     T_map_from_opti:
-      x    : 1.785956
-      y    : 1.809220
-      z    : 0.000000
-      roll : 0.000000   # 0.000 deg
-      pitch: 0.000000   # 0.000 deg
-      yaw  : 1.570795   # 90.000 deg
+      x: 1.93 # cm
+      y: 1.91 # cm
+      z: 0.0
+      roll: 0.0
+      pitch: 0.0
+      yaw: 1.570795 # 90.000 deg
+    # T_map_from_opti:
+    #   x    : 1.785956
+    #   y    : 1.809220
+    #   z    : 0.000000
+    #   roll : 0.000000   # 0.000 deg
+    #   pitch: 0.000000   # 0.000 deg
+    #   yaw  : 1.570795   # 90.000 deg
 
-    T_drone_from_cam:
-      x    : 0.035000
-      y    : 0.000000
-      z    : 0.000000
-      roll : 3.141590   # 180.000 deg
-      pitch: 0.000000   # 0.000 deg
-      yaw  : 0.044292   # 2.538 deg
+    # T_drone_from_cam:
+    #   x    : 0.035000
+    #   y    : 0.000000
+    #   z    : 0.000000
+    #   roll : 3.141590   # 180.000 deg
+    #   pitch: 0.000000   # 0.000 deg
+    #   yaw  : 0.044292   # 2.538 deg
 
     optitrack:
       yaw_axis: "z"     # "z" or "y"

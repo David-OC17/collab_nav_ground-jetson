@@ -23,7 +23,7 @@ import os
 import threading
 import time
 from dataclasses import replace
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -51,6 +51,8 @@ from arena_map_builder.processing.drone_map_grid_gen import (
     ReconstructConfig,
     ColorRangeMask,
     reconstruct_from_video,
+    CYAN_BGR,
+    RED_BGR,
 )
 
 # Wrapper-side modules
@@ -62,6 +64,7 @@ from arena_map_builder.occupancy import (
     OccupancyConfig,
     rasterize_occupancy,
     occupancy_to_grid_array,
+    locate_color_marker_m,
 )
 
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
@@ -143,8 +146,8 @@ class BuildArenaMapServer(Node):
         self.declare_parameter("stitch.reconstruct.processing_scale",          0.5)
         self.declare_parameter("stitch.reconstruct.max_keyframes",              20)
         self.declare_parameter("stitch.reconstruct.max_canvas_px",            8000)
-        self.declare_parameter("stitch.reconstruct.match_ratio",              0.65)
-        self.declare_parameter("stitch.reconstruct.mad_factor",                4.0)
+        self.declare_parameter("stitch.reconstruct.match_ratio",              0.80)
+        self.declare_parameter("stitch.reconstruct.mad_factor",                6.0)
         self.declare_parameter("stitch.reconstruct.feature_exclude_dilate_px",   5)
         self.declare_parameter("stitch.reconstruct.min_keypoint_bins",          10)
 
@@ -158,7 +161,7 @@ class BuildArenaMapServer(Node):
         self.declare_parameter("stitch.reconstruct.grid_hsv_v_lo",              50)
 
         # Feature extractor / matcher (independent)
-        self.declare_parameter("stitch.reconstruct.feature_extractor", "sift")
+        self.declare_parameter("stitch.reconstruct.feature_extractor", "superpoint")
         self.declare_parameter("stitch.reconstruct.feature_matcher",   "ratio_test")
         self.declare_parameter("stitch.reconstruct.sp_ort_provider",   "cuda")
         self.declare_parameter("stitch.reconstruct.sp_onnx_path",      "")
@@ -194,9 +197,29 @@ class BuildArenaMapServer(Node):
         # with an explicit STRING_ARRAY descriptor.
         self.declare_parameter(
             "stitch.reconstruct.feature_exclude_hsv",
-            ["blue_tape:90,125,60,255,60,255:255,255,255"],
+            [],
             ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY),
         )
+
+        # ArUco marker recolouring — each detected marker's exact quad is filled
+        # with a solid BGR colour keyed by its ID. Encoded as a string array
+        # where each item is "id:B,G,R" (markers whose ID is absent are left
+        # untouched). An empty array disables marker recolouring.
+        self.declare_parameter(
+            "stitch.reconstruct.marker_color_map",
+            [
+                f"5:{CYAN_BGR[0]},{CYAN_BGR[1]},{CYAN_BGR[2]}",  # marker 5 → cyan
+                f"0:{RED_BGR[0]},{RED_BGR[1]},{RED_BGR[2]}",     # marker 0 → red
+            ],
+            ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY),
+        )
+
+        # --- Marker localisation (goal / AMR fiducials) ---------------------
+        # Which masked ArUco ID is the goal and which is the AMR. Both IDs MUST
+        # appear in stitch.reconstruct.marker_color_map (they have to be coloured
+        # in for the transfer stage to locate them); the run aborts otherwise.
+        self.declare_parameter("marker.goal_id", 0)
+        self.declare_parameter("marker.amr_id",  5)
 
         # --- Transfer (TransferConfig) --------------------------------------
         self.declare_parameter("transfer.correct_perspective", True)
@@ -321,6 +344,27 @@ class BuildArenaMapServer(Node):
                 out.append(m)
         return out
 
+    def _parse_marker_color_map(
+        self, param_name: str
+    ) -> Dict[int, Tuple[int, int, int]]:
+        """Parse a ``["id:B,G,R", ...]`` string array into a
+        {marker_id: (B, G, R)} dict. Malformed entries are warned and skipped
+        so a single bad entry doesn't abort the run."""
+        raw = self._get(param_name) or []
+        out: Dict[int, Tuple[int, int, int]] = {}
+        for spec in raw:
+            try:
+                id_part, bgr_part = spec.split(":")
+                mid = int(id_part.strip())
+                b, g, r = [int(x.strip()) for x in bgr_part.split(",")]
+                out[mid] = (b, g, r)
+            except Exception:
+                self.get_logger().warn(
+                    f"Ignoring malformed {param_name} entry: {spec!r}. "
+                    f"Expected 'id:B,G,R'."
+                )
+        return out
+
     def _on_params_changed(self, params) -> SetParametersResult:
         """Validate parameter changes before they are applied.
 
@@ -385,6 +429,8 @@ class BuildArenaMapServer(Node):
                 "stitch.reconstruct.color_masks"),
             feature_exclude_hsv       = self._parse_color_mask_list(
                 "stitch.reconstruct.feature_exclude_hsv"),
+            marker_color_map          = self._parse_marker_color_map(
+                "stitch.reconstruct.marker_color_map"),
             feature_extractor         = str(self._get("stitch.reconstruct.feature_extractor")),
             feature_matcher           = str(self._get("stitch.reconstruct.feature_matcher")),
             sp_ort_provider           = str(self._get("stitch.reconstruct.sp_ort_provider")),
@@ -452,6 +498,24 @@ class BuildArenaMapServer(Node):
             return self._abort(goal_handle,
                                f"transfer.background_path not set or missing: "
                                f"{bg_path!r}")
+
+        # Marker localisation config: the goal/AMR IDs must be coloured in by the
+        # stitcher (present in marker_color_map) — that solid colour is what the
+        # transfer stage keys on to locate them. Validate before doing any work.
+        marker_map = self._parse_marker_color_map(
+            "stitch.reconstruct.marker_color_map")
+        goal_id = int(self._get("marker.goal_id"))
+        amr_id  = int(self._get("marker.amr_id"))
+        if goal_id == amr_id:
+            return self._abort(goal_handle,
+                               f"marker.goal_id and marker.amr_id are both {goal_id}; "
+                               f"they must be different markers.")
+        missing = [mid for mid in (goal_id, amr_id) if mid not in marker_map]
+        if missing:
+            return self._abort(goal_handle,
+                               f"marker IDs {missing} are not coloured in "
+                               f"stitch.reconstruct.marker_color_map "
+                               f"(have {sorted(marker_map)}); they cannot be located.")
 
         # ── 2) Stitch video → top-down map ─────────────────────────────
         self._emit_feedback(goal_handle, "stitching", 0.0, "Stitching video")
@@ -560,12 +624,13 @@ class BuildArenaMapServer(Node):
         msg.data = data_flat.astype(np.int8).tolist()
 
         # ── 6) Done ────────────────────────────────────────────────────
+        # Build the FULL result (including the marker fields) BEFORE publishing
+        # and succeed(). Anything that can still raise here — e.g. populating a
+        # result field — must happen while the goal is still executing; raising
+        # after succeed() would force an abort() on an already-succeeded goal and
+        # the client would receive an empty, reason-less failure result.
         self._emit_feedback(goal_handle, "done", 1.0,
                             f"OccupancyGrid ready ({width}x{height} cells)")
-        # Publish occupancy grid 
-        self._map_pub.publish(msg)
-        
-        goal_handle.succeed()
 
         result = BuildArenaMap.Result()
         result.map = msg
@@ -576,6 +641,38 @@ class BuildArenaMapServer(Node):
             np.mean([o.overall for o in obstacles]) if obstacles else 0.0
         )
         result.debug_dir = debug_dir
+
+        # Marker centres (goal / AMR) in occupancy-grid metres from the
+        # bottom-left origin. Detected by their solid mask colour in the same
+        # dewarped+cropped frame the obstacles are projected from; NaN when a
+        # marker isn't present (or detection fails) — never fatal to the build.
+        cleaned = stages.get("wall_masked")
+
+        def _marker_point(mid: int) -> Point:
+            try:
+                pos = (locate_color_marker_m(cleaned, marker_map[mid], ocfg)
+                       if cleaned is not None else None)
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"Marker {mid} localisation failed: {exc}")
+                pos = None
+            if pos is None:
+                return Point(x=float("nan"), y=float("nan"), z=0.0)
+            return Point(x=float(pos[0]), y=float(pos[1]), z=0.0)
+
+        result.goal_marker_position = _marker_point(goal_id)
+        result.amr_marker_position  = _marker_point(amr_id)
+        self.get_logger().info(
+            "Marker centres (m from bottom-left): "
+            f"goal=({result.goal_marker_position.x:.3f}, "
+            f"{result.goal_marker_position.y:.3f})  "
+            f"amr=({result.amr_marker_position.x:.3f}, "
+            f"{result.amr_marker_position.y:.3f})"
+        )
+
+        # Result is fully populated → publish the map and finalise the goal.
+        self._map_pub.publish(msg)
+        goal_handle.succeed()
         return result
 
     # -----------------------------------------------------------------------

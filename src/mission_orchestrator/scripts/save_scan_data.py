@@ -5,14 +5,16 @@ and save the outputs for use with run_hw_test_amr_nav.py.
 
 No AMR hardware is required — only the drone scan files on disk.
 
-Stages that run:
+Stages that run (in execution order):
   06   Wait for scan.mp4 and telemetry.csv
   11   Verify scan.mp4 integrity via ffmpeg
   15   Launch arena_marker_localizer service node
-  16   Call /localize_markers service
-  17   Publish /aruco/amr/pose and /aruco/goal/pose  → saved to YAML
+  16   Call /localize_markers service                 (marker ORIENTATION source)
   18   Launch arena_map_builder server
-  19   Call BuildArenaMap action
+  19   Call BuildArenaMap action                      (marker POSITION source)
+  17   Publish /aruco/amr/pose and /aruco/goal/pose  → saved to YAML
+       (position from the map-builder result, orientation from the localizer;
+        if --ground-truth is given, AMR/goal pose errors vs GT are printed here)
   20   Publish /drone/map                             → saved to YAML
 
 All other stages (01-05 drone, 07-10 AMR bringup, 12-13 traj/fusion,
@@ -29,6 +31,10 @@ Usage (from workspace root, after sourcing install/setup.bash):
 Override ArUco marker IDs (AMR then goal):
     python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 10 --aruco-ids '[3, 7]'
 
+Print AMR/goal pose errors vs a ground-truth file:
+    python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 20 \\
+        --ground-truth src/arena_marker_localizer/config/aruco_pose_gt/scan20.yaml
+
 With a custom config:
     python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 10 \\
         --config /abs/path/to/orchestrator_params.yaml
@@ -38,11 +44,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import sys
 import threading
 import time
+from typing import Optional
+
+import yaml
 
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
@@ -55,7 +65,10 @@ sys.path.insert(
     os.path.normpath(os.path.join(_SCRIPTS_DIR, '..')),
 )
 
-from mission_orchestrator.orchestrator_node import MissionOrchestratorNode  # noqa: E402
+from mission_orchestrator.orchestrator_node import (  # noqa: E402
+    MissionOrchestratorNode,
+    _yaw_from_quat,
+)
 from mission_orchestrator.scan_data_io import (  # noqa: E402
     recorded_data_dir,
     scan_video_dir,
@@ -68,6 +81,32 @@ _DEFAULT_CONFIG = os.path.normpath(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Ground-truth helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _wrap_deg(angle_deg: float) -> float:
+    """Wrap an angle in degrees to (-180, 180]."""
+    return (angle_deg + 180.0) % 360.0 - 180.0
+
+
+def _load_ground_truth(path: str) -> dict:
+    """Load a marker ground-truth YAML into {int id: {'x', 'y', 'theta'}}.
+
+    Same format the arena_marker_localizer calibration uses, e.g.::
+
+        markers:
+          0: {x: 0.76, y: 0.785, theta: 0}
+          2: {x: 3.065, y: 0.781, theta: 180}
+
+    x/y are in metres; theta is in DEGREES.
+    """
+    with open(path, 'r') as fh:
+        data = yaml.safe_load(fh) or {}
+    markers = data.get('markers', data)
+    return {int(k): v for k, v in markers.items()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Orchestrator subclass: only stages 06+11+15-20 run; everything else no-ops
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -75,6 +114,8 @@ class _SaveScanOrchestrator(MissionOrchestratorNode):
     """Run localizer + map builder from drone scan files; save aruco poses and map."""
 
     _output_dir: str = ''
+    # When set (via --ground-truth), stage 17 prints AMR/goal pose errors vs GT.
+    _gt_markers: Optional[dict] = None
 
     # ── No-op: drone pipeline (01-05) ────────────────────────────────────────
 
@@ -128,20 +169,63 @@ class _SaveScanOrchestrator(MissionOrchestratorNode):
 
     # ── Stage 17 override: publish + save aruco poses ─────────────────────────
 
-    def _stage_17_publish_aruco_poses(self, markers) -> None:
-        super()._stage_17_publish_aruco_poses(markers)
+    def _stage_17_publish_aruco_poses(self, markers, map_result) -> None:
+        super()._stage_17_publish_aruco_poses(markers, map_result)
 
         cfg_a = self._cfg['aruco']
         amr_id = cfg_a['amr_marker_id']
         goal_id = cfg_a['goal_marker_id']
         by_id = {int(m.id): m for m in markers}
 
+        # Save the SAME messages that were just published: map-builder position +
+        # localizer orientation. _build_marker_pose is idempotent (super() already
+        # populated these in place), so this returns the exact published poses.
+        amr_pose = self._build_marker_pose(
+            by_id[amr_id], map_result.amr_marker_position, "AMR", amr_id)
+        goal_pose = self._build_marker_pose(
+            by_id[goal_id], map_result.goal_marker_position, "goal", goal_id)
+
         amr_path = os.path.join(self._output_dir, 'aruco_amr_pose.yaml')
         goal_path = os.path.join(self._output_dir, 'aruco_goal_pose.yaml')
-        save_pose(amr_path, by_id[amr_id].pose_with_covariance)
-        save_pose(goal_path, by_id[goal_id].pose_with_covariance)
+        save_pose(amr_path, amr_pose)
+        save_pose(goal_path, goal_pose)
         self._log.info(f"  [save] aruco_amr_pose.yaml  → {amr_path!r}")
         self._log.info(f"  [save] aruco_goal_pose.yaml → {goal_path!r}")
+
+        # If a ground-truth file was provided, report the error of the FINAL
+        # (map-builder position + localizer orientation) AMR and goal poses.
+        if self._gt_markers is not None:
+            self._log.info("  [gt] Marker pose error vs ground truth:")
+            self._print_marker_gt_error("AMR", amr_id, amr_pose)
+            self._print_marker_gt_error("goal", goal_id, goal_pose)
+
+    def _print_marker_gt_error(self, label: str, marker_id: int, pose) -> None:
+        """Print the final pose's error vs ground truth for one marker:
+        per-axis (Δx, Δy in metres; Δθ in degrees, wrapped) plus the euclidean
+        position error. `pose` is the published PoseWithCovarianceStamped."""
+        gt = (self._gt_markers or {}).get(int(marker_id))
+        if gt is None:
+            self._log.warning(
+                f"    {label} (id={marker_id}): no ground-truth entry "
+                f"(have ids: {sorted((self._gt_markers or {}).keys())}) — skipped")
+            return
+
+        gt_x, gt_y, gt_th = float(gt['x']), float(gt['y']), float(gt['theta'])
+        px = pose.pose.pose.position.x
+        py = pose.pose.pose.position.y
+        yaw_deg = math.degrees(_yaw_from_quat(pose.pose.pose.orientation))
+
+        dx = px - gt_x
+        dy = py - gt_y
+        dist = math.hypot(dx, dy)
+        dth = _wrap_deg(yaw_deg - gt_th)
+
+        self._log.info(
+            f"    {label} (id={marker_id}): "
+            f"Δx={dx:+.3f} m  Δy={dy:+.3f} m  |Δpos|={dist:.3f} m  Δθ={dth:+.2f}°")
+        self._log.info(
+            f"        got  x={px:.3f} y={py:.3f} θ={yaw_deg:+.2f}°   "
+            f"gt  x={gt_x:.3f} y={gt_y:.3f} θ={gt_th:+.2f}°")
 
     # ── Stage 20 override: publish + save drone map ───────────────────────────
 
@@ -181,6 +265,16 @@ def main() -> None:
             'Overrides aruco.amr_marker_id and aruco.goal_marker_id in the YAML.'
         ),
     )
+    parser.add_argument(
+        '--ground-truth', default=None, metavar='PATH',
+        help=(
+            'Optional marker ground-truth YAML (same format the '
+            'arena_marker_localizer calibration uses, e.g. '
+            'src/arena_marker_localizer/config/aruco_pose_gt/scanN.yaml).  When '
+            'given, the AMR and goal pose errors vs ground truth (Δx, Δy, Δθ and '
+            'euclidean) are printed after the poses are saved.'
+        ),
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.config):
@@ -213,6 +307,14 @@ def main() -> None:
         node._cfg['aruco']['amr_marker_id'] = ids[0]
         node._cfg['aruco']['goal_marker_id'] = ids[1]
         node._log.info(f"[--aruco-ids] amr_marker_id={ids[0]}, goal_marker_id={ids[1]}")
+
+    if args.ground_truth is not None:
+        if not os.path.isfile(args.ground_truth):
+            sys.exit(f"ERROR: ground-truth file not found: {args.ground_truth}")
+        node._gt_markers = _load_ground_truth(args.ground_truth)
+        node._log.info(
+            f"[--ground-truth] loaded {len(node._gt_markers)} marker(s) from "
+            f"{args.ground_truth!r}")
 
     cfg_v = node._cfg['video']
     for fname_key in ('video_filename', 'telemetry_filename'):

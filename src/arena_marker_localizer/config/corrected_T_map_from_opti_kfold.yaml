@@ -1,0 +1,160 @@
+summary:
+  n_folds: 6
+  total_test_points: 14
+  min_pos_error_m: 0.060596
+  mean_pos_error_m: 0.190522
+  max_pos_error_m: 0.328066
+  mean_ang_error_deg: 0.9791
+folds:
+- fold: 1
+  train_pairs:
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  test_pairs:
+  - 1
+  fitted:
+    c_x: -0.028003
+    c_y: 0.050519
+    dx_d: -0.1
+    dy_d: -0.082285
+    dz_d: 0.1
+    scale: 0.0
+  condition_number: 18.44
+  degenerate: false
+  rms_pos_m: 0.234405
+  test_pos_errors_m:
+  - 0.317356
+  - 0.095791
+  mean_ang_err_deg: 0.5219
+- fold: 2
+  train_pairs:
+  - 1
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  test_pairs:
+  - 2
+  fitted:
+    c_x: -0.038275
+    c_y: 0.038927
+    dx_d: -0.1
+    dy_d: -0.072867
+    dz_d: 0.1
+    scale: 0.0
+  condition_number: 18.36
+  degenerate: false
+  rms_pos_m: 0.186619
+  test_pos_errors_m:
+  - 0.186619
+  mean_ang_err_deg: 0.4477
+- fold: 3
+  train_pairs:
+  - 1
+  - 2
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  test_pairs:
+  - 3
+  fitted:
+    c_x: -0.050822
+    c_y: 0.04155
+    dx_d: -0.1
+    dy_d: -0.07611
+    dz_d: 0.1
+    scale: 0.0
+  condition_number: 16.14
+  degenerate: false
+  rms_pos_m: 0.108555
+  test_pos_errors_m:
+  - 0.136883
+  - 0.060596
+  - 0.11377
+  mean_ang_err_deg: 1.5895
+- fold: 4
+  train_pairs:
+  - 1
+  - 2
+  - 3
+  - 5
+  - 6
+  - 7
+  - 8
+  test_pairs:
+  - 4
+  fitted:
+    c_x: -0.042802
+    c_y: 0.038815
+    dx_d: -0.1
+    dy_d: -0.04696
+    dz_d: 0.1
+    scale: 0.0
+  condition_number: 17.31
+  degenerate: false
+  rms_pos_m: 0.11269
+  test_pos_errors_m:
+  - 0.099652
+  - 0.124368
+  mean_ang_err_deg: 1.0791
+- fold: 5
+  train_pairs:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 6
+  - 7
+  - 8
+  test_pairs:
+  - 5
+  fitted:
+    c_x: -0.122482
+    c_y: 0.000499
+    dx_d: -0.1
+    dy_d: -0.056252
+    dz_d: 0.1
+    scale: 0.0
+  condition_number: 22.34
+  degenerate: false
+  rms_pos_m: 0.242531
+  test_pos_errors_m:
+  - 0.291599
+  - 0.247078
+  - 0.226525
+  - 0.232804
+  - 0.206198
+  mean_ang_err_deg: 0.4817
+- fold: 8
+  train_pairs:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  test_pairs:
+  - 8
+  fitted:
+    c_x: -0.026268
+    c_y: 0.050601
+    dx_d: -0.1
+    dy_d: -0.03599
+    dz_d: 0.1
+    scale: 0.0
+  condition_number: 18.46
+  degenerate: false
+  rms_pos_m: 0.328066
+  test_pos_errors_m:
+  - 0.328066
+  mean_ang_err_deg: 2.8803

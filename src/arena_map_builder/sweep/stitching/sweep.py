@@ -257,12 +257,14 @@ class SweepClient(Node):
 # Server process management
 # ══════════════════════════════════════════════════════════════════════════════
 
-def start_server() -> subprocess.Popen:
-    print("  Starting build_arena_map_server…")
+def start_server(log_path: Optional[Path] = None) -> subprocess.Popen:
+    log_path = log_path or Path("/tmp/build_arena_map_server.log")
+    print(f"  Starting build_arena_map_server… (log: {log_path})")
+    log_file = open(log_path, "w", buffering=1)
     return subprocess.Popen(
         ["ros2", "run", "arena_map_builder", "build_arena_map_server"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stdout=log_file,
+        stderr=log_file,
     )
 
 
@@ -399,7 +401,7 @@ def main() -> None:
     # ── start server ───────────────────────────────────────────────────────
     server_proc: Optional[subprocess.Popen] = None
     if not args.no_server:
-        server_proc = start_server()
+        server_proc = start_server(output_dir / "server.log")
 
     # Graceful shutdown on SIGINT / SIGTERM
     _shutdown = {"requested": False}
@@ -435,7 +437,7 @@ def main() -> None:
         # Restart server if it died
         if not args.no_server and not server_alive(server_proc):
             print("  [!] Server process died — restarting…")
-            server_proc = start_server()
+            server_proc = start_server(output_dir / "server.log")
             if not client.wait_for_server(timeout_s=120.0):
                 print("[ERROR] Server did not recover. Stopping sweep.")
                 break

@@ -104,6 +104,10 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
     _goal_y: float = 0.0
     _goal_set: bool = False
 
+    _map_source_topic: str = '/fusion/map'
+    _map_source_timeout_sec: float = 30.0
+
+
     # ── Extra subscription: AMR EKF pose for goal monitoring ──────────────────
 
     def _init_ros_interfaces(self) -> None:
@@ -180,6 +184,26 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
         amr_pose = load_pose(amr_path)
         goal_pose = load_pose(goal_path)
 
+        if getattr(self, '_override_start_x', None) is not None:
+            amr_pose.pose.pose.position.x = self._override_start_x
+            amr_pose.pose.pose.position.y = self._override_start_y
+        if getattr(self, '_override_start_yaw', None) is not None:
+            yaw = self._override_start_yaw
+            amr_pose.pose.pose.orientation.x = 0.0
+            amr_pose.pose.pose.orientation.y = 0.0
+            amr_pose.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            amr_pose.pose.pose.orientation.w = math.cos(yaw / 2.0)
+
+        if getattr(self, '_override_goal_x', None) is not None:
+            goal_pose.pose.pose.position.x = self._override_goal_x
+            goal_pose.pose.pose.position.y = self._override_goal_y
+        if getattr(self, '_override_goal_yaw', None) is not None:
+            yaw = self._override_goal_yaw
+            goal_pose.pose.pose.orientation.x = 0.0
+            goal_pose.pose.pose.orientation.y = 0.0
+            goal_pose.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            goal_pose.pose.pose.orientation.w = math.cos(yaw / 2.0)
+            
         # Store goal xy for the goal-reached monitor
         self._goal_x = goal_pose.pose.pose.position.x
         self._goal_y = goal_pose.pose.pose.position.y
@@ -263,6 +287,25 @@ def main() -> None:
             'in the YAML (default: /tmp/mission_orchestrator_logs).'
         ),
     )
+    parser.add_argument(
+        '--map-topic', default='/fusion/map', metavar='TOPIC',
+        help='Topic to capture the OccupancyGrid from in stage 19 '
+             '(default: /fusion/map, matching your map_server -r /map:=/fusion/map).')
+    parser.add_argument(
+        '--map-timeout', type=float, default=30.0, metavar='SECONDS',
+        help='How long to wait for a map message on --map-topic (default: 30 s).')
+
+    # Set custom start and goal positions 
+    parser.add_argument('--start-x', type=float, default=None)
+    parser.add_argument('--start-y', type=float, default=None)
+    parser.add_argument('--goal-x',  type=float, default=None)
+    parser.add_argument('--goal-y',  type=float, default=None)
+
+    parser.add_argument('--start-yaw', type=float, default=None,
+                        metavar='RAD', help='Start yaw in radians (overrides saved data).')
+    parser.add_argument('--goal-yaw',  type=float, default=None,
+                        metavar='RAD', help='Goal yaw in radians (overrides saved data).')
+
     args = parser.parse_args()
 
     if not os.path.isfile(args.config):
@@ -280,6 +323,17 @@ def main() -> None:
     node.skip_trajectory_planner = not args.trajectory_planner
     node._scan_data_dir = data_dir
     node._goal_tolerance_m = args.goal_tolerance
+
+    node._override_start_x = args.start_x
+    node._override_start_y = args.start_y
+    node._override_goal_x  = args.goal_x
+    node._override_goal_y  = args.goal_y
+
+    node._override_start_yaw = args.start_yaw
+    node._override_goal_yaw  = args.goal_yaw
+
+    node._map_source_topic = args.map_topic
+    node._map_source_timeout_sec = args.map_timeout
 
     if args.rosbag:
         node._cfg.setdefault('rosbag', {})['enabled'] = True

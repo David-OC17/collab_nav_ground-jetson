@@ -22,10 +22,14 @@ Stages
 14  Launch oradar lidar
  14b Launch emergency_stop node; verify next 10 /amr/emergency_stop messages are False
 15  Launch arena_marker_localizer service node + wait for readiness
-16  Call /localize_markers service → parse marker poses
-17  Publish /aruco/amr/pose and /aruco/goal/pose as PoseWithCovarianceStamped
+16  Call /localize_markers service → parse marker poses (ORIENTATION source)
 18  Launch arena_map_builder server + set background_path parameter
-19  Send BuildArenaMap action goal → wait for result
+19  Send BuildArenaMap action goal → wait for result (marker POSITION source)
+17  Publish /aruco/amr/pose and /aruco/goal/pose as PoseWithCovarianceStamped,
+    built from the map-builder marker position + the localizer orientation.
+    Runs only after BOTH stage 16 and stage 19 have returned successfully.
+17b Launch alignment_node (translates the /aruco/amr/pose to world->odom tf)
+17c Launch odom-based mapper (no SLAM)
 20  Publish the resulting OccupancyGrid to /drone/map
 
 From stage 20 onward the orchestrator only observes; map_fusion and
@@ -623,6 +627,26 @@ class MissionOrchestratorNode(Node):
         self._verify_optitrack_header()
         self._log.info("╚══ Stage 01 OK: OptiTrack verified")
 
+    def _stage_17b_publish_static_tf(self)->None:
+        self._log.info("╔══ Stage 17b: Publish static TF world->odom")
+        proc = subprocess.Popen(
+            ['ros2', 'run', 'amr_drone_nav', 'alignment_node'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._processes['world_odom_tf'] = proc
+        self._log.info(f"  static TF world->odom launched (pid={proc.pid})")
+
+    def _stage_17c_amr_mapper(self)->None:
+        self._log.info("╔══ Stage 17c: AMR Mapper")
+        proc = subprocess.Popen(
+            ['ros2', 'launch', 'world_mapper', 'mapper.launch.py'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._processes['amr_mapper'] = proc
+        self._log.info(f"  amr_mapper launched (pid={proc.pid})")
+
+
+
     def _wait_optitrack_message(self) -> bool:
         self._optitrack_event.clear()
         return self._optitrack_event.wait(timeout=self._cfg['optitrack']['check_timeout_sec'])
@@ -968,7 +992,7 @@ class MissionOrchestratorNode(Node):
         self._log.info("╚══ Stage 16 OK")
         return markers
 
-    def _stage_17_publish_aruco_poses(self, markers: List) -> None:
+    def _stage_17_publish_aruco_poses(self, markers: List, map_result) -> None:
         self._log.info("╔══ Stage 17: Publish /aruco/amr/pose and /aruco/goal/pose")
         cfg_a = self._cfg['aruco']
         amr_id = cfg_a['amr_marker_id']
@@ -985,11 +1009,53 @@ class MissionOrchestratorNode(Node):
                 f"Goal marker id={goal_id} not found in localizer response "
                 f"(found ids: {sorted(by_id.keys())})")
 
-        self._pub_aruco_amr.publish(by_id[amr_id].pose_with_covariance)
-        self._pub_aruco_goal.publish(by_id[goal_id].pose_with_covariance)
-        self._log.info(f"  Published AMR pose (marker {amr_id}) to {cfg_a['amr_pose_topic']}")
-        self._log.info(f"  Published goal pose (marker {goal_id}) to {cfg_a['goal_pose_topic']}")
+        # POSITION comes from the arena_map_builder result; ORIENTATION (and
+        # covariance + header/frame) from the marker localizer. Both express the
+        # marker in the same map frame (origin at the OccupancyGrid bottom-left),
+        # so substituting only the position is frame-consistent.
+        amr_pose = self._build_marker_pose(
+            by_id[amr_id], map_result.amr_marker_position, "AMR", amr_id)
+        goal_pose = self._build_marker_pose(
+            by_id[goal_id], map_result.goal_marker_position, "goal", goal_id)
+
+        self._pub_aruco_amr.publish(amr_pose)
+        self._pub_aruco_goal.publish(goal_pose)
+        self._log.info(
+            f"  AMR  (marker {amr_id}): map pos="
+            f"({amr_pose.pose.pose.position.x:.3f}, {amr_pose.pose.pose.position.y:.3f}) "
+            f"θ={math.degrees(_yaw_from_quat(amr_pose.pose.pose.orientation)):.1f}° "
+            f"→ {cfg_a['amr_pose_topic']}")
+        self._log.info(
+            f"  goal (marker {goal_id}): map pos="
+            f"({goal_pose.pose.pose.position.x:.3f}, {goal_pose.pose.pose.position.y:.3f}) "
+            f"θ={math.degrees(_yaw_from_quat(goal_pose.pose.pose.orientation)):.1f}° "
+            f"→ {cfg_a['goal_pose_topic']}")
         self._log.info("╚══ Stage 17 OK")
+
+    def _build_marker_pose(self, marker, position, label: str, marker_id: int):
+        """Build the PoseWithCovarianceStamped to publish for one marker.
+
+        POSITION is taken from the map-builder result (`position` is a
+        geometry_msgs/Point in metres from the OccupancyGrid's bottom-left
+        origin); ORIENTATION, covariance, and the header/frame are taken from the
+        localizer's `marker.pose_with_covariance`. The localizer's map frame and
+        the grid frame share that same origin, so only the position is swapped.
+
+        Aborts the mission if the map-builder could not locate the marker (its
+        result Point is NaN) — there is then no valid position to publish.
+        """
+        if math.isnan(position.x) or math.isnan(position.y):
+            raise MissionAbortError(
+                f"{label} marker (id={marker_id}) was not located in the arena "
+                f"map (map-builder returned a NaN position); cannot publish its "
+                f"pose.")
+
+        pose = marker.pose_with_covariance   # PoseWithCovarianceStamped (localizer)
+        pose.pose.pose.position.x = float(position.x)
+        pose.pose.pose.position.y = float(position.y)
+        pose.pose.pose.position.z = 0.0
+        pose.header.stamp = self.get_clock().now().to_msg()
+        return pose
 
     def _stage_18_launch_map_builder(self) -> None:
         self._log.info("╔══ Stage 18: Launch arena_map_builder server")
@@ -1030,7 +1096,7 @@ class MissionOrchestratorNode(Node):
                 f"{result.stderr.strip()}")
         self._log.info("╚══ Stage 18 OK: map_builder ready")
 
-    def _stage_19_call_map_builder(self) -> OccupancyGrid:
+    def _stage_19_call_map_builder(self) -> "BuildArenaMap.Result":
         self._log.info("╔══ Stage 19: Call BuildArenaMap action")
         goal = BuildArenaMap.Goal()
         goal.video_path = self._video_path
@@ -1046,8 +1112,12 @@ class MissionOrchestratorNode(Node):
             f"  Map built: {result.map.info.width}×{result.map.info.height} cells, "
             f"{result.n_obstacles} obstacles, "
             f"mean consistency={result.mean_consistency:.3f}")
+        gp, ap = result.goal_marker_position, result.amr_marker_position
+        self._log.info(
+            f"  Marker centres (m from grid origin): "
+            f"goal=({gp.x:.3f}, {gp.y:.3f})  amr=({ap.x:.3f}, {ap.y:.3f})")
         self._log.info("╚══ Stage 19 OK")
-        return result.map
+        return result
 
     def _stage_20_publish_drone_map(self, grid: OccupancyGrid) -> None:
         self._log.info("╔══ Stage 20: Publish /drone/map")
@@ -1163,10 +1233,15 @@ class MissionOrchestratorNode(Node):
             self._stage_14b_launch_emergency_stop()
             self._stage_15_launch_marker_localizer()
             markers = self._stage_16_call_localize_markers()
-            self._stage_17_publish_aruco_poses(markers)
+            # The aruco poses take their POSITION from the map-builder result and
+            # their ORIENTATION from the localizer markers above, so the builder
+            # must run and return successfully BEFORE we publish them.
             self._stage_18_launch_map_builder()
-            grid = self._stage_19_call_map_builder()
-            self._stage_20_publish_drone_map(grid)
+            map_result = self._stage_19_call_map_builder()
+            self._stage_17_publish_aruco_poses(markers, map_result)
+            self._stage_17b_publish_static_tf()
+            self._stage_17c_amr_mapper()
+            self._stage_20_publish_drone_map(map_result.map)
 
             self._mission_complete = True
             self._log.info(

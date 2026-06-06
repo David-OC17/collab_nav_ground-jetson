@@ -247,6 +247,65 @@ def rasterize_occupancy(
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Marker localisation (goal / AMR fiducials masked as solid colour blocks)
+# ───────────────────────────────────────────────────────────────────────────
+
+def locate_color_marker_m(
+    cleaned_bgr: np.ndarray,
+    color_bgr:   Tuple[int, int, int],
+    cfg:         OccupancyConfig,
+    tol:         int = 40,
+    min_area_px: int = 9,
+) -> Optional[Tuple[float, float]]:
+    """Locate a solid-colour marker block and return its centre in metres.
+
+    The marker (e.g. an ArUco recoloured to a solid cyan/red block by the
+    stitcher) is detected by colour in `cleaned_bgr` — the transfer pipeline's
+    dewarped+cropped, wall-masked image (``stages["wall_masked"]``), which is
+    the SAME frame the obstacles are projected from in bbox mode.
+
+    Coordinate mapping (bbox projection)
+    ────────────────────────────────────
+    bbox-mode transfer maps the cleaned image's full extent linearly onto the
+    background wall bbox, and occupancy_to_grid_array() crops that same wall
+    bbox and scales it to (arena_width_m × arena_height_m). The intermediate
+    bbox cancels, so a centroid (cx, cy) maps to:
+
+        x_m = (cx / W_src) * arena_width_m
+        y_m = (1 - cy / H_src) * arena_height_m     # occupancy origin = bottom-left
+
+    which is exactly the transform an obstacle at the same pixel undergoes.
+
+    Returns (x_m, y_m), or None when the colour is absent (marker not in map).
+    """
+    b, g, r = color_bgr
+    lo = np.array([max(0, b - tol), max(0, g - tol), max(0, r - tol)], dtype=np.uint8)
+    hi = np.array([min(255, b + tol), min(255, g + tol), min(255, r + tol)], dtype=np.uint8)
+    mask = cv2.inRange(cleaned_bgr, lo, hi)
+
+    # Light close to fuse interpolation-blurred edges into one solid blob.
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = [c for c in contours if cv2.contourArea(c) >= min_area_px]
+    if not contours:
+        return None
+
+    c = max(contours, key=cv2.contourArea)
+    M = cv2.moments(c)
+    if M["m00"] == 0:
+        return None
+    cx = M["m10"] / M["m00"]
+    cy = M["m01"] / M["m00"]
+
+    H_src, W_src = cleaned_bgr.shape[:2]
+    x_m = (cx / max(W_src, 1)) * cfg.arena_width_m
+    y_m = (1.0 - cy / max(H_src, 1)) * cfg.arena_height_m
+    return (float(x_m), float(y_m))
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Final stage: build the OccupancyGrid msg (resampled to nav2 dims)
 # ───────────────────────────────────────────────────────────────────────────
 
