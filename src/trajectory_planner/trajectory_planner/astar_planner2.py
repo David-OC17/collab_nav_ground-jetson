@@ -202,6 +202,10 @@ class AStarPlanner2(Node):
         # ------------------------------------------------------------------
         self.path_pub = self.create_publisher(
             Path, '/trajectory_planner2/path', reliable_qos)
+        
+        # Notify when goal is lethal and planner failed (to replan in frontier explorer)
+        self.goal_failed_pub = self.create_publisher(
+            PoseWithCovarianceStamped, '/astar/goal_failed', reliable_qos)
 
         self.get_logger().info(
             'AStarPlanner2 ready\n'
@@ -423,6 +427,14 @@ class AStarPlanner2(Node):
 
         # Goal lethality check
         if self._is_lethal(gci, gcj):
+            # Notify frontier explorer so it can blacklist and pick a new goal
+            fail_msg = PoseWithCovarianceStamped()
+            fail_msg.header.stamp    = self.get_clock().now().to_msg()
+            fail_msg.header.frame_id = self.world_frame
+            fail_msg.pose.pose.position.x = self.goal_x
+            fail_msg.pose.pose.position.y = self.goal_y
+            self.goal_failed_pub.publish(fail_msg)
+
             self.get_logger().error(
                 f'Goal cell ({gci},{gcj}) is lethal — cannot plan.')
             return
