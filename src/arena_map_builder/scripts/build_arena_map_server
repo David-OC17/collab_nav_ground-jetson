@@ -20,6 +20,7 @@ directory; nothing is published to ROS topics.
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import time
 from dataclasses import replace
@@ -41,6 +42,8 @@ from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParameters
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import Pose, Point, Quaternion
 from nav_msgs.msg import OccupancyGrid, MapMetaData
+from sensor_msgs.msg import Image
+from std_srvs.srv import Trigger
 
 from arena_map_builder_msgs.action import BuildArenaMap
 
@@ -51,6 +54,8 @@ from arena_map_builder.processing.drone_map_grid_gen import (
     ReconstructConfig,
     ColorRangeMask,
     reconstruct_from_video,
+    MapReconstructor,
+    OnlineFrameGate,
     CYAN_BGR,
     RED_BGR,
 )
@@ -68,6 +73,24 @@ from arena_map_builder.occupancy import (
 )
 
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
+
+
+def _imgmsg_to_bgr(msg: Image) -> np.ndarray:
+    """Convert a sensor_msgs/Image (bgr8 / rgb8 / mono8) to a BGR ndarray.
+
+    Done manually (no cv_bridge dependency) — honours the row stride (`step`)
+    so padded rows decode correctly.
+    """
+    h, w = msg.height, msg.width
+    buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+    enc = msg.encoding.lower()
+    if enc in ("bgr8", "rgb8"):
+        arr = buf.reshape(h, msg.step)[:, : w * 3].reshape(h, w, 3)
+        return arr[:, :, ::-1].copy() if enc == "rgb8" else arr.copy()
+    if enc == "mono8":
+        arr = buf.reshape(h, msg.step)[:, :w].reshape(h, w)
+        return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    raise ValueError(f"unsupported image encoding: {msg.encoding!r}")
 
 
 # ===========================================================================
@@ -109,6 +132,11 @@ class BuildArenaMapServer(Node):
         )
         self._map_pub = self.create_publisher(OccupancyGrid, '/drone/map', map_qos)
 
+        # ── Online stitching (opt-in) ──────────────────────────────────
+        self._online = None        # truthy only when online_mode is enabled
+        if bool(self.get_parameter("stitch.online_mode").value):
+            self._setup_online()
+
         self.get_logger().info(
             "build_arena_map action server ready on /build_arena_map"
         )
@@ -127,6 +155,15 @@ class BuildArenaMapServer(Node):
         self.declare_parameter("stitch.output_width",  3000)
         self.declare_parameter("stitch.output_height", 3000)
         self.declare_parameter("stitch.save_intermediate", True)
+
+        # Online stitching (opt-in): when enabled, the server subscribes to a
+        # live processed-image topic and incrementally stitches during the
+        # drone flight via the ~/online_start and ~/online_stop services. The
+        # BuildArenaMap action then runs only the offline stages (transfer +
+        # occupancy) on the already-stitched map. Default off → behaviour is
+        # exactly the saved-video pipeline.
+        self.declare_parameter("stitch.online_mode", False)
+        self.declare_parameter("stitch.online_image_topic", "/camera/image_proc")
 
         # ExtractionConfig
         self.declare_parameter("stitch.extract.target_fps",          5.0)
@@ -251,6 +288,178 @@ class BuildArenaMapServer(Node):
         self.declare_parameter("occupancy.halo_step_px",      2)
         self.declare_parameter("occupancy.wall_s_hi",         180)
         self.declare_parameter("occupancy.frame_id",          "map")
+
+    # -----------------------------------------------------------------------
+    # Online stitching (opt-in): live incremental stitch during the flight
+    # -----------------------------------------------------------------------
+    #
+    # Lifecycle (driven by the orchestrator):
+    #   ~/online_start  → fresh MapReconstructor + frame gate, begin consuming
+    #                     the live processed-image topic in a worker thread.
+    #   (frames arrive) → gated (quality/movement/fps) and placed incrementally,
+    #                     hiding the heavy stitch latency behind the flight.
+    #   ~/online_stop   → stop intake, run finalize()+get_map() (pose-graph solve
+    #                     & re-render if use_pose_graph), save the stitched PNG.
+    #   BuildArenaMap   → sees the ready stitch and runs only the offline stages
+    #                     (transfer + consistency + occupancy).
+    #
+    # Only the per-frame placement is online; everything that needs the whole
+    # map (finalize re-render, marker overlay, transfer, occupancy) stays
+    # offline, run after the drone has stopped streaming.
+
+    def _setup_online(self) -> None:
+        self._online_lock = threading.Lock()
+        self._online_rec: Optional[MapReconstructor] = None
+        self._online_gate: Optional[OnlineFrameGate] = None
+        self._online_q: queue.Queue = queue.Queue(maxsize=2)
+        self._online_worker: Optional[threading.Thread] = None
+        self._online_accumulating = False
+        self._online_ready = False
+        self._online_stitched_path: Optional[str] = None
+        self._online_stop_sentinel = object()
+
+        topic = self.get_parameter("stitch.online_image_topic").value
+        img_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=2,
+        )
+        self._online_sub = self.create_subscription(
+            Image, topic, self._online_image_cb, img_qos,
+            callback_group=self._cb_group)
+        self._online_start_srv = self.create_service(
+            Trigger, "~/online_start", self._online_start_cb,
+            callback_group=self._cb_group)
+        self._online_stop_srv = self.create_service(
+            Trigger, "~/online_stop", self._online_stop_cb,
+            callback_group=self._cb_group)
+
+        self._online = True
+        self.get_logger().info(
+            f"Online stitching ENABLED — subscribing '{topic}'; "
+            f"services: ~/online_start, ~/online_stop")
+
+    def _online_image_cb(self, msg: Image) -> None:
+        """Enqueue the latest live frame while accumulating (drop-oldest)."""
+        if not self._online_accumulating:
+            return
+        try:
+            img = _imgmsg_to_bgr(msg)
+        except Exception as exc:
+            self.get_logger().warn(f"online: dropping bad image: {exc}")
+            return
+        try:
+            self._online_q.put_nowait(img)
+        except queue.Full:
+            # Keep the freshest frame: discard the oldest, enqueue this one.
+            try:
+                self._online_q.get_nowait()
+                self._online_q.put_nowait(img)
+            except (queue.Empty, queue.Full):
+                pass
+
+    def _online_worker_loop(self) -> None:
+        """Serialised placement worker: gate → MapReconstructor.add_frame."""
+        rec, gate = self._online_rec, self._online_gate
+        placed = 0
+        while True:
+            try:
+                item = self._online_q.get(timeout=0.5)
+            except queue.Empty:
+                if not self._online_accumulating:
+                    break
+                continue
+            if item is self._online_stop_sentinel:
+                break
+            try:
+                if gate.accept(item, time.monotonic()) and rec.add_frame(item):
+                    placed += 1
+            except Exception as exc:
+                self.get_logger().warn(f"online: frame placement failed: {exc}")
+        self.get_logger().info(
+            f"online worker stopped — gate={gate.stats} placed={placed}")
+
+    def _online_start_cb(self, request, response):
+        with self._online_lock:
+            if self._online_accumulating:
+                response.success = False
+                response.message = "online stitching already running"
+                return response
+            self.get_logger().info("online stitching: START (building reconstructor…)")
+            self._online_rec = MapReconstructor(self._build_reconstruct_cfg())
+            self._online_gate = OnlineFrameGate(self._build_extract_cfg())
+            self._online_ready = False
+            self._online_stitched_path = None
+            while not self._online_q.empty():        # drain stale frames
+                try:
+                    self._online_q.get_nowait()
+                except queue.Empty:
+                    break
+            self._online_accumulating = True
+            self._online_worker = threading.Thread(
+                target=self._online_worker_loop, daemon=True, name="online-stitch")
+            self._online_worker.start()
+        response.success = True
+        response.message = "online stitching started"
+        return response
+
+    def _online_stop_cb(self, request, response):
+        with self._online_lock:
+            if not self._online_accumulating and self._online_worker is None:
+                response.success = False
+                response.message = "online stitching not running"
+                return response
+            self._online_accumulating = False
+            try:
+                self._online_q.put_nowait(self._online_stop_sentinel)
+            except queue.Full:
+                try:
+                    self._online_q.get_nowait()
+                    self._online_q.put_nowait(self._online_stop_sentinel)
+                except (queue.Empty, queue.Full):
+                    pass
+            worker = self._online_worker
+
+        if worker is not None:
+            worker.join(timeout=60.0)
+
+        # Offline finalize of the stitch: pose-graph solve + re-render (if
+        # use_pose_graph), marker overlay paint, crop/resize → save PNG.
+        try:
+            out_w = int(self.get_parameter("stitch.output_width").value)
+            out_h = int(self.get_parameter("stitch.output_height").value)
+            stitched = self._online_rec.get_map(output_shape=(out_w, out_h))
+        except Exception as exc:
+            response.success = False
+            response.message = f"online finalize failed: {exc}"
+            self.get_logger().error(response.message)
+            with self._online_lock:
+                self._online_worker = None
+            return response
+
+        debug_dir = self.get_parameter("debug_dir").value
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(debug_dir, "stitched_map.png")
+        cv2.imwrite(path, stitched)
+
+        with self._online_lock:
+            self._online_stitched_path = path
+            self._online_ready = True
+            self._online_worker = None
+
+        response.success = True
+        response.message = (
+            f"online stitch finalized -> {path}  gate={self._online_gate.stats}")
+        self.get_logger().info(response.message)
+        return response
+
+    def _online_map_ready(self) -> bool:
+        """True when a finished online stitch is available for the action."""
+        return bool(
+            getattr(self, "_online", None)
+            and self._online_ready
+            and self._online_stitched_path
+            and os.path.isfile(self._online_stitched_path))
 
     # -----------------------------------------------------------------------
     # Action server callbacks
@@ -490,7 +699,10 @@ class BuildArenaMapServer(Node):
         os.makedirs(debug_dir, exist_ok=True)
 
         # ── 1) Validate inputs ─────────────────────────────────────────
-        if not video_path or not os.path.isfile(video_path):
+        # When an online-stitched map is ready, the action skips stitching and
+        # consumes that map, so video_path is not required.
+        use_online = self._online_map_ready() if getattr(self, "_online", None) else False
+        if not use_online and (not video_path or not os.path.isfile(video_path)):
             return self._abort(goal_handle,
                                f"video_path does not exist: {video_path!r}")
         bg_path = self._get("transfer.background_path") or ""
@@ -524,30 +736,38 @@ class BuildArenaMapServer(Node):
 
         out_w = int(self._get("stitch.output_width"))
         out_h = int(self._get("stitch.output_height"))
-        extract_cfg     = self._build_extract_cfg()
-        reconstruct_cfg = self._build_reconstruct_cfg()
 
-        stitched_path = os.path.join(debug_dir, "stitched_map.png") \
-            if self._get("stitch.save_intermediate") else None
+        if use_online:
+            # Online mode: the map was already stitched live during the flight
+            # (~/online_start … ~/online_stop). Reuse it; skip stitching here.
+            stitched_path = self._online_stitched_path
+            self._emit_feedback(goal_handle, "stitching", 1.0,
+                                f"Using online-stitched map -> {stitched_path}")
+        else:
+            extract_cfg     = self._build_extract_cfg()
+            reconstruct_cfg = self._build_reconstruct_cfg()
 
-        stitched = reconstruct_from_video(
-            video_path,
-            output_shape=(out_w, out_h),
-            extract_cfg=extract_cfg,
-            reconstruct_cfg=reconstruct_cfg,
-            save_path=stitched_path,
-            verbose=bool(self._get("stitch.verbose")),
-        )
-        if stitched is None:
-            return self._abort(goal_handle, "Stitching returned None.")
+            stitched_path = os.path.join(debug_dir, "stitched_map.png") \
+                if self._get("stitch.save_intermediate") else None
 
-        # If saving was disabled but downstream needs a path, write a temp.
-        if stitched_path is None:
-            stitched_path = os.path.join(debug_dir, "stitched_map.png")
-            cv2.imwrite(stitched_path, stitched)
+            stitched = reconstruct_from_video(
+                video_path,
+                output_shape=(out_w, out_h),
+                extract_cfg=extract_cfg,
+                reconstruct_cfg=reconstruct_cfg,
+                save_path=stitched_path,
+                verbose=bool(self._get("stitch.verbose")),
+            )
+            if stitched is None:
+                return self._abort(goal_handle, "Stitching returned None.")
 
-        self._emit_feedback(goal_handle, "stitching", 1.0,
-                            f"Stitched -> {stitched_path}")
+            # If saving was disabled but downstream needs a path, write a temp.
+            if stitched_path is None:
+                stitched_path = os.path.join(debug_dir, "stitched_map.png")
+                cv2.imwrite(stitched_path, stitched)
+
+            self._emit_feedback(goal_handle, "stitching", 1.0,
+                                f"Stitched -> {stitched_path}")
         if self._check_cancel(goal_handle):
             return self._cancelled(goal_handle)
 

@@ -98,6 +98,22 @@ orchestrator:
     server_ready_timeout_sec: 30.0
     drone_map_topic: "/drone/map"
 
+    # ── Online vs offline stitching ───────────────────────────────────────
+    # online: true  → bring the map-builder server up in ONLINE mode before the
+    #   flight; it stitches live from the drone's processed-image stream during
+    #   the trajectory (hiding stitch latency behind the flight). The
+    #   BuildArenaMap action then runs only the offline stages (transfer +
+    #   occupancy). The orchestrator drives this via the server's online_start /
+    #   online_stop services and launches the controller with publish_processed.
+    # online: false → current behaviour: the server stitches from the saved
+    #   scan.mp4 after the flight; the processed-image stream is ignored.
+    online: false
+    online_image_topic: "/camera/image_proc"
+    online_start_service: "/build_arena_map_server/online_start"
+    online_stop_service: "/build_arena_map_server/online_stop"
+    online_start_timeout_sec: 60.0
+    online_stop_timeout_sec: 180.0
+
   # ── Rosbag recording ────────────────────────────────────────────────────
   rosbag:
     enabled: false

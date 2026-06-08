@@ -34,6 +34,17 @@ Stages
 
 From stage 20 onward the orchestrator only observes; map_fusion and
 trajectory_planner operate autonomously.
+
+Map-builder mode (config map_builder.online)
+─────────────────────────────────────────────
+ offline (default): the arena_map_builder server is launched after stage 16 and
+   stitches from the saved scan.mp4; the live processed-image stream is ignored.
+ online: the server is launched in online mode BEFORE the flight (right after
+   stage 04) and its online_start service is called; it stitches incrementally
+   from the drone's processed-image stream during the trajectory. After the
+   drone lands (stage 05) online_stop finalizes the stitch, and stage 19 runs
+   only the offline stages (transfer + occupancy) on the already-stitched map —
+   hiding the stitch latency behind the flight.
 """
 
 from __future__ import annotations
@@ -68,6 +79,7 @@ from geometry_msgs.msg import Point, PoseStamped, PoseWithCovarianceStamped, Twi
 from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import BatteryState, Image, Imu
 from std_msgs.msg import Bool, Int32
+from std_srvs.srv import Trigger
 
 from arena_map_builder_msgs.action import BuildArenaMap
 from arena_marker_localizer_interfaces.srv import LocalizeMarkers
@@ -186,6 +198,11 @@ class MissionOrchestratorNode(Node):
         self._mission_complete = False
         self._drone_aborted = False
 
+        # Map-builder mode: online (stitch live during the flight) vs offline
+        # (stitch from the saved scan.mp4 afterwards — the default).
+        self._online_enabled = bool(
+            self._cfg.get('map_builder', {}).get('online', False))
+
         # ── ROS 2 sync primitives ──
         self._imu_ready_event = threading.Event()
         self._imu_msg_count: int = 0
@@ -298,6 +315,15 @@ class MissionOrchestratorNode(Node):
             LocalizeMarkers, cfg['marker_localizer']['service_name'])
         self._map_action_client = ActionClient(
             self, BuildArenaMap, cfg['map_builder']['action_name'])
+
+        # Online-stitching control services (only used when map_builder.online).
+        mb = cfg['map_builder']
+        self._online_start_cli = self.create_client(
+            Trigger, mb.get('online_start_service',
+                            '/build_arena_map_server/online_start'))
+        self._online_stop_cli = self.create_client(
+            Trigger, mb.get('online_stop_service',
+                            '/build_arena_map_server/online_stop'))
 
     # ────────────────────────────────────────────────────────────────────────
     # ROS 2 callbacks
@@ -774,9 +800,17 @@ class MissionOrchestratorNode(Node):
 
     def _stage_04_launch_tello_map(self) -> None:
         self._log.info("╔══ Stage 04: Launch tello_map (drone take-off + scan)")
+        cmd = ['ros2', 'launch', 'tello_pos_control', 'tello_map.launch.py']
+        if self._online_enabled:
+            # Have the controller republish the processed frames it records so
+            # the map-builder can stitch them live.
+            topic = self._cfg['map_builder'].get(
+                'online_image_topic', '/camera/image_proc')
+            cmd += ['publish_processed:=true', f'processed_image_topic:={topic}']
+            self._log.info(
+                f"  online: controller will publish processed frames → {topic}")
         proc = subprocess.Popen(
-            ['ros2', 'launch', 'tello_pos_control', 'tello_map.launch.py'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self._processes['tello_map'] = proc
         self._log.info(f"  tello_map launched (pid={proc.pid})")
@@ -1059,9 +1093,18 @@ class MissionOrchestratorNode(Node):
 
     def _stage_18_launch_map_builder(self) -> None:
         self._log.info("╔══ Stage 18: Launch arena_map_builder server")
+        cmd = ['ros2', 'run', 'arena_map_builder', 'build_arena_map_server']
+        if self._online_enabled:
+            # online_mode must be set at construction (it wires the subscription
+            # + start/stop services), so pass it as a launch-time parameter.
+            topic = self._cfg['map_builder'].get(
+                'online_image_topic', '/camera/image_proc')
+            cmd += ['--ros-args',
+                    '-p', 'stitch.online_mode:=true',
+                    '-p', f'stitch.online_image_topic:={topic}']
+            self._log.info(f"  online mode: server will subscribe {topic}")
         proc = subprocess.Popen(
-            ['ros2', 'run', 'arena_map_builder', 'build_arena_map_server'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self._processes['map_builder'] = proc
         self._log.info(f"  build_arena_map_server launched (pid={proc.pid})")
@@ -1095,6 +1138,26 @@ class MissionOrchestratorNode(Node):
                 f"Failed to set background_path after 5 attempts: "
                 f"{result.stderr.strip()}")
         self._log.info("╚══ Stage 18 OK: map_builder ready")
+
+    def _stage_online_start(self) -> None:
+        """Tell the map-builder server to begin live stitching (online mode)."""
+        self._log.info("╔══ Online: start live stitching")
+        timeout = float(self._cfg['map_builder'].get('online_start_timeout_sec', 60.0))
+        resp = self._call_service(
+            self._online_start_cli, Trigger.Request(), timeout_sec=timeout)
+        if not resp.success:
+            raise MissionAbortError(f"online_start failed: {resp.message}")
+        self._log.info(f"╚══ Online start OK: {resp.message}")
+
+    def _stage_online_stop(self) -> None:
+        """Tell the server to stop intake and finalize the live stitch."""
+        self._log.info("╔══ Online: stop live stitching + finalize stitch")
+        timeout = float(self._cfg['map_builder'].get('online_stop_timeout_sec', 180.0))
+        resp = self._call_service(
+            self._online_stop_cli, Trigger.Request(), timeout_sec=timeout)
+        if not resp.success:
+            raise MissionAbortError(f"online_stop failed: {resp.message}")
+        self._log.info(f"╚══ Online stop OK: {resp.message}")
 
     def _stage_19_call_map_builder(self) -> "BuildArenaMap.Result":
         self._log.info("╔══ Stage 19: Call BuildArenaMap action")
@@ -1220,7 +1283,17 @@ class MissionOrchestratorNode(Node):
             self._stage_02_launch_tello_driver()
             self._stage_03_drone_preflight()
             self._stage_04_launch_tello_map()
+            if self._online_enabled:
+                # Online: bring the map-builder up in online mode BEFORE the
+                # flight and start live stitching, so the heavy stitch runs
+                # during the trajectory instead of after landing.
+                self._stage_18_launch_map_builder()
+                self._stage_online_start()
             self._stage_05_observe_drone_states()
+            if self._online_enabled:
+                # Drone has landed → it has stopped streaming frames; finalize
+                # the live stitch so the action can run the offline stages on it.
+                self._stage_online_stop()
             self._stage_06_wait_video_files()
             self._stage_07_ping()
             self._stage_08_ssh_connect()
@@ -1236,7 +1309,10 @@ class MissionOrchestratorNode(Node):
             # The aruco poses take their POSITION from the map-builder result and
             # their ORIENTATION from the localizer markers above, so the builder
             # must run and return successfully BEFORE we publish them.
-            self._stage_18_launch_map_builder()
+            if not self._online_enabled:
+                # Offline: launch the server now and stitch from the saved video.
+                # (Online mode already launched it before the flight.)
+                self._stage_18_launch_map_builder()
             map_result = self._stage_19_call_map_builder()
             self._stage_17_publish_aruco_poses(markers, map_result)
             self._stage_17b_publish_static_tf()

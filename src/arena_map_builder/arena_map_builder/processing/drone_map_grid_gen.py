@@ -1086,6 +1086,91 @@ def extract_frames(
     return list(stream_frames(video_path, cfg, verbose))
 
 
+class OnlineFrameGate:
+    """Push-model equivalent of stream_frames()'s per-frame filtering.
+
+    stream_frames() is a PULL generator over a video FILE, and its quality +
+    movement gates are embedded in that loop (they compare consecutive frames).
+    For online stitching the frames arrive one at a time from a live stream, so
+    this class applies the SAME gates in a PUSH model: feed each incoming BGR
+    frame to accept(); it returns True when the frame should be placed onto the
+    map, and False when it is throttled (target_fps), low quality, static, or a
+    jerk.  Per-frame state (previous keypoints / thumbnail) is held internally.
+
+    The saved-video path (stream_frames / add_video) is intentionally left
+    untouched; this is an additive, parallel intake used only by online mode.
+    Reuses the same module-level gate helpers so behaviour matches.
+    """
+
+    _THUMB_W, _THUMB_H = 160, 90   # mirror stream_frames' thumbnail size
+
+    def __init__(self, cfg: Optional[ExtractionConfig] = None):
+        self.cfg = cfg or ExtractionConfig()
+        self.detector, self.norm = _make_detector()
+        self._prev_kp = None
+        self._prev_des = None
+        self._prev_thumb: Optional[np.ndarray] = None
+        self._last_considered: Optional[float] = None
+        self.stats = dict(seen=0, throttled=0, quality=0, movement=0, accepted=0)
+
+    def accept(self, img: np.ndarray, now_sec: float) -> bool:
+        """Return True if `img` passes the gates and should be placed.
+
+        `now_sec` is a monotonic timestamp (seconds) used for the target_fps
+        throttle, which bounds how often the (relatively expensive) gates run —
+        the live camera publishes far faster than target_fps.
+        """
+        self.stats["seen"] += 1
+
+        # ── target_fps throttle (replaces stream_frames' 1-in-N subsampling) ──
+        if self.cfg.target_fps > 0 and self._last_considered is not None:
+            if (now_sec - self._last_considered) < (1.0 / self.cfg.target_fps):
+                self.stats["throttled"] += 1
+                return False
+        self._last_considered = now_sec
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+
+        # ── quality gate ──────────────────────────────────────────────────────
+        ok, _ = _assess_frame(
+            img, self.cfg.blur_thresh, self.cfg.artifact_thresh, gray=gray)
+        if not ok:
+            self.stats["quality"] += 1
+            return False
+
+        # ── movement gate (feature displacement; pixel-diff fallback) ─────────
+        kp, des = self.detector.detectAndCompute(gray, None)
+        feature_decision_made = False
+        if self._prev_des is not None and des is not None and len(kp) >= 8:
+            diag = math.hypot(img.shape[1], img.shape[0])
+            mv = _median_displacement(
+                self._prev_kp, self._prev_des, kp, des, self.norm, diag)
+            if mv is not None:
+                feature_decision_made = True
+                if mv < self.cfg.min_movement or mv > self.cfg.max_movement:
+                    self.stats["movement"] += 1
+                    return False
+
+        if (not feature_decision_made
+                and self.cfg.static_pixel_thresh > 0
+                and self._prev_thumb is not None):
+            thumb = cv2.resize(
+                gray, (self._THUMB_W, self._THUMB_H),
+                interpolation=cv2.INTER_AREA).astype(np.float32)
+            mad = float(np.abs(thumb - self._prev_thumb).mean())
+            if mad < self.cfg.static_pixel_thresh:
+                self.stats["movement"] += 1
+                return False
+
+        # ── accept: advance state ─────────────────────────────────────────────
+        self._prev_kp, self._prev_des = kp, des
+        self._prev_thumb = cv2.resize(
+            gray, (self._THUMB_W, self._THUMB_H),
+            interpolation=cv2.INTER_AREA).astype(np.float32)
+        self.stats["accepted"] += 1
+        return True
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Blending utilities
 # ══════════════════════════════════════════════════════════════════════════════
