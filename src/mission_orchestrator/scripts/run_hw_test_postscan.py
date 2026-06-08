@@ -1,53 +1,39 @@
 #!/usr/bin/env python3
 """
-Hardware smoke-test: post-scan pipeline (stages 06 + 11-20).
+Hardware smoke-test: post-scan pipeline (no drone, no AMR bringup).
 
-Skips the drone pipeline (stages 01-05) and the RPi/AMR/IMU pipeline
-(stages 07-10).  Assumes scan.mp4 and telemetry.csv already exist in the
-configured video directory from a prior run.
+Assumes scan.mp4 and telemetry.csv already exist in the configured video
+directory from a prior run. Runs OFFLINE (stitches the saved scan.mp4).
 
 Stages that run for real:
+  02   Arena map builder bringup (server + background_path)
+  03.g/h  Resolve scan.mp4 / telemetry.csv + ffmpeg integrity
+  (kickoff) Send BuildArenaMap goal (full stitch + transfer + occupancy)
+  04   Launch arena_marker_localizer + 04.a Call /localize_markers
+  04.b Join map result → publish /aruco/.../pose + /drone/map
+  08   Mapping bringup (oradar + alignment_node + odom mapper)
+  09   Trajectory planner  (skip with --trajectory-planner=false)
 
-  06   Wait for scan.mp4 and telemetry.csv in the configured video dir
-  11   Verify scan.mp4 integrity via ffmpeg
-  12   Launch trajectory_planner  (skip with --trajectory-planner=false)
-  13   Launch map_fusion
-  14   Launch oradar lidar
-  15   Launch arena_marker_localizer service node
-  16   Call /localize_markers service
-  17   Publish /aruco/amr/pose and /aruco/goal/pose
-  18   Launch arena_map_builder server
-  19   Call BuildArenaMap action
-  20   Publish /drone/map
+Skipped (no-ops): 01 optitrack, 03.a-f drone flight, 05 VSLAM, 06 Rasp/AMR,
+07 emergency stop.
 
 On success the script stays alive as a ROS 2 observer, keeping all spawned
-processes running.  Press Ctrl+C to stop and exit.
+processes running. Press Ctrl+C to stop and exit.
 
 Usage (from workspace root, after sourcing install/setup.bash):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py
+    python3 src/mission_orchestrator/scripts/run_hw_test_postscan.py
 
 When the files on disk are older than max_age_sec (typical for re-tests):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --touch-files
+    python3 src/mission_orchestrator/scripts/run_hw_test_postscan.py --touch-files
 
-Use a specific directory for scan.mp4 / telemetry.csv (overrides video.dir in YAML):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --file-path /data/run42
+Use a specific directory for scan.mp4 / telemetry.csv (overrides video.dir):
+    python3 src/mission_orchestrator/scripts/run_hw_test_postscan.py --file-path /data/run42
 
 Override ArUco marker IDs (AMR then goal):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --aruco-ids '[3, 7]'
+    python3 src/mission_orchestrator/scripts/run_hw_test_postscan.py --aruco-ids '[3, 7]'
 
-Skip trajectory_planner (stage 12):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --trajectory-planner=false
-
-Note on stage numbering: old stage 10 (wait for video files) is now stage 06 in
-the new execution order.  The drone pipeline (01-05) and RPi/AMR/IMU pipeline
-(07-10) are all skipped by this script.
-
-Record a rosbag of all topics during the run:
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py --rosbag
-
-With a custom config:
-    python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py \\
-        --config /abs/path/to/orchestrator_params.yaml
+Skip trajectory_planner:
+    python3 src/mission_orchestrator/scripts/run_hw_test_postscan.py --trajectory-planner=false
 """
 
 from __future__ import annotations
@@ -77,61 +63,40 @@ _DEFAULT_CONFIG = os.path.normpath(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Restricted orchestrator: drone (01-05) and RPi/AMR/IMU (07-10) no-ops;
-# stage 06 + 11-20 real
+# Restricted orchestrator: map builder + localizer + mapping + planner (no drone,
+# no Rasp/AMR, no VSLAM); stitch OFFLINE from the saved scan.mp4.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _HwTestOrchestrator(MissionOrchestratorNode):
-    """Drone stages 01-05 and RPi/AMR/IMU stages 07-10 are no-ops; stage 06 + 11-20 run normally."""
+    """Stages 02, 03.g/h, 04, 08, 09 run; drone/VSLAM/Rasp/e-stop are no-ops."""
 
     skip_trajectory_planner: bool = False
 
-    # ── No-op: drone pipeline (01-05) ────────────────────────────────────────
+    # ── No-op: optitrack (01) + drone flight (03.a-f) ────────────────────────
+    def _stage_01a_check_optitrack(self) -> None: pass
+    def _stage_01b_optitrack_sanity(self) -> None: pass
+    def _stage_03a_connect_tello_wifi(self) -> None: pass
+    def _stage_03b_launch_tello_driver(self) -> None: pass
+    def _stage_03c_drone_preflight(self) -> None: pass
+    def _stage_03d_launch_tello_map(self) -> None: pass
+    def _stage_03f_observe_drone_states(self) -> None: pass
 
-    def _stage_01_check_optitrack(self) -> None:
-        pass
+    # ── No-op: VSLAM (05), Rasp/AMR (06), e-stop (07) ────────────────────────
+    def _stage_05a_verify_realsense(self) -> None: pass
+    def _stage_05b_start_vslam(self) -> None: pass
+    def _stage_05c_check_vslam_odometry(self) -> None: pass
+    def _stage_06a_ping(self) -> None: pass
+    def _stage_06b_ssh_connect(self) -> None: pass
+    def _stage_06c_launch_amr(self) -> None: pass
+    def _stage_06d_wait_imu_ready(self) -> None: pass
+    def _stage_07a_emergency_stop(self) -> None: pass
 
-    def _stage_01b_connect_tello_wifi(self) -> None:
-        pass
-
-    def _stage_02_launch_tello_driver(self) -> None:
-        pass
-
-    def _stage_03_drone_preflight(self) -> None:
-        pass
-
-    def _stage_04_launch_tello_map(self) -> None:
-        pass
-
-    def _stage_05_observe_drone_states(self) -> None:
-        pass
-
-    # ── No-op: RPi / AMR / IMU pipeline (07-10) ─────────────────────────────
-
-    def _stage_07_ping(self) -> None:
-        pass
-
-    def _stage_08_ssh_connect(self) -> None:
-        pass
-
-    def _stage_09_launch_amr(self) -> None:
-        pass
-
-    def _stage_10_wait_imu_ready(self) -> None:
-        pass
-
-    # ── No-op: emergency_stop requires AMR (not running in this script) ─────────
-
-    def _stage_14b_launch_emergency_stop(self) -> None:
-        pass
-
-    # ── Flag-gated: trajectory_planner ───────────────────────────────────────
-
-    def _stage_12_launch_trajectory_planner(self) -> None:
+    # ── Flag-gated: trajectory_planner (09) ──────────────────────────────────
+    def _stage_09_trajectory_planner(self) -> None:
         if self.skip_trajectory_planner:
-            self._log.info("  [stage 12] trajectory_planner skipped (--trajectory-planner=false)")
+            self._log.info("  [stage 09] trajectory_planner skipped (--trajectory-planner=false)")
             return
-        super()._stage_12_launch_trajectory_planner()
+        super()._stage_09_trajectory_planner()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,47 +105,32 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Hardware smoke-test: post-scan pipeline (stage 06 + stages 11-20).')
+        description='Hardware smoke-test: post-scan map+localizer+mapping+planner '
+                    '(no drone, no AMR bringup).')
     parser.add_argument(
         '--config', default=_DEFAULT_CONFIG,
         help='Path to orchestrator_params.yaml (default: config/ inside this package)')
     parser.add_argument(
         '--touch-files', action='store_true',
         help=(
-            'Touch scan.mp4 and telemetry.csv before stage 06 runs, updating '
-            'their mtime to now so the freshness check passes.  Use this when '
-            'the files on disk are older than video.max_age_sec.'
+            'Touch scan.mp4 and telemetry.csv so the freshness check passes.  '
+            'Use this when the files on disk are older than video.max_age_sec.'
         ),
     )
     parser.add_argument(
         '--trajectory-planner', type=lambda v: v.lower() != 'false',
         default=True, metavar='true|false',
-        help='Launch trajectory_planner in stage 12 (default: true).',
+        help='Launch trajectory_planner in stage 09 (default: true).',
     )
     parser.add_argument(
         '--file-path', default=None, metavar='DIR',
-        help=(
-            'Directory containing scan.mp4 and telemetry.csv.  '
-            'Overrides video.dir in the YAML; filenames are still taken from '
-            'video.video_filename and video.telemetry_filename.'
-        ),
-    )
+        help='Directory containing scan.mp4 and telemetry.csv (overrides video.dir).')
     parser.add_argument(
         '--aruco-ids', default=None, metavar='[AMR_ID,GOAL_ID]',
-        help=(
-            "Two ArUco marker IDs as a JSON array, e.g. '[3, 7]'.  "
-            'First is amr_marker_id, second is goal_marker_id.  '
-            'Overrides aruco.amr_marker_id and aruco.goal_marker_id in the YAML.'
-        ),
-    )
+        help="Two ArUco marker IDs as a JSON array, e.g. '[3, 7]' (amr, goal).")
     parser.add_argument(
         '--rosbag', action='store_true',
-        help=(
-            'Record a rosbag of all topics for the duration of the run.  '
-            'Output goes to the directory configured under rosbag.output_dir '
-            'in the YAML (default: /tmp/mission_orchestrator_logs).'
-        ),
-    )
+        help='Record a rosbag of all topics for the duration of the run.')
     args = parser.parse_args()
 
     if not os.path.isfile(args.config):
@@ -189,8 +139,11 @@ def main() -> None:
     rclpy.init()
 
     node = _HwTestOrchestrator(args.config)
-
     node.skip_trajectory_planner = not args.trajectory_planner
+
+    # No live drone stream here → stitch OFFLINE from the saved scan.mp4.
+    node._online_enabled = False
+    node._cfg.setdefault('map_builder', {})['online'] = False
 
     if args.file_path is not None:
         node._cfg['video']['dir'] = args.file_path
@@ -203,7 +156,7 @@ def main() -> None:
                     or not all(isinstance(i, int) for i in ids)):
                 raise ValueError
         except (ValueError, TypeError):
-            sys.exit(f"ERROR: --aruco-ids must be a JSON array of exactly two integers, e.g. '[0, 1]'")
+            sys.exit("ERROR: --aruco-ids must be a JSON array of exactly two integers, e.g. '[0, 1]'")
         node._cfg['aruco']['amr_marker_id'] = ids[0]
         node._cfg['aruco']['goal_marker_id'] = ids[1]
         node._log.info(f"[--aruco-ids] amr_marker_id={ids[0]}, goal_marker_id={ids[1]}")
@@ -230,7 +183,7 @@ def main() -> None:
 
     try:
         node.run()
-        # Stage 06 + stages 11-20 done; stay alive as observer
+        # Stages done; stay alive as observer
         while rclpy.ok():
             time.sleep(1.0)
     except KeyboardInterrupt:
@@ -239,7 +192,6 @@ def main() -> None:
         if not node._mission_complete:
             node._abort()
         node._stop_rosbag()
-        # _teardown_ssh is a no-op here (SSH was never opened)
         node._teardown_ssh()
         executor.shutdown(timeout_sec=5.0)
         node.destroy_node()
