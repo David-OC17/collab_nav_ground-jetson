@@ -1,4 +1,4 @@
-# LiDAR mapping - apt packages only
+## LiDAR mapping - apt packages only
 
 ```bash
 colcon build --symlink-install --packages-select amr_optitrack arena_map_builder_msgs  arena_marker_localizer_interfaces local_costmap trajectory_planner arena_map_builder  arena_marker_localizer map_fusion oradar_lidar optitrack_client tello_driver tello_pos_control tello_msgs emergency_stop
@@ -211,14 +211,15 @@ echo "Exit code: $?"   # 0 = all dead, 1 = something survived
 ## Testing orchestrator partial pipeline
 
 ```bash
-# For scan10
-python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20.py \
+# Post-scan map pipeline, no AMR (map builder + localizer + mapping + planner)
+python3 src/mission_orchestrator/scripts/run_hw_test_postscan.py \
     --file-path /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10 \
     --aruco-ids '[1, 3]' \
     --touch-files \
     --trajectory-planner=false
 
-python3 src/mission_orchestrator/scripts/run_hw_test_s06_s20_amr.py \
+# Post-scan map pipeline + AMR bringup
+python3 src/mission_orchestrator/scripts/run_hw_test_postscan_amr.py \
     --file-path /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan10 \
     --aruco-ids '[0, 2]' \
     --touch-files \
@@ -399,14 +400,13 @@ After correction:
   θ percentiles: p50=0.7°  p75=1.4°  p90=4.1
 ```
 
-# Isaac Ros Visual Slam
+## Isaac Ros Visual Slam
 
 ```bash
   docker start isaac_ros_vslam
   docker exec -it isaac_ros_vslam bash
   ros2 launch isaac_ros_visual_slam isaac_ros_visual_slam_realsense.launch.py
 ```
-
 
 ## XGBoost data preparation
 
@@ -446,3 +446,46 @@ python3 extract_features.py \
 # this step reads them directly (no pipeline re-run) and finishes in seconds.
 # Output: features.csv  — one row per run, ~57 columns ready for XGBoost.
 ```
+
+Major stages and substages:
+01. Optitrack bringup
+    01.a.  Check /optitrack/rigid_body presence + header; launch client if absent
+    01.b.  Do sanity check of /optitrack/rigid_body contents
+02. Arena map builder bringup
+    02.a.  Configure background_path parameter
+    02.b.  Configure online/offline mode (default online)
+    (Async) 02.c. Server will respond with OccupancyGrid and ego publishes
+03. Drone routine
+    03.a.  Connect to Tello WiFi (nmcli scan + connect on wlx14ebb67dae0b)
+    03.b.  Launch tello_driver
+    03.c.  Drone preflight: verify /camera/image_raw live, /battery_state ≥ min %
+    03.d.  Launch tello_map (drone takes off and executes scanning routine)
+    03.e.  (If online) Send start request to map builder (to consume incoming drone /camera/image_proc)
+    03.f.  Observe drone state transitions 1→2→3→4 with per-stage timeouts
+    03.g.  Wait for scan.mp4 and telemetry.csv to appear in the configured video dir, fresh within max_age_sec
+    03.h.  Verify scan.mp4 integrity via ffmpeg
+04. Launch Aruco localizer server
+    04.a. Call service with new scan.mp4
+    04.b. Collect response from Aruco localizer server and stitching pipeline and publish to /aruco/.../pose (built from map-builder marker position + aruco-localizer orientation)
+05. Isaac ROS Visual SLAM (cuSLAM) bringup
+    05.a. Verify Intel Realsense D435i is plugged in
+    05.b. Start Docker container and enter
+    05.c. Launch visual SLAM for Realsense camera
+    05.d. Check /visual_slam/tracking/odometry has a valid output (from outside the container)
+06. Rasp bringup
+    06.a.  Ping Raspberry Pi
+    06.b.  SSH connect to Raspberry Pi
+    06.c.  Start amr_bringup systemd service on Raspberry Pi and verify active
+    06.d.  Wait for /imu/data_raw to publish 200 messages (IMU running at 100 Hz)
+07. Emergency stop bringup
+    07.a. Verify /amr/emergency_stop flag is innactive originally
+08. Mapping bringup
+    08.a.  Launch oradar lidar
+    08.b.  Launch alignment_node (translates the /aruco/amr/pose to world->odom tf)
+    08.c.  Launch odom-based mapper (no SLAM)
+09. Trajectory planner bringup
+10. Enter observer mode and log updates
+
+TODO:
+- Verify safe mode is active
+- Verify stitching output is good, else fallback to frontier exploration

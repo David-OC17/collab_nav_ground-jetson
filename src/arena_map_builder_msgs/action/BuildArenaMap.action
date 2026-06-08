@@ -11,12 +11,18 @@ string video_path
 ---
 
 # ── Result ─────────────────────────────────────────────────────────────
-nav_msgs/OccupancyGrid map      # final probabilistic occupancy grid
+nav_msgs/OccupancyGrid map               # final probabilistic occupancy grid
 bool                  success
-string                message    # short human-readable status
+string                message            # short human-readable status
 uint32                n_obstacles
 float32               mean_consistency   # mean per-obstacle confidence in [0,1]
 string                debug_dir          # where intermediate images were written
+
+# Marker centres in the SAME frame as the occupancy grid: metres from the
+# bottom-left origin, +x right, +y up. z is unused (0). When a marker is not
+# found in the map its x and y are NaN.
+geometry_msgs/Point   goal_marker_position
+geometry_msgs/Point   amr_marker_position
 
 ---
 
