@@ -153,49 +153,62 @@ class _MockDroneOrchestrator(MissionOrchestratorNode):
             cap.release()
         self._log.info(f"  streamed {sent} frames total")
 
-    # ── Stage 05 override: the drone "flight" = replay the video ──────────────
+    # ── Stage 03.f override: the drone "flight" = replay the video ────────────
 
-    def _stage_05_observe_drone_states(self) -> None:
+    def _stage_03f_observe_drone_states(self) -> None:
         if self._online_enabled:
-            self._log.info("╔══ Stage 05 (MOCK): streaming video → emulating drone flight")
+            self._log.info("╔══ Stage 03.f (MOCK): streaming video → emulating drone flight")
             self._relay_video()
-            self._log.info("╚══ Stage 05 (MOCK) OK: stream complete (drone 'landed')")
+            self._log.info("╚══ Stage 03.f (MOCK) OK: stream complete (drone 'landed')")
         else:
             self._log.info(
-                "╔══ Stage 05 (MOCK): offline mode — no live stream; the server "
-                "will stitch the saved video in the action")
-            self._log.info("╚══ Stage 05 (MOCK) OK")
+                "╔══ Stage 03.f (MOCK): offline mode — no live stream; the server "
+                "will stitch the saved video in the map build")
+            self._log.info("╚══ Stage 03.f (MOCK) OK")
 
-    # ── Stage 06 override: point the pipeline at the saved video, no waiting ──
+    # ── Stage 03.g override: point the pipeline at the saved video, no waiting ─
 
-    def _stage_06_wait_video_files(self) -> None:
+    def _stage_03g_wait_video_files(self) -> None:
         self._video_path = self._relay_video_path
         self._telemetry_path = os.path.join(
             os.path.dirname(self._relay_video_path), 'telemetry.csv')
-        self._log.info(f"╠══ Stage 06 (MOCK): video_path={self._video_path!r}")
+        self._log.info(f"╠══ Stage 03.g (MOCK): video_path={self._video_path!r}")
 
-    # ── No-ops: drone bring-up (01-05 launch), AMR, sensors, localizer, aruco ─
+    # ── Stage 04.b override: no localizer here → just join the map build ──────
 
-    def _stage_01_check_optitrack(self) -> None: pass
-    def _stage_01b_connect_tello_wifi(self) -> None: pass
-    def _stage_02_launch_tello_driver(self) -> None: pass
-    def _stage_03_drone_preflight(self) -> None: pass
-    def _stage_04_launch_tello_map(self) -> None: pass
-    def _stage_07_ping(self) -> None: pass
-    def _stage_08_ssh_connect(self) -> None: pass
-    def _stage_09_launch_amr(self) -> None: pass
-    def _stage_10_wait_imu_ready(self) -> None: pass
-    def _stage_11_verify_video_integrity(self) -> None: pass
-    def _stage_12_launch_trajectory_planner(self) -> None: pass
-    def _stage_13_launch_map_fusion(self) -> None: pass
-    def _stage_14_launch_oradar(self) -> None: pass
-    def _stage_14b_launch_emergency_stop(self) -> None: pass
-    def _stage_15_launch_marker_localizer(self) -> None: pass
-    def _stage_16_call_localize_markers(self):
+    def _stage_04b_publish_aruco_poses(self, markers) -> None:
+        result = self._await_map_result()
+        self._publish_drone_map(result.map)
+        gp, ap_ = result.goal_marker_position, result.amr_marker_position
+        self._log.info(
+            f"╠══ Stage 04.b (MOCK): map markers (m)  "
+            f"goal=({gp.x:.3f}, {gp.y:.3f})  amr=({ap_.x:.3f}, {ap_.y:.3f})")
+
+    # ── No-ops: optitrack, drone bring-up, localizer, vslam, rasp, mapping ───
+
+    def _stage_01a_check_optitrack(self) -> None: pass
+    def _stage_01b_optitrack_sanity(self) -> None: pass
+    def _stage_03a_connect_tello_wifi(self) -> None: pass
+    def _stage_03b_launch_tello_driver(self) -> None: pass
+    def _stage_03c_drone_preflight(self) -> None: pass
+    def _stage_03d_launch_tello_map(self) -> None: pass
+    def _stage_03h_verify_video_integrity(self) -> None: pass
+    def _stage_04_launch_marker_localizer(self) -> None: pass
+    def _stage_04a_call_localize_markers(self):
         return []
-    def _stage_17_publish_aruco_poses(self, markers, map_result) -> None: pass
-    def _stage_17b_publish_static_tf(self) -> None: pass
-    def _stage_17c_amr_mapper(self) -> None: pass
+    def _stage_05a_verify_realsense(self) -> None: pass
+    def _stage_05b_start_vslam(self) -> None: pass
+    def _stage_05c_check_vslam_odometry(self) -> None: pass
+    def _stage_06a_ping(self) -> None: pass
+    def _stage_06b_ssh_connect(self) -> None: pass
+    def _stage_06c_launch_amr(self) -> None: pass
+    def _stage_06d_wait_imu_ready(self) -> None: pass
+    def _stage_07a_emergency_stop(self) -> None: pass
+    def _stage_08a_launch_oradar(self) -> None: pass
+    def _stage_08b_publish_static_tf(self) -> None: pass
+    def _stage_08c_amr_mapper(self) -> None: pass
+    def _stage_09_trajectory_planner(self) -> None: pass
+    def _stage_10_observer(self) -> None: pass
 
     # Don't run the real drone-abort sequence (publishes /land + sleeps).
     def _abort_drone(self) -> None: pass

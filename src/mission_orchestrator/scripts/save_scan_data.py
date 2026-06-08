@@ -5,20 +5,17 @@ and save the outputs for use with run_hw_test_amr_nav.py.
 
 No AMR hardware is required — only the drone scan files on disk.
 
-Stages that run (in execution order):
-  06   Wait for scan.mp4 and telemetry.csv
-  11   Verify scan.mp4 integrity via ffmpeg
-  15   Launch arena_marker_localizer service node
-  16   Call /localize_markers service                 (marker ORIENTATION source)
-  18   Launch arena_map_builder server
-  19   Call BuildArenaMap action                      (marker POSITION source)
-  17   Publish /aruco/amr/pose and /aruco/goal/pose  → saved to YAML
-       (position from the map-builder result, orientation from the localizer;
-        if --ground-truth is given, AMR/goal pose errors vs GT are printed here)
-  20   Publish /drone/map                             → saved to YAML
+Runs OFFLINE (map_builder.online forced false): stitches from the saved
+scan.mp4. The map-builder stages run as in the real mission:
+  02.a   Launch arena_map_builder server + set background_path
+  03.g/h Resolve scan.mp4 / telemetry.csv + ffmpeg integrity
+  (kickoff) Send BuildArenaMap goal (full stitch + transfer + occupancy)
+  04     Launch arena_marker_localizer + 04.a Call /localize_markers (ORIENTATION)
+  04.b   Join map result (POSITION) → publish + SAVE aruco poses & OccupancyGrid
+         (if --ground-truth is given, AMR/goal pose errors vs GT are printed here)
 
-All other stages (01-05 drone, 07-10 AMR bringup, 12-13 traj/fusion,
-14 oradar, 14b emergency stop) are no-ops.
+All other stages (01 optitrack, 03.a-f drone, 05 vslam, 06 rasp/AMR,
+07 e-stop, 08 mapping, 09 planner, 10 observer) are no-ops.
 
 Outputs saved to:
   src/mission_orchestrator/recorded_data/scanX/aruco_amr_pose.yaml
@@ -114,83 +111,62 @@ class _SaveScanOrchestrator(MissionOrchestratorNode):
     """Run localizer + map builder from drone scan files; save aruco poses and map."""
 
     _output_dir: str = ''
-    # When set (via --ground-truth), stage 17 prints AMR/goal pose errors vs GT.
+    # When set (via --ground-truth), stage 04.b prints AMR/goal pose errors vs GT.
     _gt_markers: Optional[dict] = None
 
-    # ── No-op: drone pipeline (01-05) ────────────────────────────────────────
+    # ── No-ops: everything except the map-builder + localizer stages ─────────
+    def _stage_01a_check_optitrack(self) -> None: pass
+    def _stage_01b_optitrack_sanity(self) -> None: pass
+    def _stage_03a_connect_tello_wifi(self) -> None: pass
+    def _stage_03b_launch_tello_driver(self) -> None: pass
+    def _stage_03c_drone_preflight(self) -> None: pass
+    def _stage_03d_launch_tello_map(self) -> None: pass
+    def _stage_03f_observe_drone_states(self) -> None: pass
+    def _stage_05a_verify_realsense(self) -> None: pass
+    def _stage_05b_start_vslam(self) -> None: pass
+    def _stage_05c_check_vslam_odometry(self) -> None: pass
+    def _stage_06a_ping(self) -> None: pass
+    def _stage_06b_ssh_connect(self) -> None: pass
+    def _stage_06c_launch_amr(self) -> None: pass
+    def _stage_06d_wait_imu_ready(self) -> None: pass
+    def _stage_07a_emergency_stop(self) -> None: pass
+    def _stage_08a_launch_oradar(self) -> None: pass
+    def _stage_08b_publish_static_tf(self) -> None: pass
+    def _stage_08c_amr_mapper(self) -> None: pass
+    def _stage_09_trajectory_planner(self) -> None: pass
+    def _stage_10_observer(self) -> None: pass
+    def _abort_drone(self) -> None: pass
 
-    def _stage_01_check_optitrack(self) -> None:
-        pass
+    # ── Stage 04.b override: join map result → publish + SAVE poses & map ─────
 
-    def _stage_01b_connect_tello_wifi(self) -> None:
-        pass
-
-    def _stage_02_launch_tello_driver(self) -> None:
-        pass
-
-    def _stage_03_drone_preflight(self) -> None:
-        pass
-
-    def _stage_04_launch_tello_map(self) -> None:
-        pass
-
-    def _stage_05_observe_drone_states(self) -> None:
-        pass
-
-    # ── No-op: AMR bringup (07-10) ───────────────────────────────────────────
-
-    def _stage_07_ping(self) -> None:
-        pass
-
-    def _stage_08_ssh_connect(self) -> None:
-        pass
-
-    def _stage_09_launch_amr(self) -> None:
-        pass
-
-    def _stage_10_wait_imu_ready(self) -> None:
-        pass
-
-    # ── No-op: trajectory planner + map fusion (not needed for saving) ────────
-
-    def _stage_12_launch_trajectory_planner(self) -> None:
-        pass
-
-    def _stage_13_launch_map_fusion(self) -> None:
-        pass
-
-    # ── No-op: oradar + emergency stop ────────────────────────────────────────
-
-    def _stage_14_launch_oradar(self) -> None:
-        pass
-
-    def _stage_14b_launch_emergency_stop(self) -> None:
-        pass
-
-    # ── Stage 17 override: publish + save aruco poses ─────────────────────────
-
-    def _stage_17_publish_aruco_poses(self, markers, map_result) -> None:
-        super()._stage_17_publish_aruco_poses(markers, map_result)
+    def _stage_04b_publish_aruco_poses(self, markers) -> None:
+        # super() awaits the map result, publishes the poses + OccupancyGrid, and
+        # stores self._last_map_result.
+        super()._stage_04b_publish_aruco_poses(markers)
 
         cfg_a = self._cfg['aruco']
         amr_id = cfg_a['amr_marker_id']
         goal_id = cfg_a['goal_marker_id']
         by_id = {int(m.id): m for m in markers}
+        mr = self._last_map_result
 
-        # Save the SAME messages that were just published: map-builder position +
-        # localizer orientation. _build_marker_pose is idempotent (super() already
-        # populated these in place), so this returns the exact published poses.
+        # Re-derive the SAME published poses (idempotent) for saving.
         amr_pose = self._build_marker_pose(
-            by_id[amr_id], map_result.amr_marker_position, "AMR", amr_id)
+            by_id[amr_id], mr.amr_marker_position, "AMR", amr_id)
         goal_pose = self._build_marker_pose(
-            by_id[goal_id], map_result.goal_marker_position, "goal", goal_id)
+            by_id[goal_id], mr.goal_marker_position, "goal", goal_id)
 
         amr_path = os.path.join(self._output_dir, 'aruco_amr_pose.yaml')
         goal_path = os.path.join(self._output_dir, 'aruco_goal_pose.yaml')
+        map_path = os.path.join(self._output_dir, 'drone_map.yaml')
         save_pose(amr_path, amr_pose)
         save_pose(goal_path, goal_pose)
+        save_grid(map_path, mr.map)
         self._log.info(f"  [save] aruco_amr_pose.yaml  → {amr_path!r}")
         self._log.info(f"  [save] aruco_goal_pose.yaml → {goal_path!r}")
+        self._log.info(
+            f"  [save] drone_map.yaml ({mr.map.info.width}×{mr.map.info.height} "
+            f"cells) → {map_path!r}")
 
         # If a ground-truth file was provided, report the error of the FINAL
         # (map-builder position + localizer orientation) AMR and goal poses.
@@ -226,17 +202,6 @@ class _SaveScanOrchestrator(MissionOrchestratorNode):
         self._log.info(
             f"        got  x={px:.3f} y={py:.3f} θ={yaw_deg:+.2f}°   "
             f"gt  x={gt_x:.3f} y={gt_y:.3f} θ={gt_th:+.2f}°")
-
-    # ── Stage 20 override: publish + save drone map ───────────────────────────
-
-    def _stage_20_publish_drone_map(self, grid) -> None:
-        super()._stage_20_publish_drone_map(grid)
-
-        map_path = os.path.join(self._output_dir, 'drone_map.yaml')
-        save_grid(map_path, grid)
-        self._log.info(
-            f"  [save] drone_map.yaml ({grid.info.width}×{grid.info.height} cells)"
-            f" → {map_path!r}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,6 +255,10 @@ def main() -> None:
 
     node = _SaveScanOrchestrator(args.config)
     node._output_dir = output_dir
+
+    # This flow has no live drone stream — always stitch from the saved video.
+    node._online_enabled = False
+    node._cfg.setdefault('map_builder', {})['online'] = False
 
     node._cfg['video']['dir'] = video_dir
     node._log.info(f"[--scan-id {args.scan_id}] video.dir → {video_dir!r}")

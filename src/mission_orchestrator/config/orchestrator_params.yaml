@@ -105,14 +105,23 @@ orchestrator:
     #   BuildArenaMap action then runs only the offline stages (transfer +
     #   occupancy). The orchestrator drives this via the server's online_start /
     #   online_stop services and launches the controller with publish_processed.
-    # online: false → current behaviour: the server stitches from the saved
-    #   scan.mp4 after the flight; the processed-image stream is ignored.
-    online: false
+    # online: false → the server stitches from the saved scan.mp4 after the
+    #   flight; the processed-image stream is ignored.
+    online: true                          # default: stitch live during the flight
     online_image_topic: "/camera/image_proc"
     online_start_service: "/build_arena_map_server/online_start"
     online_stop_service: "/build_arena_map_server/online_stop"
     online_start_timeout_sec: 60.0
     online_stop_timeout_sec: 180.0
+
+  # ── Isaac ROS Visual SLAM (cuVSLAM) — stage 05 ──────────────────────────
+  vslam:
+    odometry_topic: "/visual_slam/tracking/odometry"
+    odometry_timeout_sec: 30.0           # max wait for the first odometry msg
+    realsense_usb_id: "8086:0b3a"        # Intel RealSense D435i USB id (lsusb)
+    container_name: "isaac_ros_vslam"    # informational; the script owns it
+    start_timeout_sec: 120.0             # max wait for start_vslam.sh to return
+    start_script: "/home/jetson/collab_nav_ground-jetson/src/mission_orchestrator/scripts/start_vslam.sh"
 
   # ── Rosbag recording ────────────────────────────────────────────────────
   rosbag:

@@ -3,48 +3,61 @@ mission_orchestrator.orchestrator_node
 ────────────────────────────────────────────────────────────────────────────
 End-to-end mission sequencer for the collab_nav ground-robot + drone system.
 
-Stages
-──────
- 01  Check /optitrack/rigid_body presence + header; launch client if absent
- 01b Connect to Tello WiFi (nmcli scan + connect on wlx14ebb67dae0b)
- 02  Launch tello_driver
- 03  Drone preflight: verify /camera/image_raw live, /battery_state ≥ min %
- 04  Launch tello_map (drone takes off and executes scanning routine)
- 05  Observe drone state transitions 1→2→3→4 with per-stage timeouts
- 06  Wait for scan.mp4 and telemetry.csv to appear in the configured video dir, fresh within max_age_sec
- 07  Ping Raspberry Pi
- 08  SSH connect to Raspberry Pi
- 09  Start amr_bringup systemd service on Raspberry Pi; verify active
-10  Wait for /imu/data_raw to publish 200 messages (IMU running at 100 Hz)
-11  Verify scan.mp4 integrity via ffmpeg
-12  Launch trajectory_planner
-13  Launch map_fusion
-14  Launch oradar lidar
- 14b Launch emergency_stop node; verify next 10 /amr/emergency_stop messages are False
-15  Launch arena_marker_localizer service node + wait for readiness
-16  Call /localize_markers service → parse marker poses (ORIENTATION source)
-18  Launch arena_map_builder server + set background_path parameter
-19  Send BuildArenaMap action goal → wait for result (marker POSITION source)
-17  Publish /aruco/amr/pose and /aruco/goal/pose as PoseWithCovarianceStamped,
-    built from the map-builder marker position + the localizer orientation.
-    Runs only after BOTH stage 16 and stage 19 have returned successfully.
-17b Launch alignment_node (translates the /aruco/amr/pose to world->odom tf)
-17c Launch odom-based mapper (no SLAM)
-20  Publish the resulting OccupancyGrid to /drone/map
+Major stages and substages
+───────────────────────────
+ 01  Optitrack bringup
+     01.a  Check /optitrack/rigid_body presence + header; launch client if absent
+     01.b  Sanity-check /optitrack/rigid_body contents (frame_id + freshness)
+ 02  Arena map builder bringup
+     02.a  Launch server + configure background_path parameter
+     02.b  Configure online/offline mode (default online)
+     (Async) 02.c  Server responds with OccupancyGrid + marker poses (joined at 04.b)
+ 03  Drone routine
+     03.a  Connect to Tello WiFi (nmcli scan + connect)
+     03.b  Launch tello_driver
+     03.c  Drone preflight: verify /camera/image_raw live, /battery_state ≥ min %
+     03.d  Launch tello_map (drone takes off + scanning routine)
+     03.e  (If online) Send online_start to map builder (consume /camera/image_proc)
+     03.f  Observe drone state transitions 1→2→3→4 with per-stage timeouts
+     03.g  Wait for scan.mp4 + telemetry.csv (fresh within max_age_sec)
+     03.h  Verify scan.mp4 integrity via ffmpeg
+ 04  Aruco localizer
+     (kickoff) online_stop (if online) + send BuildArenaMap goal in the BACKGROUND
+     04    Launch arena_marker_localizer service node + wait for readiness
+     04.a  Call /localize_markers (ORIENTATION source) — runs while the map builds
+     04.b  Join the map-builder result (POSITION source), publish /aruco/.../pose
+           and the OccupancyGrid to /drone/map
+ 05  Isaac ROS Visual SLAM (cuSLAM) bringup
+     05.a  Verify Intel RealSense D435i is plugged in
+     05.b  Start Docker container + launch visual SLAM (via start_vslam.sh)
+     05.c  Check /visual_slam/tracking/odometry has a valid output
+ 06  Rasp bringup
+     06.a  Ping Raspberry Pi
+     06.b  SSH connect to Raspberry Pi
+     06.c  Start amr_bringup systemd service; verify active
+     06.d  Wait for /imu/data_raw to publish N messages
+ 07  Emergency stop bringup
+     07.a  Launch emergency_stop node; verify /amr/emergency_stop is inactive
+ 08  Mapping bringup
+     08.a  Launch oradar lidar
+     08.b  Launch alignment_node (/aruco/amr/pose → world->odom tf)
+     08.c  Launch odom-based mapper (no SLAM)
+ 09  Trajectory planner bringup
+ 10  Enter observer mode and log updates
 
-From stage 20 onward the orchestrator only observes; map_fusion and
+From stage 10 onward the orchestrator only observes; the mapper and
 trajectory_planner operate autonomously.
 
-Map-builder mode (config map_builder.online)
-─────────────────────────────────────────────
- offline (default): the arena_map_builder server is launched after stage 16 and
-   stitches from the saved scan.mp4; the live processed-image stream is ignored.
- online: the server is launched in online mode BEFORE the flight (right after
-   stage 04) and its online_start service is called; it stitches incrementally
-   from the drone's processed-image stream during the trajectory. After the
-   drone lands (stage 05) online_stop finalizes the stitch, and stage 19 runs
-   only the offline stages (transfer + occupancy) on the already-stitched map —
-   hiding the stitch latency behind the flight.
+Map-builder mode (config map_builder.online, default online)
+────────────────────────────────────────────────────────────
+ online (default): the server is launched in online mode at stage 02 and its
+   online_start service is called at 03.e; it stitches incrementally from the
+   drone's processed-image stream during the flight. After the drone lands,
+   online_stop finalizes the stitch and the BuildArenaMap goal (transfer +
+   occupancy only) is sent in the background; 04.b joins it.
+ offline: the server is launched in plain mode at stage 02; after the drone
+   lands the BuildArenaMap goal (full stitch + transfer + occupancy) is sent in
+   the background and joined at 04.b. The processed-image stream is ignored.
 """
 
 from __future__ import annotations
@@ -164,6 +177,7 @@ def _fmt_point(msg: Point) -> str:
 _OBSERVER_REGISTRY: Dict[str, tuple] = {
     '/amr/reference':   ('default', 'ref',       Odometry,                _fmt_odometry),
     '/amr/ekf/odom':    ('default', 'ekf/odom',  Odometry,                _fmt_odometry),
+    '/visual_slam/tracking/odometry': ('default', 'vslam', Odometry,      _fmt_odometry),
     '/aruco/amr/pose':  ('latched', 'amr_pose',  PoseWithCovarianceStamped, _fmt_pose_with_cov),
     '/aruco/goal/pose': ('latched', 'goal_pose', PoseWithCovarianceStamped, _fmt_pose_with_cov),
     '/amr/vel_raw':     ('default', 'vel_raw',   Twist,                   _fmt_twist),
@@ -198,10 +212,17 @@ class MissionOrchestratorNode(Node):
         self._mission_complete = False
         self._drone_aborted = False
 
-        # Map-builder mode: online (stitch live during the flight) vs offline
-        # (stitch from the saved scan.mp4 afterwards — the default).
+        # Map-builder mode: online (stitch live during the flight, default) vs
+        # offline (stitch from the saved scan.mp4 afterwards).
         self._online_enabled = bool(
-            self._cfg.get('map_builder', {}).get('online', False))
+            self._cfg.get('map_builder', {}).get('online', True))
+
+        # Background BuildArenaMap state (sent after the drone lands, joined at
+        # stage 04.b so the transfer/occupancy — and the full stitch in offline
+        # — overlaps the marker-localizer call).
+        self._map_goal_handle = None
+        self._map_result_future = None
+        self._map_send_error: Optional[str] = None
 
         # ── ROS 2 sync primitives ──
         self._imu_ready_event = threading.Event()
@@ -227,6 +248,7 @@ class MissionOrchestratorNode(Node):
         self._estop_triggered: bool = False
 
         self._drone_map_event = threading.Event()
+        self._vslam_odom_event = threading.Event()
 
         # Observer state (populated by _start_observer after mission handoff)
         self._observer_cache: Dict[str, object] = {}
@@ -303,6 +325,9 @@ class MissionOrchestratorNode(Node):
             self._emergency_stop_cb, 10)
         self.create_subscription(OccupancyGrid,
             cfg['map_builder']['drone_map_topic'], self._drone_map_cb, latched)
+        self.create_subscription(Odometry,
+            cfg.get('vslam', {}).get('odometry_topic', '/visual_slam/tracking/odometry'),
+            self._vslam_odom_cb, best_effort)
 
         self._pub_aruco_amr = self.create_publisher(
             PoseWithCovarianceStamped, cfg['aruco']['amr_pose_topic'], latched)
@@ -372,6 +397,9 @@ class MissionOrchestratorNode(Node):
     def _drone_map_cb(self, _msg: OccupancyGrid) -> None:
         self._drone_map_event.set()
 
+    def _vslam_odom_cb(self, _msg: Odometry) -> None:
+        self._vslam_odom_event.set()
+
     # ────────────────────────────────────────────────────────────────────────
     # Service / action helpers (called from main thread; executor spins in bg)
     # ────────────────────────────────────────────────────────────────────────
@@ -393,40 +421,6 @@ class MissionOrchestratorNode(Node):
             raise MissionAbortError(
                 f"Service call to '{client.srv_name}' timed out after {timeout_sec}s")
         return future.result()
-
-    def _call_action(self, goal, timeout_sec: float):
-        """Send a BuildArenaMap action goal and wait for the result."""
-        deadline = time.monotonic() + timeout_sec
-
-        # Wait for server
-        server_timeout = 30.0
-        if not self._map_action_client.wait_for_server(timeout_sec=server_timeout):
-            raise MissionAbortError(
-                f"BuildArenaMap action server not available after {server_timeout}s")
-
-        # Send goal
-        goal_evt = threading.Event()
-        goal_future = self._map_action_client.send_goal_async(
-            goal,
-            feedback_callback=self._map_action_feedback,
-        )
-        goal_future.add_done_callback(lambda _: goal_evt.set())
-        if not goal_evt.wait(timeout=30.0):
-            raise MissionAbortError("BuildArenaMap goal not accepted within 30s")
-
-        goal_handle = goal_future.result()
-        if not goal_handle.accepted:
-            raise MissionAbortError("BuildArenaMap goal was rejected")
-
-        # Wait for result
-        result_evt = threading.Event()
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(lambda _: result_evt.set())
-        remaining = max(1.0, deadline - time.monotonic())
-        if not result_evt.wait(timeout=remaining):
-            raise MissionAbortError(
-                f"BuildArenaMap action timed out after {timeout_sec}s")
-        return result_future.result().result
 
     def _map_action_feedback(self, fb_msg) -> None:
         fb = fb_msg.feedback
@@ -526,152 +520,14 @@ class MissionOrchestratorNode(Node):
         self._log.error("══════ ABORT COMPLETE ══════")
 
     # ────────────────────────────────────────────────────────────────────────
-    # Stages
+    # Shared low-level helpers
     # ────────────────────────────────────────────────────────────────────────
-
-    def _stage_07_ping(self) -> None:
-        self._log.info("╔══ Stage 07: Ping Raspberry Pi")
-        cfg_r = self._cfg['rasp']
-        ip = cfg_r['ip']
-        cmd = ['ping', '-c', str(cfg_r['ping_count']),
-               '-W', str(int(cfg_r['ping_timeout_sec'])), ip]
-        result = subprocess.run(cmd, capture_output=True)
-        if result.returncode != 0:
-            raise MissionAbortError(f"Raspberry Pi {ip} is not reachable")
-        self._log.info(f"╚══ Stage 07 OK: Raspberry Pi {ip} reachable")
-
-    def _stage_08_ssh_connect(self) -> None:
-        self._log.info("╔══ Stage 08: SSH connect to Raspberry Pi")
-        cfg_r = self._cfg['rasp']
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            hostname=cfg_r['ip'],
-            username=cfg_r['user'],
-            password=cfg_r['password'],
-            timeout=cfg_r['ssh_connect_timeout_sec'],
-        )
-        self._ssh = client
-        self._log.info(f"╚══ Stage 08 OK: SSH connected to {cfg_r['user']}@{cfg_r['ip']}")
 
     def _ssh_run(self, cmd: str) -> tuple[int, str, str]:
         """Run a command over SSH; return (exit_code, stdout, stderr)."""
         _in, out, err = self._ssh.exec_command(cmd)
         exit_code = out.channel.recv_exit_status()
         return exit_code, out.read().decode().strip(), err.read().decode().strip()
-
-    def _stage_09_launch_amr(self) -> None:
-        self._log.info("╔══ Stage 09: Start AMR bringup service on Raspberry Pi")
-        cfg_r = self._cfg['rasp']
-        svc = cfg_r['amr_service']
-        timeout = cfg_r['amr_service_start_timeout_sec']
-
-        # Start the service (idempotent — fine if already running)
-        rc, _, stderr = self._ssh_run(f'systemctl start {svc}')
-        if rc != 0:
-            raise MissionAbortError(
-                f"systemctl start {svc} failed (rc={rc}): {stderr}")
-        self._log.info(f"  systemctl start {svc} → OK")
-
-        # Poll until active or timeout
-        self._log.info(f"  Waiting for {svc} to become active (up to {timeout}s) …")
-        deadline = time.monotonic() + timeout
-        while True:
-            _, state, _ = self._ssh_run(f'systemctl is-active {svc}')
-            if state == 'active':
-                break
-            if time.monotonic() > deadline:
-                # Grab journal tail for diagnostics
-                _, journal, _ = self._ssh_run(
-                    f'journalctl -u {svc} -n 20 --no-pager')
-                raise MissionAbortError(
-                    f"{svc} did not become active within {timeout}s "
-                    f"(state={state!r}).\nJournal tail:\n{journal}")
-            time.sleep(1.0)
-
-        self._log.info(f"╚══ Stage 09 OK: {svc} is active")
-
-    def _stage_14b_launch_emergency_stop(self) -> None:
-        self._log.info("╔══ Stage 14b: Launch emergency_stop node")
-        cfg_es = self._cfg.get('emergency_stop', {})
-        topic = cfg_es.get('topic', '/amr/emergency_stop')
-        n_samples = int(cfg_es.get('check_count', 10))
-        startup_timeout = float(cfg_es.get('startup_timeout_sec', 15.0))
-
-        proc = subprocess.Popen(
-            ['ros2', 'launch', 'emergency_stop', 'emergency_stop.launch.py'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        self._processes['emergency_stop'] = proc
-        self._log.info(f"  emergency_stop launched (pid={proc.pid})")
-
-        # Reset collection state before we start counting messages
-        with self._estop_lock:
-            self._estop_count = 0
-            self._estop_triggered = False
-        self._estop_event.clear()
-
-        # At 10 Hz, n_samples messages arrive in n_samples/10 s; add startup margin
-        total_timeout = startup_timeout + n_samples / 10.0 + 2.0
-        self._log.info(
-            f"  Waiting for {n_samples} messages on {topic} "
-            f"(timeout={total_timeout:.0f}s) …")
-
-        if not self._estop_event.wait(timeout=total_timeout):
-            raise MissionAbortError(
-                f"emergency_stop: received only {self._estop_count}/{n_samples} "
-                f"messages on {topic} within {total_timeout:.0f}s")
-
-        if self._estop_triggered:
-            raise MissionAbortError(
-                f"emergency_stop: ACTIVE signal detected on {topic} — "
-                "check AMR safety state before proceeding")
-
-        self._log.info(
-            f"╚══ Stage 14b OK: {n_samples} messages on {topic} all False")
-
-    def _stage_10_wait_imu_ready(self) -> None:
-        n = self._cfg['imu']['message_count']
-        timeout = self._cfg['imu']['timeout_sec']
-        self._log.info(f"╔══ Stage 10: Waiting for {n} messages on {self._cfg['imu']['topic']}")
-        if not self._imu_ready_event.wait(timeout=timeout):
-            raise MissionAbortError(
-                f"IMU did not publish {n} messages within {timeout}s "
-                f"(received {self._imu_msg_count})")
-        self._log.info(f"╚══ Stage 10 OK: IMU ready ({self._imu_msg_count} messages received)")
-
-    def _stage_01_check_optitrack(self) -> None:
-        self._log.info("╔══ Stage 01: Check OptiTrack")
-        if not self._wait_optitrack_message():
-            self._log.warning("  No message — launching optitrack_client and retrying …")
-            proc = subprocess.Popen(['ros2', 'run', 'optitrack_client', 'optitrack_client'])
-            self._processes['optitrack_client'] = proc
-            time.sleep(self._cfg['optitrack']['retry_delay_sec'])
-            self._optitrack_event.clear()
-            if not self._wait_optitrack_message():
-                raise MissionAbortError("OptiTrack did not come up after launching client")
-        self._verify_optitrack_header()
-        self._log.info("╚══ Stage 01 OK: OptiTrack verified")
-
-    def _stage_17b_publish_static_tf(self)->None:
-        self._log.info("╔══ Stage 17b: Publish static TF world->odom")
-        proc = subprocess.Popen(
-            ['ros2', 'run', 'amr_drone_nav', 'alignment_node'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        self._processes['world_odom_tf'] = proc
-        self._log.info(f"  static TF world->odom launched (pid={proc.pid})")
-
-    def _stage_17c_amr_mapper(self)->None:
-        self._log.info("╔══ Stage 17c: AMR Mapper")
-        proc = subprocess.Popen(
-            ['ros2', 'launch', 'world_mapper', 'mapper.launch.py'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        self._processes['amr_mapper'] = proc
-        self._log.info(f"  amr_mapper launched (pid={proc.pid})")
-
-
 
     def _wait_optitrack_message(self) -> bool:
         self._optitrack_event.clear()
@@ -702,8 +558,115 @@ class MissionOrchestratorNode(Node):
 
         self._log.info(f"  OptiTrack OK — frame_id='{msg.header.frame_id}', age={age:.3f}s")
 
-    def _stage_01b_connect_tello_wifi(self) -> None:
-        self._log.info("╔══ Stage 01b: Connect to Tello WiFi")
+    def _wait_drone_state(self, target: int, timeout_sec: float) -> bool:
+        """Block until /drone/state is exactly *target*, or *timeout_sec* elapses."""
+        deadline = time.monotonic() + timeout_sec
+        with self._drone_state_cond:
+            while self._drone_state != target:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._drone_state_cond.wait(timeout=remaining)
+            return True
+
+    def _wait_for_publisher(self, topic: str, timeout_sec: float, label: str) -> None:
+        """Block until at least one publisher exists on *topic* or raise."""
+        deadline = time.monotonic() + timeout_sec
+        while self.count_publishers(topic) == 0:
+            if time.monotonic() > deadline:
+                raise MissionAbortError(
+                    f"{label} not ready: no publisher on '{topic}' after {timeout_sec}s")
+            time.sleep(0.5)
+        self._log.info(f"  {label} ready — publisher on '{topic}' detected")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 01 — Optitrack bringup
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_01a_check_optitrack(self) -> None:
+        self._log.info("╔══ Stage 01.a: Check OptiTrack presence")
+        if not self._wait_optitrack_message():
+            self._log.warning("  No message — launching optitrack_client and retrying …")
+            proc = subprocess.Popen(['ros2', 'run', 'optitrack_client', 'optitrack_client'])
+            self._processes['optitrack_client'] = proc
+            time.sleep(self._cfg['optitrack']['retry_delay_sec'])
+            self._optitrack_event.clear()
+            if not self._wait_optitrack_message():
+                raise MissionAbortError("OptiTrack did not come up after launching client")
+        self._log.info("╚══ Stage 01.a OK: OptiTrack publishing")
+
+    def _stage_01b_optitrack_sanity(self) -> None:
+        self._log.info("╔══ Stage 01.b: Sanity-check /optitrack/rigid_body")
+        self._verify_optitrack_header()
+        self._log.info("╚══ Stage 01.b OK: OptiTrack contents verified")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 02 — Arena map builder bringup
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_02a_configure_background(self) -> None:
+        self._log.info("╔══ Stage 02.a: Launch arena_map_builder + set background_path")
+        cmd = ['ros2', 'run', 'arena_map_builder', 'build_arena_map_server']
+        if self._online_enabled:
+            # online_mode must be set at construction (it wires the subscription
+            # + start/stop services), so pass it as a launch-time parameter.
+            topic = self._cfg['map_builder'].get(
+                'online_image_topic', '/camera/image_proc')
+            cmd += ['--ros-args',
+                    '-p', 'stitch.online_mode:=true',
+                    '-p', f'stitch.online_image_topic:={topic}']
+            self._log.info(f"  online mode: server will subscribe {topic}")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._processes['map_builder'] = proc
+        self._log.info(f"  build_arena_map_server launched (pid={proc.pid})")
+
+        # Wait for the action server to be ready
+        server_timeout = self._cfg['map_builder']['server_ready_timeout_sec']
+        self._log.info(f"  Waiting for action server (up to {server_timeout}s) …")
+        if not self._map_action_client.wait_for_server(timeout_sec=server_timeout):
+            raise MissionAbortError(
+                f"BuildArenaMap action server not available after {server_timeout}s")
+
+        # Set background_path parameter — retry because ros2cli node discovery
+        # can lag behind the action server becoming available.
+        bg = self._cfg['map_builder']['background_image_path']
+        self._log.info(f"  Setting background_path → {bg}")
+        result = None
+        for attempt in range(1, 6):
+            result = subprocess.run(
+                ['ros2', 'param', 'set', '/build_arena_map_server',
+                 'transfer.background_path', bg],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                break
+            self._log.info(
+                f"  ros2 param set attempt {attempt}/5 failed "
+                f"({result.stderr.strip()!r}), retrying …")
+            time.sleep(1.0)
+        if result.returncode != 0:
+            raise MissionAbortError(
+                f"Failed to set background_path after 5 attempts: "
+                f"{result.stderr.strip()}")
+        self._log.info("╚══ Stage 02.a OK: map_builder ready")
+
+    def _stage_02b_configure_mode(self) -> None:
+        self._log.info("╔══ Stage 02.b: Configure online/offline mode")
+        mode = 'ONLINE' if self._online_enabled else 'OFFLINE'
+        self._log.info(
+            f"  map builder mode = {mode}  "
+            f"(online stitches live from /camera/image_proc during the flight; "
+            f"offline stitches the saved scan.mp4 afterwards)")
+        self._log.info(f"╚══ Stage 02.b OK: mode = {mode}")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 03 — Drone routine
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_03a_connect_tello_wifi(self) -> None:
+        self._log.info("╔══ Stage 03.a: Connect to Tello WiFi")
         cfg_w = self._cfg['tello_wifi']
         iface = cfg_w['interface']
         ssid = cfg_w['ssid']
@@ -752,10 +715,10 @@ class MissionOrchestratorNode(Node):
                 f"{result.stderr.strip() or result.stdout.strip()}")
 
         self._log.info(f"  {result.stdout.strip()}")
-        self._log.info("╚══ Stage 01b OK: Tello WiFi connected")
+        self._log.info("╚══ Stage 03.a OK: Tello WiFi connected")
 
-    def _stage_02_launch_tello_driver(self) -> None:
-        self._log.info("╔══ Stage 02: Launch tello_driver")
+    def _stage_03b_launch_tello_driver(self) -> None:
+        self._log.info("╔══ Stage 03.b: Launch tello_driver")
         proc = subprocess.Popen(
             ['ros2', 'launch', 'tello_driver', 'tello_driver.launch.py'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -765,10 +728,10 @@ class MissionOrchestratorNode(Node):
         delay = float(self._cfg['drone'].get('driver_startup_delay_sec', 15.0))
         self._log.info(f"  Waiting {delay}s for tello_driver to finish configuring …")
         time.sleep(delay)
-        self._log.info("╚══ Stage 02 OK")
+        self._log.info("╚══ Stage 03.b OK")
 
-    def _stage_03_drone_preflight(self) -> None:
-        self._log.info("╔══ Stage 03: Drone preflight checks")
+    def _stage_03c_drone_preflight(self) -> None:
+        self._log.info("╔══ Stage 03.c: Drone preflight checks")
         cfg_d = self._cfg['drone']
 
         # Camera
@@ -796,10 +759,10 @@ class MissionOrchestratorNode(Node):
         if self._drone_state is not None and self._drone_state != -1:
             raise MissionAbortError(
                 f"Expected drone state -1 (before takeoff), got {self._drone_state}")
-        self._log.info("╚══ Stage 03 OK: Drone is ready for takeoff")
+        self._log.info("╚══ Stage 03.c OK: Drone is ready for takeoff")
 
-    def _stage_04_launch_tello_map(self) -> None:
-        self._log.info("╔══ Stage 04: Launch tello_map (drone take-off + scan)")
+    def _stage_03d_launch_tello_map(self) -> None:
+        self._log.info("╔══ Stage 03.d: Launch tello_map (drone take-off + scan)")
         cmd = ['ros2', 'launch', 'tello_pos_control', 'tello_map.launch.py']
         if self._online_enabled:
             # Have the controller republish the processed frames it records so
@@ -814,25 +777,20 @@ class MissionOrchestratorNode(Node):
         )
         self._processes['tello_map'] = proc
         self._log.info(f"  tello_map launched (pid={proc.pid})")
-        self._log.info("╚══ Stage 04 OK")
+        self._log.info("╚══ Stage 03.d OK")
 
-    def _wait_drone_state(self, target: int, timeout_sec: float) -> bool:
-        """Block until /drone/state is exactly *target*, or *timeout_sec* elapses.
+    def _stage_03e_online_start(self) -> None:
+        """Tell the map-builder server to begin live stitching (online mode)."""
+        self._log.info("╔══ Stage 03.e: Start live stitching (online)")
+        timeout = float(self._cfg['map_builder'].get('online_start_timeout_sec', 60.0))
+        resp = self._call_service(
+            self._online_start_cli, Trigger.Request(), timeout_sec=timeout)
+        if not resp.success:
+            raise MissionAbortError(f"online_start failed: {resp.message}")
+        self._log.info(f"╚══ Stage 03.e OK: {resp.message}")
 
-        Uses the current reported state, not a cached event — so it correctly
-        waits even if the target state was briefly published before this call.
-        """
-        deadline = time.monotonic() + timeout_sec
-        with self._drone_state_cond:
-            while self._drone_state != target:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._drone_state_cond.wait(timeout=remaining)
-            return True
-
-    def _stage_05_observe_drone_states(self) -> None:
-        self._log.info("╔══ Stage 05: Monitor drone state transitions")
+    def _stage_03f_observe_drone_states(self) -> None:
+        self._log.info("╔══ Stage 03.f: Monitor drone state transitions")
         cfg_d = self._cfg['drone']
 
         state_names = {1: 'Stabilize', 2: 'Trajectory', 3: 'Going Back', 4: 'Landing'}
@@ -853,10 +811,10 @@ class MissionOrchestratorNode(Node):
                 raise MissionAbortError(f"Drone timeout in state {state} ({name})")
             self._log.info(f"  → State {state} ({name}) reached")
 
-        self._log.info("╚══ Stage 05 OK: Drone mission complete (state 4)")
+        self._log.info("╚══ Stage 03.f OK: Drone mission complete (state 4)")
 
-    def _stage_06_wait_video_files(self) -> None:
-        self._log.info("╔══ Stage 06: Wait for video and telemetry files")
+    def _stage_03g_wait_video_files(self) -> None:
+        self._log.info("╔══ Stage 03.g: Wait for video and telemetry files")
         cfg_v = self._cfg['video']
         video_dir = cfg_v['dir']
         video_path = os.path.join(video_dir, cfg_v['video_filename'])
@@ -904,10 +862,10 @@ class MissionOrchestratorNode(Node):
             age = now - os.path.getmtime(path)
             self._log.info(f"  {label}: {size_kb:.1f} KB, age={age:.0f}s — OK")
 
-        self._log.info("╚══ Stage 06 OK")
+        self._log.info("╚══ Stage 03.g OK")
 
-    def _stage_11_verify_video_integrity(self) -> None:
-        self._log.info("╔══ Stage 11: Verify scan.mp4 integrity via ffmpeg")
+    def _stage_03h_verify_video_integrity(self) -> None:
+        self._log.info("╔══ Stage 03.h: Verify scan.mp4 integrity via ffmpeg")
         result = subprocess.run(
             ['ffmpeg', '-v', 'error', '-i', self._video_path, '-f', 'null', '-'],
             capture_output=True,
@@ -916,59 +874,89 @@ class MissionOrchestratorNode(Node):
             err = result.stderr.decode().strip()
             raise MissionAbortError(
                 f"scan.mp4 failed ffmpeg integrity check: {err}")
-        self._log.info("╚══ Stage 11 OK: scan.mp4 is valid")
+        self._log.info("╚══ Stage 03.h OK: scan.mp4 is valid")
 
-    def _wait_for_publisher(self, topic: str, timeout_sec: float, label: str) -> None:
-        """Block until at least one publisher exists on *topic* or raise MissionAbortError."""
-        deadline = time.monotonic() + timeout_sec
-        while self.count_publishers(topic) == 0:
-            if time.monotonic() > deadline:
-                raise MissionAbortError(
-                    f"{label} not ready: no publisher on '{topic}' after {timeout_sec}s")
-            time.sleep(0.5)
-        self._log.info(f"  {label} ready — publisher on '{topic}' detected")
+    # ── Map-build kickoff: online_stop (if online) + send goal in background ──
 
-    def _stage_12_launch_trajectory_planner(self) -> None:
-        self._log.info("╔══ Stage 12: Launch trajectory_planner")
-        proc = subprocess.Popen(
-            ['ros2', 'launch', 'trajectory_planner', 'planner_launch.py'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        self._processes['trajectory_planner'] = proc
-        self._log.info(f"  trajectory_planner launched (pid={proc.pid})")
-        cfg_tp = self._cfg['trajectory_planner']
-        self._wait_for_publisher(
-            cfg_tp['ready_topic'], cfg_tp['ready_timeout_sec'], 'trajectory_planner')
-        self._log.info("╚══ Stage 12 OK")
+    def _online_stop(self) -> None:
+        """Tell the server to stop intake and finalize the live stitch."""
+        self._log.info("╔══ Map build: stop live stitching + finalize")
+        timeout = float(self._cfg['map_builder'].get('online_stop_timeout_sec', 180.0))
+        resp = self._call_service(
+            self._online_stop_cli, Trigger.Request(), timeout_sec=timeout)
+        if not resp.success:
+            raise MissionAbortError(f"online_stop failed: {resp.message}")
+        self._log.info(f"╚══ Map build: stitch finalized — {resp.message}")
 
-    def _stage_13_launch_map_fusion(self) -> None:
-        self._log.info("╔══ Stage 13: Launch map_fusion")
-        proc = subprocess.Popen(
-            ['ros2', 'launch', 'map_fusion', 'map_fusion.launch.py'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        self._processes['map_fusion'] = proc
-        self._log.info(f"  map_fusion launched (pid={proc.pid})")
-        cfg_mf = self._cfg['map_fusion']
-        self._wait_for_publisher(
-            cfg_mf['ready_topic'], cfg_mf['ready_timeout_sec'], 'map_fusion')
-        self._log.info("╚══ Stage 13 OK")
+    def _send_map_goal_async(self) -> None:
+        """Finalize the live stitch (online) and send BuildArenaMap WITHOUT
+        blocking, so transfer+occupancy (and the full stitch in offline) overlaps
+        the marker-localizer call. The result is joined later at stage 04.b."""
+        if self._online_enabled:
+            self._online_stop()
 
-    def _stage_14_launch_oradar(self) -> None:
-        self._log.info("╔══ Stage 14: Launch oradar lidar")
-        proc = subprocess.Popen(
-            ['ros2', 'launch', 'oradar_lidar', 'ms200_scan.launch.py'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        self._processes['oradar'] = proc
-        self._log.info(f"  oradar launched (pid={proc.pid})")
-        cfg_or = self._cfg['oradar']
-        self._wait_for_publisher(
-            cfg_or['scan_topic'], cfg_or['ready_timeout_sec'], 'oradar')
-        self._log.info("╚══ Stage 14 OK")
+        self._log.info("╔══ Map build: sending BuildArenaMap goal (async)")
+        if not self._map_action_client.wait_for_server(timeout_sec=30.0):
+            raise MissionAbortError("BuildArenaMap action server not available")
 
-    def _stage_15_launch_marker_localizer(self) -> None:
-        self._log.info("╔══ Stage 15: Launch arena_marker_localizer")
+        goal = BuildArenaMap.Goal()
+        goal.video_path = self._video_path or ''
+        self._map_goal_handle = None
+        self._map_result_future = None
+        self._map_send_error = None
+
+        accepted_evt = threading.Event()
+
+        def _on_goal(send_future):
+            try:
+                gh = send_future.result()
+                if not gh.accepted:
+                    self._map_send_error = "BuildArenaMap goal was rejected"
+                else:
+                    self._map_goal_handle = gh
+                    self._map_result_future = gh.get_result_async()
+            except Exception as exc:           # pragma: no cover
+                self._map_send_error = f"send_goal failed: {exc}"
+            finally:
+                accepted_evt.set()
+
+        self._map_action_client.send_goal_async(
+            goal, feedback_callback=self._map_action_feedback
+        ).add_done_callback(_on_goal)
+
+        if not accepted_evt.wait(timeout=30.0):
+            raise MissionAbortError("BuildArenaMap goal not accepted within 30s")
+        if self._map_send_error or self._map_result_future is None:
+            raise MissionAbortError(self._map_send_error or "BuildArenaMap goal rejected")
+        self._log.info("╚══ Map build: running in background")
+
+    def _await_map_result(self) -> "BuildArenaMap.Result":
+        """Block until the background BuildArenaMap result arrives; return it."""
+        timeout = float(self._cfg['map_builder']['action_timeout_sec'])
+        evt = threading.Event()
+        self._map_result_future.add_done_callback(lambda _: evt.set())
+        if not evt.wait(timeout=timeout):
+            raise MissionAbortError(f"BuildArenaMap timed out after {timeout}s")
+        result = self._map_result_future.result().result
+        if not result.success:
+            raise MissionAbortError(f"BuildArenaMap failed: {result.message}")
+        self._last_map_result = result   # exposed for subclasses (e.g. save_scan)
+        self._log.info(
+            f"  Map built: {result.map.info.width}×{result.map.info.height} cells, "
+            f"{result.n_obstacles} obstacles, "
+            f"mean consistency={result.mean_consistency:.3f}")
+        gp, ap = result.goal_marker_position, result.amr_marker_position
+        self._log.info(
+            f"  Marker centres (m from grid origin): "
+            f"goal=({gp.x:.3f}, {gp.y:.3f})  amr=({ap.x:.3f}, {ap.y:.3f})")
+        return result
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 04 — Aruco localizer
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_04_launch_marker_localizer(self) -> None:
+        self._log.info("╔══ Stage 04: Launch arena_marker_localizer")
         ws = self._cfg['marker_localizer']['workspace_path']
 
         # Find the default.yaml for the localizer inside the workspace
@@ -1001,10 +989,10 @@ class MissionOrchestratorNode(Node):
             if time.monotonic() > deadline:
                 raise MissionAbortError(
                     f"/localize_markers not available after {server_timeout}s")
-        self._log.info("╚══ Stage 15 OK: marker_localizer ready")
+        self._log.info("╚══ Stage 04 OK: marker_localizer ready")
 
-    def _stage_16_call_localize_markers(self) -> List:
-        self._log.info("╔══ Stage 16: Call /localize_markers")
+    def _stage_04a_call_localize_markers(self) -> List:
+        self._log.info("╔══ Stage 04.a: Call /localize_markers")
         req = LocalizeMarkers.Request()
         req.video_path = self._video_path
         req.optitrack_csv = self._telemetry_path
@@ -1023,11 +1011,11 @@ class MissionOrchestratorNode(Node):
             self._log.info(
                 f"    id={m.id}  x={m.pose_2d.x:.3f} y={m.pose_2d.y:.3f} "
                 f"θ={math.degrees(m.pose_2d.theta):.1f}°  n_obs={m.n_observations}")
-        self._log.info("╚══ Stage 16 OK")
+        self._log.info("╚══ Stage 04.a OK")
         return markers
 
-    def _stage_17_publish_aruco_poses(self, markers: List, map_result) -> None:
-        self._log.info("╔══ Stage 17: Publish /aruco/amr/pose and /aruco/goal/pose")
+    def _stage_04b_publish_aruco_poses(self, markers: List) -> None:
+        self._log.info("╔══ Stage 04.b: Join map result → publish poses + OccupancyGrid")
         cfg_a = self._cfg['aruco']
         amr_id = cfg_a['amr_marker_id']
         goal_id = cfg_a['goal_marker_id']
@@ -1042,6 +1030,10 @@ class MissionOrchestratorNode(Node):
             raise MissionAbortError(
                 f"Goal marker id={goal_id} not found in localizer response "
                 f"(found ids: {sorted(by_id.keys())})")
+
+        # Join the background map-build result (POSITION + OccupancyGrid). 02.c.
+        map_result = self._await_map_result()
+        self._publish_drone_map(map_result.map)
 
         # POSITION comes from the arena_map_builder result; ORIENTATION (and
         # covariance + header/frame) from the marker localizer. Both express the
@@ -1064,7 +1056,7 @@ class MissionOrchestratorNode(Node):
             f"({goal_pose.pose.pose.position.x:.3f}, {goal_pose.pose.pose.position.y:.3f}) "
             f"θ={math.degrees(_yaw_from_quat(goal_pose.pose.pose.orientation)):.1f}° "
             f"→ {cfg_a['goal_pose_topic']}")
-        self._log.info("╚══ Stage 17 OK")
+        self._log.info("╚══ Stage 04.b OK")
 
     def _build_marker_pose(self, marker, position, label: str, marker_id: int):
         """Build the PoseWithCovarianceStamped to publish for one marker.
@@ -1091,102 +1083,9 @@ class MissionOrchestratorNode(Node):
         pose.header.stamp = self.get_clock().now().to_msg()
         return pose
 
-    def _stage_18_launch_map_builder(self) -> None:
-        self._log.info("╔══ Stage 18: Launch arena_map_builder server")
-        cmd = ['ros2', 'run', 'arena_map_builder', 'build_arena_map_server']
-        if self._online_enabled:
-            # online_mode must be set at construction (it wires the subscription
-            # + start/stop services), so pass it as a launch-time parameter.
-            topic = self._cfg['map_builder'].get(
-                'online_image_topic', '/camera/image_proc')
-            cmd += ['--ros-args',
-                    '-p', 'stitch.online_mode:=true',
-                    '-p', f'stitch.online_image_topic:={topic}']
-            self._log.info(f"  online mode: server will subscribe {topic}")
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        self._processes['map_builder'] = proc
-        self._log.info(f"  build_arena_map_server launched (pid={proc.pid})")
-
-        # Wait for the action server to be ready
-        server_timeout = self._cfg['map_builder']['server_ready_timeout_sec']
-        self._log.info(f"  Waiting for action server (up to {server_timeout}s) …")
-        if not self._map_action_client.wait_for_server(timeout_sec=server_timeout):
-            raise MissionAbortError(
-                f"BuildArenaMap action server not available after {server_timeout}s")
-
-        # Set background_path parameter — retry because ros2cli node discovery
-        # can lag behind the action server becoming available.
-        bg = self._cfg['map_builder']['background_image_path']
-        self._log.info(f"  Setting background_path → {bg}")
-        result = None
-        for attempt in range(1, 6):
-            result = subprocess.run(
-                ['ros2', 'param', 'set', '/build_arena_map_server',
-                 'transfer.background_path', bg],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                break
-            self._log.info(
-                f"  ros2 param set attempt {attempt}/5 failed "
-                f"({result.stderr.strip()!r}), retrying …")
-            time.sleep(1.0)
-        if result.returncode != 0:
-            raise MissionAbortError(
-                f"Failed to set background_path after 5 attempts: "
-                f"{result.stderr.strip()}")
-        self._log.info("╚══ Stage 18 OK: map_builder ready")
-
-    def _stage_online_start(self) -> None:
-        """Tell the map-builder server to begin live stitching (online mode)."""
-        self._log.info("╔══ Online: start live stitching")
-        timeout = float(self._cfg['map_builder'].get('online_start_timeout_sec', 60.0))
-        resp = self._call_service(
-            self._online_start_cli, Trigger.Request(), timeout_sec=timeout)
-        if not resp.success:
-            raise MissionAbortError(f"online_start failed: {resp.message}")
-        self._log.info(f"╚══ Online start OK: {resp.message}")
-
-    def _stage_online_stop(self) -> None:
-        """Tell the server to stop intake and finalize the live stitch."""
-        self._log.info("╔══ Online: stop live stitching + finalize stitch")
-        timeout = float(self._cfg['map_builder'].get('online_stop_timeout_sec', 180.0))
-        resp = self._call_service(
-            self._online_stop_cli, Trigger.Request(), timeout_sec=timeout)
-        if not resp.success:
-            raise MissionAbortError(f"online_stop failed: {resp.message}")
-        self._log.info(f"╚══ Online stop OK: {resp.message}")
-
-    def _stage_19_call_map_builder(self) -> "BuildArenaMap.Result":
-        self._log.info("╔══ Stage 19: Call BuildArenaMap action")
-        goal = BuildArenaMap.Goal()
-        goal.video_path = self._video_path
-        self._log.info(f"  video_path={self._video_path!r}")
-
-        timeout = self._cfg['map_builder']['action_timeout_sec']
-        result = self._call_action(goal, timeout_sec=timeout)
-
-        if not result.success:
-            raise MissionAbortError(f"BuildArenaMap failed: {result.message}")
-
-        self._log.info(
-            f"  Map built: {result.map.info.width}×{result.map.info.height} cells, "
-            f"{result.n_obstacles} obstacles, "
-            f"mean consistency={result.mean_consistency:.3f}")
-        gp, ap = result.goal_marker_position, result.amr_marker_position
-        self._log.info(
-            f"  Marker centres (m from grid origin): "
-            f"goal=({gp.x:.3f}, {gp.y:.3f})  amr=({ap.x:.3f}, {ap.y:.3f})")
-        self._log.info("╚══ Stage 19 OK")
-        return result
-
-    def _stage_20_publish_drone_map(self, grid: OccupancyGrid) -> None:
-        self._log.info("╔══ Stage 20: Publish /drone/map")
+    def _publish_drone_map(self, grid: OccupancyGrid) -> None:
+        """Publish the map-builder OccupancyGrid to /drone/map (stage 02.c)."""
         cfg_mb = self._cfg['map_builder']
-
-        # Ensure frame_id is 'world' as map_fusion expects
         grid.header.frame_id = 'world'
         grid.header.stamp = self.get_clock().now().to_msg()
 
@@ -1198,11 +1097,229 @@ class MissionOrchestratorNode(Node):
         # Confirm our own subscriber fires (latched; same process)
         if not self._drone_map_event.wait(timeout=5.0):
             self._log.warning("  /drone/map subscriber did not echo back within 5s (may be ok)")
-        self._log.info("╚══ Stage 20 OK: /drone/map live")
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Observer: post-handoff periodic state logging
-    # ────────────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 05 — Isaac ROS Visual SLAM (cuSLAM) bringup
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_05a_verify_realsense(self) -> None:
+        self._log.info("╔══ Stage 05.a: Verify Intel RealSense D435i")
+        cfg_v = self._cfg.get('vslam', {})
+        usb_id = str(cfg_v.get('realsense_usb_id', '8086:0b3a')).lower()
+        result = subprocess.run(['lsusb'], capture_output=True, text=True)
+        out = result.stdout.lower()
+        if usb_id in out or 'realsense' in out:
+            self._log.info("╚══ Stage 05.a OK: RealSense detected on USB")
+        else:
+            raise MissionAbortError(
+                f"Intel RealSense D435i (usb {usb_id}) not found in lsusb — "
+                f"check it is plugged in")
+
+    def _stage_05b_start_vslam(self) -> None:
+        # Covers spec 05.b (start container) + 05.c (launch visual SLAM).
+        self._log.info("╔══ Stage 05.b: Start container + launch Isaac ROS VSLAM")
+        cfg_v = self._cfg.get('vslam', {})
+        script = cfg_v.get('start_script')
+        if not script or not os.path.isfile(script):
+            raise MissionAbortError(
+                f"vslam.start_script not found: {script!r}")
+        timeout = float(cfg_v.get('start_timeout_sec', 120.0))
+        result = subprocess.run(
+            ['bash', script], capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            raise MissionAbortError(
+                f"start_vslam.sh failed (rc={result.returncode}): "
+                f"{result.stderr.strip() or result.stdout.strip()}")
+        self._log.info(f"  {result.stdout.strip()}")
+        self._log.info("╚══ Stage 05.b OK: VSLAM container + launch started")
+
+    def _stage_05c_check_vslam_odometry(self) -> None:
+        self._log.info("╔══ Stage 05.c: Check /visual_slam/tracking/odometry")
+        cfg_v = self._cfg.get('vslam', {})
+        topic = cfg_v.get('odometry_topic', '/visual_slam/tracking/odometry')
+        timeout = float(cfg_v.get('odometry_timeout_sec', 30.0))
+        self._vslam_odom_event.clear()
+        self._log.info(f"  Waiting for {topic} (up to {timeout:.0f}s) …")
+        if not self._vslam_odom_event.wait(timeout=timeout):
+            raise MissionAbortError(
+                f"No message on {topic} within {timeout:.0f}s — VSLAM not tracking")
+        self._log.info("╚══ Stage 05.c OK: VSLAM odometry live")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 06 — Rasp bringup
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_06a_ping(self) -> None:
+        self._log.info("╔══ Stage 06.a: Ping Raspberry Pi")
+        cfg_r = self._cfg['rasp']
+        ip = cfg_r['ip']
+        cmd = ['ping', '-c', str(cfg_r['ping_count']),
+               '-W', str(int(cfg_r['ping_timeout_sec'])), ip]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            raise MissionAbortError(f"Raspberry Pi {ip} is not reachable")
+        self._log.info(f"╚══ Stage 06.a OK: Raspberry Pi {ip} reachable")
+
+    def _stage_06b_ssh_connect(self) -> None:
+        self._log.info("╔══ Stage 06.b: SSH connect to Raspberry Pi")
+        cfg_r = self._cfg['rasp']
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            hostname=cfg_r['ip'],
+            username=cfg_r['user'],
+            password=cfg_r['password'],
+            timeout=cfg_r['ssh_connect_timeout_sec'],
+        )
+        self._ssh = client
+        self._log.info(f"╚══ Stage 06.b OK: SSH connected to {cfg_r['user']}@{cfg_r['ip']}")
+
+    def _stage_06c_launch_amr(self) -> None:
+        self._log.info("╔══ Stage 06.c: Start AMR bringup service on Raspberry Pi")
+        cfg_r = self._cfg['rasp']
+        svc = cfg_r['amr_service']
+        timeout = cfg_r['amr_service_start_timeout_sec']
+
+        # Start the service (idempotent — fine if already running)
+        rc, _, stderr = self._ssh_run(f'systemctl start {svc}')
+        if rc != 0:
+            raise MissionAbortError(
+                f"systemctl start {svc} failed (rc={rc}): {stderr}")
+        self._log.info(f"  systemctl start {svc} → OK")
+
+        # Poll until active or timeout
+        self._log.info(f"  Waiting for {svc} to become active (up to {timeout}s) …")
+        deadline = time.monotonic() + timeout
+        while True:
+            _, state, _ = self._ssh_run(f'systemctl is-active {svc}')
+            if state == 'active':
+                break
+            if time.monotonic() > deadline:
+                # Grab journal tail for diagnostics
+                _, journal, _ = self._ssh_run(
+                    f'journalctl -u {svc} -n 20 --no-pager')
+                raise MissionAbortError(
+                    f"{svc} did not become active within {timeout}s "
+                    f"(state={state!r}).\nJournal tail:\n{journal}")
+            time.sleep(1.0)
+
+        self._log.info(f"╚══ Stage 06.c OK: {svc} is active")
+
+    def _stage_06d_wait_imu_ready(self) -> None:
+        n = self._cfg['imu']['message_count']
+        timeout = self._cfg['imu']['timeout_sec']
+        self._log.info(f"╔══ Stage 06.d: Waiting for {n} messages on {self._cfg['imu']['topic']}")
+        if not self._imu_ready_event.wait(timeout=timeout):
+            raise MissionAbortError(
+                f"IMU did not publish {n} messages within {timeout}s "
+                f"(received {self._imu_msg_count})")
+        self._log.info(f"╚══ Stage 06.d OK: IMU ready ({self._imu_msg_count} messages received)")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 07 — Emergency stop bringup
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_07a_emergency_stop(self) -> None:
+        self._log.info("╔══ Stage 07.a: Launch emergency_stop node")
+        cfg_es = self._cfg.get('emergency_stop', {})
+        topic = cfg_es.get('topic', '/amr/emergency_stop')
+        n_samples = int(cfg_es.get('check_count', 10))
+        startup_timeout = float(cfg_es.get('startup_timeout_sec', 15.0))
+
+        proc = subprocess.Popen(
+            ['ros2', 'launch', 'emergency_stop', 'emergency_stop.launch.py'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._processes['emergency_stop'] = proc
+        self._log.info(f"  emergency_stop launched (pid={proc.pid})")
+
+        # Reset collection state before we start counting messages
+        with self._estop_lock:
+            self._estop_count = 0
+            self._estop_triggered = False
+        self._estop_event.clear()
+
+        # At 10 Hz, n_samples messages arrive in n_samples/10 s; add startup margin
+        total_timeout = startup_timeout + n_samples / 10.0 + 2.0
+        self._log.info(
+            f"  Waiting for {n_samples} messages on {topic} "
+            f"(timeout={total_timeout:.0f}s) …")
+
+        if not self._estop_event.wait(timeout=total_timeout):
+            raise MissionAbortError(
+                f"emergency_stop: received only {self._estop_count}/{n_samples} "
+                f"messages on {topic} within {total_timeout:.0f}s")
+
+        if self._estop_triggered:
+            raise MissionAbortError(
+                f"emergency_stop: ACTIVE signal detected on {topic} — "
+                "check AMR safety state before proceeding")
+
+        self._log.info(
+            f"╚══ Stage 07.a OK: {n_samples} messages on {topic} all False")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 08 — Mapping bringup
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_08a_launch_oradar(self) -> None:
+        self._log.info("╔══ Stage 08.a: Launch oradar lidar")
+        proc = subprocess.Popen(
+            ['ros2', 'launch', 'oradar_lidar', 'ms200_scan.launch.py'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._processes['oradar'] = proc
+        self._log.info(f"  oradar launched (pid={proc.pid})")
+        cfg_or = self._cfg['oradar']
+        self._wait_for_publisher(
+            cfg_or['scan_topic'], cfg_or['ready_timeout_sec'], 'oradar')
+        self._log.info("╚══ Stage 08.a OK")
+
+    def _stage_08b_publish_static_tf(self) -> None:
+        self._log.info("╔══ Stage 08.b: Launch alignment_node (world->odom tf)")
+        proc = subprocess.Popen(
+            ['ros2', 'run', 'amr_drone_nav', 'alignment_node'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._processes['world_odom_tf'] = proc
+        self._log.info(f"╚══ Stage 08.b OK: alignment_node launched (pid={proc.pid})")
+
+    def _stage_08c_amr_mapper(self) -> None:
+        self._log.info("╔══ Stage 08.c: Launch odom-based mapper (no SLAM)")
+        proc = subprocess.Popen(
+            ['ros2', 'launch', 'world_mapper', 'mapper.launch.py'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._processes['amr_mapper'] = proc
+        self._log.info(f"╚══ Stage 08.c OK: amr_mapper launched (pid={proc.pid})")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 09 — Trajectory planner bringup
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_09_trajectory_planner(self) -> None:
+        self._log.info("╔══ Stage 09: Launch trajectory_planner")
+        proc = subprocess.Popen(
+            ['ros2', 'launch', 'trajectory_planner', 'planner_launch.py'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._processes['trajectory_planner'] = proc
+        self._log.info(f"  trajectory_planner launched (pid={proc.pid})")
+        cfg_tp = self._cfg['trajectory_planner']
+        self._wait_for_publisher(
+            cfg_tp['ready_topic'], cfg_tp['ready_timeout_sec'], 'trajectory_planner')
+        self._log.info("╚══ Stage 09 OK")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 10 — Observer
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_10_observer(self) -> None:
+        self._log.info("╔══ Stage 10: Enter observer mode")
+        self._start_observer()
+        self._log.info("╚══ Stage 10 OK: observing")
+
+    # ── Observer implementation ──────────────────────────────────────────────
 
     def _start_observer(self) -> None:
         cfg_obs = self._cfg.get('observer', {})
@@ -1278,53 +1395,72 @@ class MissionOrchestratorNode(Node):
         self._log.info("━━━━━━━━━━━━━━━━  MISSION START  ━━━━━━━━━━━━━━━━")
         self._start_rosbag()
         try:
-            self._stage_01_check_optitrack()
-            self._stage_01b_connect_tello_wifi()
-            self._stage_02_launch_tello_driver()
-            self._stage_03_drone_preflight()
-            self._stage_04_launch_tello_map()
-            if self._online_enabled:
-                # Online: bring the map-builder up in online mode BEFORE the
-                # flight and start live stitching, so the heavy stitch runs
-                # during the trajectory instead of after landing.
-                self._stage_18_launch_map_builder()
-                self._stage_online_start()
-            self._stage_05_observe_drone_states()
-            if self._online_enabled:
-                # Drone has landed → it has stopped streaming frames; finalize
-                # the live stitch so the action can run the offline stages on it.
-                self._stage_online_stop()
-            self._stage_06_wait_video_files()
-            self._stage_07_ping()
-            self._stage_08_ssh_connect()
-            self._stage_09_launch_amr()
-            self._stage_10_wait_imu_ready()
-            self._stage_11_verify_video_integrity()
-            self._stage_12_launch_trajectory_planner()
-            self._stage_13_launch_map_fusion()
-            self._stage_14_launch_oradar()
-            self._stage_14b_launch_emergency_stop()
-            self._stage_15_launch_marker_localizer()
-            markers = self._stage_16_call_localize_markers()
-            # The aruco poses take their POSITION from the map-builder result and
-            # their ORIENTATION from the localizer markers above, so the builder
-            # must run and return successfully BEFORE we publish them.
-            if not self._online_enabled:
-                # Offline: launch the server now and stitch from the saved video.
-                # (Online mode already launched it before the flight.)
-                self._stage_18_launch_map_builder()
-            map_result = self._stage_19_call_map_builder()
-            self._stage_17_publish_aruco_poses(markers, map_result)
-            self._stage_17b_publish_static_tf()
-            self._stage_17c_amr_mapper()
-            self._stage_20_publish_drone_map(map_result.map)
+            # ── 01 Optitrack bringup ──
+            self._log.info("━━━━━━  Stage 01: Optitrack bringup  ━━━━━━")
+            self._stage_01a_check_optitrack()
+            self._stage_01b_optitrack_sanity()
 
+            # ── 02 Arena map builder bringup ──
+            self._log.info("━━━━━━  Stage 02: Arena map builder bringup  ━━━━━━")
+            self._stage_02a_configure_background()
+            self._stage_02b_configure_mode()
+
+            # ── 03 Drone routine ──
+            self._log.info("━━━━━━  Stage 03: Drone routine  ━━━━━━")
+            self._stage_03a_connect_tello_wifi()
+            self._stage_03b_launch_tello_driver()
+            self._stage_03c_drone_preflight()
+            self._stage_03d_launch_tello_map()
+            if self._online_enabled:
+                self._stage_03e_online_start()
+            self._stage_03f_observe_drone_states()
+            self._stage_03g_wait_video_files()
+            self._stage_03h_verify_video_integrity()
+
+            # Drone has landed → finalize the live stitch (online) and kick off
+            # the BuildArenaMap goal in the background. Joined at 04.b.
+            self._send_map_goal_async()
+
+            # ── 04 Aruco localizer (runs concurrently with the map build) ──
+            self._log.info("━━━━━━  Stage 04: Aruco localizer  ━━━━━━")
+            self._stage_04_launch_marker_localizer()
+            markers = self._stage_04a_call_localize_markers()
+            self._stage_04b_publish_aruco_poses(markers)
+
+            # ── 05 Isaac ROS Visual SLAM bringup ──
+            self._log.info("━━━━━━  Stage 05: Isaac ROS Visual SLAM bringup  ━━━━━━")
+            self._stage_05a_verify_realsense()
+            self._stage_05b_start_vslam()
+            self._stage_05c_check_vslam_odometry()
+
+            # ── 06 Rasp bringup ──
+            self._log.info("━━━━━━  Stage 06: Rasp bringup  ━━━━━━")
+            self._stage_06a_ping()
+            self._stage_06b_ssh_connect()
+            self._stage_06c_launch_amr()
+            self._stage_06d_wait_imu_ready()
+
+            # ── 07 Emergency stop bringup ──
+            self._log.info("━━━━━━  Stage 07: Emergency stop bringup  ━━━━━━")
+            self._stage_07a_emergency_stop()
+
+            # ── 08 Mapping bringup ──
+            self._log.info("━━━━━━  Stage 08: Mapping bringup  ━━━━━━")
+            self._stage_08a_launch_oradar()
+            self._stage_08b_publish_static_tf()
+            self._stage_08c_amr_mapper()
+
+            # ── 09 Trajectory planner bringup ──
+            self._log.info("━━━━━━  Stage 09: Trajectory planner bringup  ━━━━━━")
+            self._stage_09_trajectory_planner()
+
+            # ── 10 Observer ──
             self._mission_complete = True
             self._log.info(
                 "━━━━━━  MISSION ORCHESTRATION COMPLETE  ━━━━━━\n"
-                "map_fusion and trajectory_planner are now operating autonomously.\n"
+                "mapper and trajectory_planner are now operating autonomously.\n"
                 "Press Ctrl+C to exit.")
-            self._start_observer()
+            self._stage_10_observer()
 
         except MissionAbortError as exc:
             self._log.error(f"MISSION ABORTED: {exc}")

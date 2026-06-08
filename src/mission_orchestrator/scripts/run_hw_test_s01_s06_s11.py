@@ -1,29 +1,20 @@
 #!/usr/bin/env python3
 """
-Hardware smoke-test: drone-only pipeline (stages 01-06 + 11).
+Hardware smoke-test: drone-only pipeline — stages 01 (OptiTrack) + 03 (Drone).
 
-Skips stages 07-10 (RPi ping, SSH, AMR bringup, IMU) — the AMR does not need
-to be running.  The following stages run for real:
+Runs OFFLINE (no map builder): brings up OptiTrack and the full drone routine
+(WiFi → driver → preflight → tello_map → state machine → video files → ffmpeg),
+then stops. Everything else — map builder (02), aruco localizer (04), VSLAM
+(05), Rasp/AMR (06), e-stop (07), mapping (08), planner (09) — is a no-op.
 
-  01   Check OptiTrack (rigid-body pose topic)
-  01b  Connect Tello WiFi
-  02   Launch tello_driver
-  03   Drone preflight (camera + battery)
-  04   Launch tello_map
-  05   Observe drone state machine (1 → 2 → 3 → 4)
-  06   Wait for video/telemetry file-path topics
-  11   Verify video integrity with ffmpeg
-
-Stages 07-10 (RPi/AMR/IMU) and 12-20 are no-ops.  On success the script
-stays alive as a ROS 2 observer, leaving tello_driver and tello_map running.
-
-Press Ctrl+C to abort the drone (land + kill processes) and exit.
+On success the script stays alive as a ROS 2 observer, leaving tello_driver
+and tello_map running. Press Ctrl+C to abort the drone (land + kill) and exit.
 
 Usage (from workspace root, after sourcing install/setup.bash):
-    python3 src/mission_orchestrator/scripts/run_hw_test_s01_s06_s11.py
+    python3 src/mission_orchestrator/scripts/run_hw_test_s01_s03.py
 
 With a custom config:
-    python3 src/mission_orchestrator/scripts/run_hw_test_s01_s06_s11.py \\
+    python3 src/mission_orchestrator/scripts/run_hw_test_s01_s03.py \\
         --config /abs/path/to/orchestrator_params.yaml
 """
 
@@ -52,61 +43,41 @@ _DEFAULT_CONFIG = os.path.normpath(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Restricted orchestrator: stages 07-10 no-ops; 01-06+11 real; 12-20 no-ops
+# Restricted orchestrator: only stages 01 (optitrack) + 03 (drone) run
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _HwTestOrchestrator(MissionOrchestratorNode):
-    """Stages 07-10 (RPi/AMR/IMU) and 12-20 are no-ops; drone stages 01-06 and 11 run normally."""
+    """Optitrack (01) + drone routine (03) run; everything else is a no-op."""
 
-    # ── No-op: RPi / AMR pipeline (now stages 07-10) ───────────────────────────
+    # ── No-op: map builder (02) — offline drone-only test, no map ────────────
+    def _stage_02a_configure_background(self) -> None: pass
+    def _stage_02b_configure_mode(self) -> None: pass
+    def _send_map_goal_async(self) -> None: pass
 
-    def _stage_07_ping(self) -> None:
-        pass
-
-    def _stage_08_ssh_connect(self) -> None:
-        pass
-
-    def _stage_09_launch_amr(self) -> None:
-        pass
-
-    def _stage_10_wait_imu_ready(self) -> None:
-        pass
-
-    # ── No-op: post-scan pipeline ─────────────────────────────────────────────
-
-    def _stage_12_launch_trajectory_planner(self) -> None:
+    # ── No-op: aruco localizer (04) ──────────────────────────────────────────
+    def _stage_04_launch_marker_localizer(self) -> None: pass
+    def _stage_04a_call_localize_markers(self):
+        return []
+    def _stage_04b_publish_aruco_poses(self, markers) -> None:
         self._log.info("══════════════════════════════════════════════════")
-        self._log.info("  Drone stages 01-06 + 11 PASSED")
+        self._log.info("  Drone stages 01 + 03 PASSED")
         self._log.info("  tello_driver and tello_map are still running.")
         self._log.info("  Press Ctrl+C to abort the drone and exit.")
         self._log.info("══════════════════════════════════════════════════")
 
-    def _stage_13_launch_map_fusion(self) -> None:
-        pass
-
-    def _stage_14_launch_oradar(self) -> None:
-        pass
-
-    def _stage_14b_launch_emergency_stop(self) -> None:
-        pass
-
-    def _stage_15_launch_marker_localizer(self) -> None:
-        pass
-
-    def _stage_16_call_localize_markers(self):
-        return []
-
-    def _stage_17_publish_aruco_poses(self, markers) -> None:
-        pass
-
-    def _stage_18_launch_map_builder(self) -> None:
-        pass
-
-    def _stage_19_call_map_builder(self):
-        return None
-
-    def _stage_20_publish_drone_map(self, grid) -> None:
-        pass
+    # ── No-op: VSLAM (05), Rasp (06), e-stop (07), mapping (08), planner (09) ─
+    def _stage_05a_verify_realsense(self) -> None: pass
+    def _stage_05b_start_vslam(self) -> None: pass
+    def _stage_05c_check_vslam_odometry(self) -> None: pass
+    def _stage_06a_ping(self) -> None: pass
+    def _stage_06b_ssh_connect(self) -> None: pass
+    def _stage_06c_launch_amr(self) -> None: pass
+    def _stage_06d_wait_imu_ready(self) -> None: pass
+    def _stage_07a_emergency_stop(self) -> None: pass
+    def _stage_08a_launch_oradar(self) -> None: pass
+    def _stage_08b_publish_static_tf(self) -> None: pass
+    def _stage_08c_amr_mapper(self) -> None: pass
+    def _stage_09_trajectory_planner(self) -> None: pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,7 +86,7 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Hardware smoke-test: drone-only pipeline (stages 01-06 + 11); skips RPi/AMR/IMU (07-10).')
+        description='Hardware smoke-test: drone-only pipeline (stages 01 + 03).')
     parser.add_argument(
         '--config', default=_DEFAULT_CONFIG,
         help='Path to orchestrator_params.yaml (default: config/ inside this package)')
@@ -127,6 +98,10 @@ def main() -> None:
     rclpy.init()
 
     node = _HwTestOrchestrator(args.config)
+    # Drone-only test: no map builder, so the online stream is irrelevant.
+    node._online_enabled = False
+    node._cfg.setdefault('map_builder', {})['online'] = False
+
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
 
@@ -135,7 +110,7 @@ def main() -> None:
 
     try:
         node.run()
-        # Stages 05-11 done; stay alive so tello processes keep running
+        # Drone stages done; stay alive so tello processes keep running
         while rclpy.ok():
             time.sleep(1.0)
     except KeyboardInterrupt:
@@ -143,7 +118,6 @@ def main() -> None:
     finally:
         if not node._mission_complete:
             node._abort()
-        # _teardown_ssh is a no-op here (SSH was never opened)
         node._teardown_ssh()
         executor.shutdown(timeout_sec=5.0)
         node.destroy_node()
