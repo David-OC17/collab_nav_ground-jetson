@@ -1845,6 +1845,16 @@ class ReconstructConfig:
     without keeping frames in RAM (preserves the streaming memory profile, and
     works for live feeds where re-streaming the source isn't possible)."""
 
+    diagnostics_path: Optional[str] = None
+    """If set, finalize() writes a JSON file to this path containing the
+    stitcher-side diagnostic feature values (Groups 1 + 6 from map_diagnostics).
+    sweep.py reads this file after the ROS action completes to populate
+    metrics.yaml without needing to re-run any pipeline stage.
+
+    Set via the sweep parameter  stitch.reconstruct.diagnostics_path.
+    Example value: /path/to/run_A01/stitcher_diagnostics.json
+    """
+
 
 class MapReconstructor:
     """
@@ -1983,6 +1993,7 @@ class MapReconstructor:
         self._cache_dir: Optional[str] = None
         self._finalized = False
         self._last_finalize_report: Optional[dict] = None  # set by finalize()
+        self._diagnostics: Optional[dict] = None           # set by finalize()
 
         # Opaque marker overlay (marker_color_map). Each placed frame's detected
         # marker quads are projected into canvas coords and queued here, then
@@ -2153,6 +2164,18 @@ class MapReconstructor:
             "grid_refined":   self._n_grid_refined,
             "grid_skipped":   self._n_grid_skipped,
         }
+
+    @property
+    def diagnostics(self) -> Optional[dict]:
+        """Stitcher-side diagnostic feature values (Groups 1 + 6).
+
+        Populated by finalize() after the global pose-graph solve.  Returns
+        None before finalize() has run or when map_diagnostics is not
+        importable.  The dict has the same flat key schema as
+        MapDiagnostics.to_feature_vector() so it can be merged directly into
+        metrics.yaml or passed to the XGBoost model.
+        """
+        return self._diagnostics
 
     # ── private helpers ──────────────────────────────────────────────────────
 
@@ -2543,6 +2566,37 @@ class MapReconstructor:
             print(f"  [finalize] re-rendered {n} frames | "
                   f"residual {report['rms_before']:.2f} -> {report['rms_after']:.2f} px | "
                   f"markers={report['markers']} edges={report['edges']}")
+
+        # ── stitcher diagnostics (Groups 1 + 6) ──────────────────────────
+        # Compute while the canvas is still in memory (get_map() will clear
+        # it).  Lazy import avoids a hard dependency on map_diagnostics.
+        if self._canvas is not None:
+            try:
+                from map_diagnostics import compute_stitcher_diagnostics
+                self._diagnostics = compute_stitcher_diagnostics(
+                    stitched_map=self._canvas,
+                    stitcher_stats=self.stats,
+                    finalize_report=report,
+                )
+            except Exception as _diag_exc:
+                if verbose:
+                    print(f"  [finalize] stitcher diagnostics skipped: {_diag_exc}")
+                self._diagnostics = None
+
+        # Write JSON to disk if the caller requested it (used by sweep.py).
+        if self._diagnostics and self.cfg.diagnostics_path:
+            import json
+            try:
+                os.makedirs(
+                    os.path.dirname(os.path.abspath(self.cfg.diagnostics_path)),
+                    exist_ok=True,
+                )
+                with open(self.cfg.diagnostics_path, "w") as _f:
+                    json.dump(self._diagnostics, _f, indent=2)
+            except Exception as _io_exc:
+                if verbose:
+                    print(f"  [finalize] could not write diagnostics JSON: {_io_exc}")
+
         return report
 
     def _register(

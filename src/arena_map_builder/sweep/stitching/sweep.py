@@ -46,6 +46,20 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from run_matrix_v3 import RUNS
 
+# ── optional diagnostics integration ─────────────────────────────────────────
+# Requires transfer_obstacles.py and map_diagnostics.py to be importable.
+# If they aren't (e.g. running without the full source tree), diagnostics
+# are silently skipped and metrics.yaml only contains the action result fields.
+_DIAG_AVAILABLE = False
+try:
+    from transfer_obstacles import run_pipeline as _run_pipeline
+    from transfer_obstacles import TransferConfig as _TransferConfig
+    from map_diagnostics import compute_stitcher_diagnostics as _compute_stitcher_diag
+    _DIAG_AVAILABLE = True
+except ImportError as _diag_import_err:
+    print(f"[sweep] diagnostics unavailable ({_diag_import_err}) "
+          f"— metrics.yaml will not contain diagnostic features")
+
 from arena_map_builder_msgs.action import BuildArenaMap
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -172,6 +186,12 @@ def apply_run_params(run: dict, run_dir: Path) -> bool:
         ("transfer.background_path", BACKGROUND_PATH),
         # Keep verbose off during the sweep (server logs already go to its terminal)
         ("stitch.verbose",           "false"),
+        # Stitcher diagnostics JSON — finalize() writes Groups 1+6 features here
+        # so sweep can read them without re-running any pipeline stage.
+        # Requires the server to map stitch.reconstruct.diagnostics_path →
+        # ReconstructConfig.diagnostics_path (added to drone_map_grid_gen.py).
+        ("stitch.reconstruct.diagnostics_path",
+         str(run_dir / "stitcher_diagnostics.json")),
     ]
 
     for key, (ros_param, typ) in _PARAM_MAP.items():
@@ -327,6 +347,10 @@ def execute_run(
         score    = compute_similarity(occ_path, gt_path)
         metrics["ssim_vs_gt"] = round(score, 4) if score is not None else None
 
+    # Collect all diagnostic features and merge into metrics before the
+    # single metrics.yaml write.  Any failure inside _collect_diagnostics
+    # is caught internally and the sweep continues.
+    _collect_diagnostics(run_dir, metrics)
     _save_metrics(metrics, run_dir)
 
     status = "ok" if result["success"] else "failed"
@@ -334,6 +358,95 @@ def execute_run(
           f"consistency={metrics.get('mean_consistency', 0.0):.3f}  "
           f"runtime={elapsed:.0f}s")
     return status
+
+
+def _collect_diagnostics(run_dir: Path, metrics: dict) -> None:
+    """Compute all diagnostic feature values and merge them into `metrics`.
+
+    Called once the ROS action has completed and all outputs are on disk.
+
+    Two-stage collection
+    ────────────────────
+    Groups 1 + 6 (stitcher side):
+        Read from  run_dir/stitcher_diagnostics.json  written by the server
+        when ReconstructConfig.diagnostics_path is set.  Falls back to
+        computing Group 1 only from the stitched-map image if the JSON is
+        absent (e.g. server not yet updated to expose diagnostics_path).
+
+    Groups 2–5 (transfer side):
+        Re-run transfer_obstacles.run_pipeline() locally on the saved
+        transfer_input.png with return_diagnostics=True.  This is the same
+        computation the server already performed; re-running it locally
+        (~5–15 s) guarantees the features match what extract_features.py
+        would compute and avoids needing the server to expose more fields.
+    """
+    if not _DIAG_AVAILABLE:
+        return
+
+    import json
+
+    # ── Groups 1 + 6: stitcher diagnostics ──────────────────────────────
+    stitcher_diag_path = run_dir / "stitcher_diagnostics.json"
+    stitcher_diag: dict = {}
+
+    if stitcher_diag_path.exists():
+        try:
+            with open(stitcher_diag_path) as f:
+                stitcher_diag = json.load(f)
+            print(f"  Diagnostics: loaded {len(stitcher_diag)} stitcher features")
+        except Exception as exc:
+            print(f"  [warn] Could not read {stitcher_diag_path.name}: {exc}")
+
+    # ── find the stitched-map image ──────────────────────────────────────
+    img_path = None
+    for name in ("transfer_input.png", "stitched_map.png"):
+        p = run_dir / name
+        if p.exists():
+            img_path = p
+            break
+
+    if img_path is None:
+        print(f"  [warn] No stitched-map image in {run_dir.name} "
+              f"— diagnostics skipped")
+        return
+
+    # ── fallback: compute Group 1 locally if JSON not present ────────────
+    if not stitcher_diag:
+        try:
+            img = cv2.imread(str(img_path))
+            if img is not None:
+                stitcher_diag = _compute_stitcher_diag(
+                    stitched_map=img,
+                    stitcher_stats=None,     # not available without JSON
+                    finalize_report=None,    # Group 6 will be all -1.0
+                )
+                print(f"  Diagnostics: computed {len(stitcher_diag)} "
+                      f"stitcher features from image (Group 6 unavailable)")
+        except Exception as exc:
+            print(f"  [warn] Stitcher diagnostics computation failed: {exc}")
+
+    # ── Groups 2–5: re-run transfer pipeline locally ─────────────────────
+    transfer_diag: dict = {}
+    try:
+        result = _run_pipeline(
+            str(img_path), BACKGROUND_PATH,
+            cfg=_TransferConfig(),
+            verbose=False,
+            return_diagnostics=True,
+        )
+        # return_diagnostics=True → 3-tuple; else 2-tuple (graceful)
+        if len(result) == 3:
+            _, _, transfer_diag = result
+            print(f"  Diagnostics: computed {len(transfer_diag)} "
+                  f"transfer features")
+    except Exception as exc:
+        print(f"  [warn] Transfer pipeline (diagnostics) failed: {exc}")
+
+    metrics.update(stitcher_diag)
+    metrics.update(transfer_diag)
+    total = len(stitcher_diag) + len(transfer_diag)
+    if total:
+        print(f"  Diagnostics: {total} features total saved to metrics.yaml")
 
 
 def _save_config(run: dict, run_dir: Path) -> None:

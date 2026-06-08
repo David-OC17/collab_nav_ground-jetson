@@ -214,6 +214,7 @@ class BuildArenaMapServer(Node):
         self.declare_parameter("stitch.reconstruct.pg_iterations",       10)
         self.declare_parameter("stitch.reconstruct.pg_huber_delta",       4.0)
         self.declare_parameter("stitch.reconstruct.render_cache_dir",    "")
+        self.declare_parameter("stitch.reconstruct.diagnostics_path",    "")
 
         # Diagnostics / verbosity
         self.declare_parameter("stitch.verbose", False)
@@ -613,6 +614,7 @@ class BuildArenaMapServer(Node):
         _sp_path     = str(self._get("stitch.reconstruct.sp_onnx_path"))     or None
         _lg_path     = str(self._get("stitch.reconstruct.lg_onnx_path"))     or None
         _cache_dir   = str(self._get("stitch.reconstruct.render_cache_dir")) or None
+        _diag_path   = str(self._get("stitch.reconstruct.diagnostics_path")) or None
         return ReconstructConfig(
             canvas_margin             = int(self._get("stitch.reconstruct.canvas_margin")),
             min_inliers               = int(self._get("stitch.reconstruct.min_inliers")),
@@ -654,6 +656,7 @@ class BuildArenaMapServer(Node):
             pg_iterations             = int(self._get("stitch.reconstruct.pg_iterations")),
             pg_huber_delta            = float(self._get("stitch.reconstruct.pg_huber_delta")),
             render_cache_dir          = _cache_dir,
+            diagnostics_path          = _diag_path,
         )
 
     def _build_transfer_cfg(self) -> TransferConfig:

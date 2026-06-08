@@ -406,3 +406,43 @@ After correction:
   docker exec -it isaac_ros_vslam bash
   ros2 launch isaac_ros_visual_slam isaac_ros_visual_slam_realsense.launch.py
 ```
+
+
+## XGBoost data preparation
+
+```bash
+
+# ── 0. Source ROS in every terminal you open ──────────────────────────────
+source /home/jetson/collab_nav_ground-jetson/install/setup.bash
+cd /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/sweep
+
+
+# ── 1. Run the sweep (overnight) ─────────────────────────────────────────
+python sweep.py # with scan 18
+python sweep.py # with scan 21
+# Results land in ./results/  (one run_<id>/ directory per run)
+# Safe to Ctrl-C and resume — progress is saved after every run.
+# Re-run failed runs afterward with:
+#   python3 sweep.py --retry-failed
+
+
+# ── 2. Manual pass/fail/unsure labeling ───────────────────────────────────
+python3 label.py \
+    --results-dirs results \
+    --labels-file  labels.yaml
+# Controls:  p=PASS   f=FAIL   s=UNSURE   u=UNDO   q=QUIT
+# Safe to quit and resume — labels are saved after every keypress.
+# If you run more sweeps later, add their results dirs:
+#   python3 label.py --results-dirs results results2 --labels-file labels.yaml
+
+
+# ── 3. Extract features → CSV ─────────────────────────────────────────────
+python3 extract_features.py \
+    --results-dirs results \
+    --background   /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/config/background.png \
+    --labels-file  labels.yaml \
+    --output       features.csv
+# Because sweep.py now writes all 46 diagnostics into each metrics.yaml,
+# this step reads them directly (no pipeline re-run) and finishes in seconds.
+# Output: features.csv  — one row per run, ~57 columns ready for XGBoost.
+```

@@ -983,9 +983,16 @@ def run_pipeline(
     cfg: Optional[TransferConfig] = None,
     debug_dir: Optional[str] = None,
     verbose: bool = True,
-) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    return_diagnostics: bool = False,
+) -> tuple:
     """
-    Full pipeline. Returns (final_image_bgr, stages_dict).
+    Full pipeline. Returns (final_image_bgr, stages_dict) by default.
+
+    When return_diagnostics=True returns a third value: a flat Dict[str, float]
+    containing Groups 2-5 diagnostic features (dewarp, green border, blobs,
+    markers) computed from the stages without any extra pipeline work.
+    Backwards-compatible: existing callers that don't pass return_diagnostics
+    continue to receive the same 2-tuple.
 
     stages_dict keys:
       "input", "dewarped", "cropped", "wall_masked",
@@ -1055,7 +1062,19 @@ def run_pipeline(
     _save_debug(None, "07_final", final, debug_dir, verbose)
 
     _log(sep, verbose)
-    return final, stages
+    if not return_diagnostics:
+        return final, stages
+
+    # ── transfer diagnostics (Groups 2-5) ────────────────────────────────
+    # Lazy import avoids a circular dependency (map_diagnostics already
+    # imports TransferConfig from this module at the top level).
+    transfer_diag: dict = {}
+    try:
+        from map_diagnostics import compute_transfer_diagnostics
+        transfer_diag = compute_transfer_diagnostics(stages, cfg)
+    except Exception as _diag_exc:
+        _log(f"  [warn] transfer diagnostics skipped: {_diag_exc}", verbose)
+    return final, stages, transfer_diag
 
 
 # ===============================================================================
