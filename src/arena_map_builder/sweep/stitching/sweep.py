@@ -42,8 +42,11 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from action_msgs.msg import GoalStatus
 
-_HERE = Path(__file__).resolve().parent
+_HERE     = Path(__file__).resolve().parent
+_PKG_ROOT = _HERE.parents[1]          # …/arena_map_builder
 sys.path.insert(0, str(_HERE))
+sys.path.insert(0, str(_PKG_ROOT / "arena_map_builder"))
+sys.path.insert(0, str(_PKG_ROOT / "arena_map_builder" / "processing"))
 from run_matrix_v3 import RUNS
 
 # ── optional diagnostics integration ─────────────────────────────────────────
@@ -66,8 +69,8 @@ from arena_map_builder_msgs.action import BuildArenaMap
 # Fixed inputs and server name
 # ══════════════════════════════════════════════════════════════════════════════
 
-VIDEO_PATH      = "/home/jetson/collab_nav_ground-jetson/src/arena_map_builder/data/drone_scans/scan18/scan.mp4"
-BACKGROUND_PATH = "/home/jetson/collab_nav_ground-jetson/src/arena_map_builder/config/background.png"
+_DEFAULT_VIDEO      = str(_PKG_ROOT / "data" / "drone_scans" / "scan18" / "scan.mp4")
+_DEFAULT_BACKGROUND = str(_PKG_ROOT / "config" / "background.png")
 SERVER_NODE     = "/build_arena_map_server"
 PROGRESS_FILE   = "progress.yaml"
 
@@ -177,13 +180,22 @@ def _fmt(value, typ: str) -> str:
     return str(value)
 
 
-def apply_run_params(run: dict, run_dir: Path) -> bool:
+def apply_run_params(run: dict, run_dir: Path, background_path: str,
+                     goal_marker_id: int = 0, amr_marker_id: int = 5) -> bool:
     """Push all params for this run to the server. Returns True on success."""
+    # marker_color_map must contain both IDs or the server aborts the goal.
+    # goal → red (0,0,255 BGR), AMR → cyan (255,255,0 BGR).
+    _cmap = (f"['{goal_marker_id}:0,0,255', '{amr_marker_id}:255,255,0']")
+
     params = [
         # Per-run output directory → all debug images land here automatically
         ("debug_dir",               str(run_dir)),
         # Fixed inputs
-        ("transfer.background_path", BACKGROUND_PATH),
+        ("transfer.background_path", background_path),
+        # Marker IDs and their recolouring (must stay in sync)
+        ("marker.goal_id",                            str(goal_marker_id)),
+        ("marker.amr_id",                             str(amr_marker_id)),
+        ("stitch.reconstruct.marker_color_map",       _cmap),
         # Keep verbose off during the sweep (server logs already go to its terminal)
         ("stitch.verbose",           "false"),
         # Stitcher diagnostics JSON — finalize() writes Groups 1+6 features here
@@ -279,10 +291,11 @@ class SweepClient(Node):
 
 def start_server(log_path: Optional[Path] = None) -> subprocess.Popen:
     log_path = log_path or Path("/tmp/build_arena_map_server.log")
+    server_script = _PKG_ROOT / "scripts" / "build_arena_map_server"
     print(f"  Starting build_arena_map_server… (log: {log_path})")
     log_file = open(log_path, "w", buffering=1)
     return subprocess.Popen(
-        ["ros2", "run", "arena_map_builder", "build_arena_map_server"],
+        [sys.executable, str(server_script)],
         stdout=log_file,
         stderr=log_file,
     )
@@ -297,11 +310,15 @@ def server_alive(proc: Optional[subprocess.Popen]) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def execute_run(
-    run:        dict,
-    client:     SweepClient,
-    output_dir: Path,
-    timeout_s:  float,
-    gt_path:    Optional[str],
+    run:             dict,
+    client:          SweepClient,
+    output_dir:      Path,
+    timeout_s:       float,
+    gt_path:         Optional[str],
+    video_path:      str = _DEFAULT_VIDEO,
+    background_path: str = _DEFAULT_BACKGROUND,
+    goal_marker_id:  int = 0,
+    amr_marker_id:   int = 5,
 ) -> str:
     """
     Execute one run. Returns "ok", "failed", or "timeout".
@@ -319,14 +336,14 @@ def execute_run(
 
     # Set all server params for this run
     print(f"  Setting params ({len(_PARAM_MAP) + 3} params)…")
-    if not apply_run_params(run, run_dir):
+    if not apply_run_params(run, run_dir, background_path, goal_marker_id, amr_marker_id):
         _save_metrics({"status": "param_set_failed", "runtime_s": 0.0}, run_dir)
         return "failed"
 
     # Send goal and wait
     print(f"  Sending goal (timeout={timeout_s:.0f}s)…")
     t0      = time.monotonic()
-    result  = client.run_action(VIDEO_PATH, timeout_s=timeout_s)
+    result  = client.run_action(video_path, timeout_s=timeout_s)
     elapsed = time.monotonic() - t0
 
     metrics: dict = {"runtime_s": round(elapsed, 1)}
@@ -350,7 +367,7 @@ def execute_run(
     # Collect all diagnostic features and merge into metrics before the
     # single metrics.yaml write.  Any failure inside _collect_diagnostics
     # is caught internally and the sweep continues.
-    _collect_diagnostics(run_dir, metrics)
+    _collect_diagnostics(run_dir, metrics, background_path)
     _save_metrics(metrics, run_dir)
 
     status = "ok" if result["success"] else "failed"
@@ -360,7 +377,8 @@ def execute_run(
     return status
 
 
-def _collect_diagnostics(run_dir: Path, metrics: dict) -> None:
+def _collect_diagnostics(run_dir: Path, metrics: dict,
+                         background_path: str = _DEFAULT_BACKGROUND) -> None:
     """Compute all diagnostic feature values and merge them into `metrics`.
 
     Called once the ROS action has completed and all outputs are on disk.
@@ -429,7 +447,7 @@ def _collect_diagnostics(run_dir: Path, metrics: dict) -> None:
     transfer_diag: dict = {}
     try:
         result = _run_pipeline(
-            str(img_path), BACKGROUND_PATH,
+            str(img_path), background_path,
             cfg=_TransferConfig(),
             verbose=False,
             return_diagnostics=True,
@@ -472,6 +490,14 @@ def main() -> None:
     )
     parser.add_argument("--output-dir", default=str(_HERE / "results"),
                         help="Results directory (default: sweep/results/)")
+    parser.add_argument("--video", default=_DEFAULT_VIDEO,
+                        help="Path to input video (default: data/drone_scans/scan18/scan.mp4)")
+    parser.add_argument("--background", default=_DEFAULT_BACKGROUND,
+                        help="Path to background image (default: config/background.png)")
+    parser.add_argument("--goal-marker-id", type=int, default=0,
+                        help="ArUco ID of the goal marker (default: 0)")
+    parser.add_argument("--amr-marker-id", type=int, default=5,
+                        help="ArUco ID of the AMR marker (default: 5)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the run plan and exit — no execution")
     parser.add_argument("--no-server", action="store_true",
@@ -556,11 +582,15 @@ def main() -> None:
                 break
 
         status = execute_run(
-            run        = run,
-            client     = client,
-            output_dir = output_dir,
-            timeout_s  = args.timeout,
-            gt_path    = args.similarity,
+            run             = run,
+            client          = client,
+            output_dir      = output_dir,
+            timeout_s       = args.timeout,
+            gt_path         = args.similarity,
+            video_path      = args.video,
+            background_path = args.background,
+            goal_marker_id  = args.goal_marker_id,
+            amr_marker_id   = args.amr_marker_id,
         )
 
         # Persist progress immediately after each run

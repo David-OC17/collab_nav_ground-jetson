@@ -1,0 +1,40 @@
+{
+  "model_type": "Random Forest",
+  "version": 1,
+  "threshold": 0.07109419315165648,
+  "precision_at_threshold": 0.9067796610169492,
+  "recall_at_threshold": 1.0,
+  "rf_average_precision": 0.9934671958953629,
+  "xgb_average_precision": 0.9822880999518148,
+  "chosen_model_ap": 0.9934671958953629,
+  "rf_cv_mean": 0.9937963426252219,
+  "rf_cv_std": 0.00895875917477345,
+  "xgb_cv_mean": 0.9838183586565039,
+  "xgb_cv_std": 0.01960283180144239,
+  "n_train": 536,
+  "n_test": 134,
+  "n_pass_train": 428,
+  "n_fail_train": 108,
+  "feature_count": 45,
+  "target_precision": 0.9,
+  "trained_on": [
+    "18-21/features.csv"
+  ],
+  "trained_date": "2026-06-09",
+  "rf_best_params": {
+    "n_estimators": 300,
+    "min_samples_split": 2,
+    "min_samples_leaf": 2,
+    "max_features": "sqrt",
+    "max_depth": null
+  },
+  "xgb_best_params": {
+    "subsample": 1.0,
+    "n_estimators": 200,
+    "min_child_weight": 3,
+    "max_depth": 2,
+    "learning_rate": 0.05,
+    "gamma": 0.5,
+    "colsample_bytree": 1.0
+  }
+}

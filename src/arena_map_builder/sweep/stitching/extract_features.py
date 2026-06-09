@@ -65,6 +65,7 @@ if _pdir_flag in sys.argv:
     _pdir = sys.argv[_idx + 1] if _idx + 1 < len(sys.argv) else None
     if _pdir:
         sys.path.insert(0, _pdir)
+        sys.path.insert(0, str(Path(_pdir) / "processing"))
 
 try:
     from transfer_obstacles import TransferConfig, run_pipeline
