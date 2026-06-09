@@ -103,7 +103,13 @@ class ExplorerController(Node):
         self.robot_y: float = 0.0
         self.pose_received  = False
 
-        self._last_forwarded_goal = None 
+        self._last_forwarded_goal = None
+
+        # Progress watchdog — re-send goal if robot hasn't moved in N seconds
+        self._last_progress_pos:  tuple | None = None
+        self._last_progress_time: float        = 0.0
+        self._progress_timeout_sec: float      = 4.0   # re-send if stuck this long
+        self._progress_min_dist:    float      = 0.05  # m — min movement to count
 
         # ------------------------------------------------------------------
         # QoS
@@ -119,13 +125,19 @@ class ExplorerController(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
+        volatile_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,   # ← never replays to late joiners
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
 
         # ------------------------------------------------------------------
         # Subscribers
         # ------------------------------------------------------------------
         self.start_sub = self.create_subscription(
             Bool, '/mission/start',
-            self._start_callback, reliable_qos)
+            self._start_callback, volatile_qos)
 
         self.frontier_sub = self.create_subscription(
             PoseWithCovarianceStamped, '/frontier/goal',
@@ -195,19 +207,14 @@ class ExplorerController(Node):
                 self._transition_to(State.IDLE)
 
     def _frontier_goal_callback(self, msg: PoseWithCovarianceStamped):
-        self.frontier_goal = msg
-        self._frontier_goal_dirty = True 
+        self.frontier_goal        = msg
+        self._frontier_goal_dirty = True
+        self._last_progress_pos   = None   # reset watchdog for new goal
 
     def _aruco_detection_callback(self, msg: PoseWithCovarianceStamped):
-        # Filter by marker ID encoded in header.frame_id
-        try:
-            detected_id = int(msg.header.frame_id)
-        except ValueError:
-            self.get_logger().warn(
-                f'ArUco detection has non-integer frame_id '
-                f'"{msg.header.frame_id}" — ignoring.',
-                throttle_duration_sec=5.0)
-            return
+        # Marker ID is stored as float in covariance[0] by aruco_goal_detector.
+        # The pose is already in world_frame — ready to forward to A*.
+        detected_id = int(round(msg.pose.covariance[0]))
 
         if detected_id != self.target_marker_id:
             self.get_logger().debug(
@@ -220,7 +227,9 @@ class ExplorerController(Node):
 
         if self.state == State.EXPLORING:
             self.get_logger().info(
-                f'Target marker {self.target_marker_id} detected → HOMING')
+                f'Target marker {self.target_marker_id} detected at '
+                f'({msg.pose.pose.position.x:.2f}, {msg.pose.pose.position.y:.2f}) '
+                f'in world frame → HOMING')
             self._transition_to(State.HOMING)
 
     def _pose_callback(self, msg: PoseWithCovarianceStamped):
@@ -258,16 +267,41 @@ class ExplorerController(Node):
                 'EXPLORING — waiting for first frontier goal…',
                 throttle_duration_sec=5.0)
             return
-        
-        if not getattr(self, '_frontier_goal_dirty', True):
-            return   # same goal already forwarded, don't hammer astar_planner2
 
+        now = self.get_clock().now().nanoseconds * 1e-9
+
+        # ── Progress watchdog ────────────────────────────────────────────
+        # If the robot hasn't moved _progress_min_dist in _progress_timeout_sec,
+        # re-send the goal — A* may have missed it or the spline stalled.
+        if self.pose_received:
+            pos = (self.robot_x, self.robot_y)
+            if self._last_progress_pos is None:
+                self._last_progress_pos  = pos
+                self._last_progress_time = now
+            else:
+                moved = math.hypot(
+                    pos[0] - self._last_progress_pos[0],
+                    pos[1] - self._last_progress_pos[1])
+                if moved >= self._progress_min_dist:
+                    self._last_progress_pos  = pos
+                    self._last_progress_time = now
+                elif now - self._last_progress_time > self._progress_timeout_sec:
+                    self.get_logger().warn(
+                        f'No progress for {self._progress_timeout_sec}s — '
+                        f're-sending goal to A*')
+                    self._frontier_goal_dirty = True
+                    self._last_progress_time  = now   # reset to avoid spam
+
+        # ── Forward goal to A* (only when dirty) ────────────────────────
+        if not getattr(self, '_frontier_goal_dirty', True):
+            return
+
+        self._frontier_goal_dirty = False
         self.goal_pub.publish(self.frontier_goal)
-        self.get_logger().debug(
+        self.get_logger().info(
             f'EXPLORING — forwarding frontier goal '
             f'({self.frontier_goal.pose.pose.position.x:.2f}, '
-            f'{self.frontier_goal.pose.pose.position.y:.2f})',
-            throttle_duration_sec=2.0)
+            f'{self.frontier_goal.pose.pose.position.y:.2f})')
 
     def _tick_homing(self):
         # Detection lost → resume exploring immediately

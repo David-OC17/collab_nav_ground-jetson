@@ -36,6 +36,7 @@ setup(
             'explorer_controller = frontier_explorer.explorer_controller:main',
             'aruco_goal_detector = frontier_explorer.aruco_goal_detector:main',
             # Simulation helpers — now in simulation_helpers subpackage
+            'fake_aruco_detector = frontier_explorer.simulation_helpers.fake_aruco_detector:main',
             'fake_map_publisher  = frontier_explorer.simulation_helpers.fake_map_publisher:main',
             'fake_pose_publisher = frontier_explorer.simulation_helpers.fake_pose_publisher:main',
             'odom_to_pose        = frontier_explorer.simulation_helpers.odom_to_pose:main',

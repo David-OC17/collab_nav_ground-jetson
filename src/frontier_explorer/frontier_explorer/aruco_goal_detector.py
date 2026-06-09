@@ -1,76 +1,63 @@
 #!/usr/bin/env python3
 """
-ArUco Detector Node for ROS 2 Humble — Intel RealSense D435i + Isaac ROS VSLAM
-================================================================================
-Detects ArUco markers in the RGB stream, back-projects the marker centre using
-the aligned depth frame to get a 3D point in camera coordinates, then transforms
-it to the world frame using TF (published by Isaac ROS Visual SLAM).
+ArUco Detector Node — ROS 2 Humble
+=====================================
+Detects ArUco markers from an RGB camera stream and publishes each
+detected marker's ID and pose relative to the camera frame.
 
-The goal pose is published as a fixed offset IN FRONT of the marker so the
-robot stands facing it rather than standing on top of it.
+For each detected marker, publishes:
+  - Marker ID encoded in header.frame_id
+  - Pose: translation + rotation of the marker relative to camera_color_optical_frame
+
+If the same marker ID appears multiple times in one frame (e.g. two faces
+of a cube both visible), the poses are averaged before publishing.
 
 Subscribes:
-  - /camera/color/image_raw                    (sensor_msgs/Image)      — RGB frame
-  - /camera/aligned_depth_to_color/image_raw   (sensor_msgs/Image)      — aligned depth
-  - /camera/color/camera_info                  (sensor_msgs/CameraInfo) — intrinsics
+  - /camera/color/image_raw   (sensor_msgs/Image)      — RGB image
+  - /camera/color/camera_info (sensor_msgs/CameraInfo) — intrinsics for solvePnP
 
 Publishes:
-  - /aruco/detection  (geometry_msgs/PoseWithCovarianceStamped)
-      Detected marker pose in world frame.
-      header.frame_id carries the marker ID as a string (e.g. '7') so
-      MissionController can filter by target_marker_id.
-
-  - /aruco/markers    (visualization_msgs/MarkerArray)
-      RViz visualisation: sphere at marker position + text label.
-
-TF used:
-  - camera_color_optical_frame → map   (provided by Isaac ROS VSLAM)
+  - /aruco/detections  (geometry_msgs/PoseArray)              — all markers this frame
+  - /aruco/markers     (visualization_msgs/MarkerArray)       — RViz cubes
+  - /aruco/{id}/pose   (geometry_msgs/PoseWithCovarianceStamped) — per-ID topic
 
 Parameters:
-  rgb_topic          '/camera/color/image_raw'
-  depth_topic        '/camera/aligned_depth_to_color/image_raw'
-  camera_info_topic  '/camera/color/camera_info'
-  world_frame        'map'
-  camera_frame       'camera_color_optical_frame'
-  aruco_dict         'DICT_4X4_50'      — OpenCV ArUco dictionary name
-  marker_size_m      0.10               — physical marker side length in metres
-  standoff_m         0.50               — how far in front of marker to place goal
-  detection_rate     10.0               — Hz, how often to run detection
-  min_depth_m        0.10               — ignore depth readings below this (noise)
-  max_depth_m        6.0                — ignore depth readings above this
-  depth_sample_r     3                  — pixel radius to median-sample depth
+  marker_size_m       0.13     m  — physical side length of the ArUco marker
+  camera_frame        'camera_color_optical_frame'
+  image_topic         '/camera/color/image_raw'
+  camera_info_topic   '/camera/color/camera_info'
+  aruco_dict          'DICT_4X4_50'  — ArUco dictionary to use
+  min_detection_area  100      px²  — discard tiny/noisy detections
+  publish_debug_image True          — publish annotated image on /aruco/debug_image
 """
 
 import math
 import numpy as np
-import cv2
 
 import rclpy
+import rclpy.duration
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
-import tf2_ros
-from tf2_ros import TransformException
-import tf2_geometry_msgs   # needed for do_transform_pose
+import cv2
+from cv_bridge import CvBridge
 
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import (PoseWithCovarianceStamped, PoseStamped,
-                                Point, Vector3)
+from geometry_msgs.msg import PoseWithCovarianceStamped, PoseArray, Pose
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
-from cv_bridge import CvBridge
 
 
 # ---------------------------------------------------------------------------
 # ArUco dictionary map
 # ---------------------------------------------------------------------------
 ARUCO_DICTS = {
-    'DICT_4X4_50':       cv2.aruco.DICT_4X4_50,
-    'DICT_4X4_100':      cv2.aruco.DICT_4X4_100,
-    'DICT_4X4_250':      cv2.aruco.DICT_4X4_250,
-    'DICT_5X5_50':       cv2.aruco.DICT_5X5_50,
-    'DICT_5X5_100':      cv2.aruco.DICT_5X5_100,
-    'DICT_6X6_50':       cv2.aruco.DICT_6X6_50,
+    'DICT_4X4_50':        cv2.aruco.DICT_4X4_50,
+    'DICT_4X4_100':       cv2.aruco.DICT_4X4_100,
+    'DICT_4X4_250':       cv2.aruco.DICT_4X4_250,
+    'DICT_5X5_50':        cv2.aruco.DICT_5X5_50,
+    'DICT_5X5_100':       cv2.aruco.DICT_5X5_100,
+    'DICT_6X6_50':        cv2.aruco.DICT_6X6_50,
     'DICT_ARUCO_ORIGINAL': cv2.aruco.DICT_ARUCO_ORIGINAL,
 }
 
@@ -83,416 +70,327 @@ class ArucoDetector(Node):
         # ------------------------------------------------------------------
         # Parameters
         # ------------------------------------------------------------------
-        self.declare_parameter('rgb_topic',
-                               '/camera/color/image_raw')
-        self.declare_parameter('depth_topic',
-                               '/camera/aligned_depth_to_color/image_raw')
-        self.declare_parameter('camera_info_topic',
-                               '/camera/color/camera_info')
-        self.declare_parameter('world_frame',      'map')
-        self.declare_parameter('camera_frame',     'camera_color_optical_frame')
-        self.declare_parameter('aruco_dict',       'DICT_4X4_50')
-        self.declare_parameter('marker_size_m',    0.10)
-        self.declare_parameter('standoff_m',       0.50)
-        self.declare_parameter('detection_rate',   10.0)
-        self.declare_parameter('min_depth_m',      0.10)
-        self.declare_parameter('max_depth_m',      6.0)
-        self.declare_parameter('depth_sample_r',   3)
+        self.declare_parameter('marker_size_m',      0.13)
+        self.declare_parameter('camera_frame',       'camera_color_optical_frame')
+        self.declare_parameter('image_topic',        '/camera/camera/color/image_raw')
+        self.declare_parameter('camera_info_topic',  '/camera/camera/color/camera_info')
+        self.declare_parameter('aruco_dict',         'DICT_4X4_50')
+        self.declare_parameter('min_detection_area', 100)
+        self.declare_parameter('publish_debug_image', True)
 
-        self.rgb_topic         = self.get_parameter('rgb_topic').value
-        self.depth_topic       = self.get_parameter('depth_topic').value
-        self.camera_info_topic = self.get_parameter('camera_info_topic').value
-        self.world_frame       = self.get_parameter('world_frame').value
-        self.camera_frame      = self.get_parameter('camera_frame').value
-        self.marker_size_m     = float(self.get_parameter('marker_size_m').value)
-        self.standoff_m        = float(self.get_parameter('standoff_m').value)
-        self.detection_rate    = float(self.get_parameter('detection_rate').value)
-        self.min_depth_m       = float(self.get_parameter('min_depth_m').value)
-        self.max_depth_m       = float(self.get_parameter('max_depth_m').value)
-        self.depth_sample_r    = int(self.get_parameter('depth_sample_r').value)
+        self.marker_size_m      = float(self.get_parameter('marker_size_m').value)
+        self.camera_frame       = self.get_parameter('camera_frame').value
+        self.image_topic        = self.get_parameter('image_topic').value
+        self.camera_info_topic  = self.get_parameter('camera_info_topic').value
+        aruco_dict_name         = self.get_parameter('aruco_dict').value
+        self.min_detection_area = int(self.get_parameter('min_detection_area').value)
+        self.publish_debug      = bool(self.get_parameter('publish_debug_image').value)
 
         # ------------------------------------------------------------------
         # ArUco setup
         # ------------------------------------------------------------------
-        dict_name = self.get_parameter('aruco_dict').value
-        if dict_name not in ARUCO_DICTS:
+        if aruco_dict_name not in ARUCO_DICTS:
             self.get_logger().error(
-                f'Unknown aruco_dict "{dict_name}". '
+                f'Unknown aruco_dict "{aruco_dict_name}". '
                 f'Valid options: {list(ARUCO_DICTS.keys())}')
-            raise ValueError(f'Unknown aruco_dict: {dict_name}')
+            raise ValueError(f'Unknown ArUco dictionary: {aruco_dict_name}')
 
-        aruco_dict    = cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[dict_name])
-        aruco_params  = cv2.aruco.DetectorParameters()
-        self.detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
-
-        # ------------------------------------------------------------------
-        # State
-        # ------------------------------------------------------------------
-        self.bridge          = CvBridge()
-        self.camera_matrix   = None   # 3x3 np.ndarray
-        self.dist_coeffs     = None   # 1x5 np.ndarray
-        self.camera_info_ok  = False
-
-        self.latest_rgb      = None   # sensor_msgs/Image
-        self.latest_depth    = None   # sensor_msgs/Image
+        self.aruco_dict   = cv2.aruco.Dictionary_get(ARUCO_DICTS[aruco_dict_name])
+        self.aruco_params = cv2.aruco.DetectorParameters_create()
 
         # ------------------------------------------------------------------
-        # TF
+        # Camera intrinsics (populated on first CameraInfo message)
         # ------------------------------------------------------------------
-        self._tf_buffer   = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        self.camera_matrix = None   # 3×3 np.ndarray
+        self.dist_coeffs   = None   # 1×5 np.ndarray
+        self.camera_info_received = False
+
+        # ------------------------------------------------------------------
+        # 3D marker corner template (centred on marker, Z forward into scene)
+        # half the marker size from centre to edge
+        half = self.marker_size_m / 2.0
+        self.obj_points = np.array([
+            [-half,  half, 0.0],   # top-left
+            [ half,  half, 0.0],   # top-right
+            [ half, -half, 0.0],   # bottom-right
+            [-half, -half, 0.0],   # bottom-left
+        ], dtype=np.float32)
+
+        # ------------------------------------------------------------------
+        # Bridge
+        # ------------------------------------------------------------------
+        self.bridge = CvBridge()
 
         # ------------------------------------------------------------------
         # QoS
         # ------------------------------------------------------------------
-        sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1
-        )
         reliable_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=10
         )
-        latched_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=5
         )
 
         # ------------------------------------------------------------------
         # Subscribers
         # ------------------------------------------------------------------
-        self.rgb_sub = self.create_subscription(
-            Image, self.rgb_topic,
-            self._rgb_callback, sensor_qos)
-
-        self.depth_sub = self.create_subscription(
-            Image, self.depth_topic,
-            self._depth_callback, sensor_qos)
+        self.image_sub = self.create_subscription(
+            Image, self.image_topic, self._image_callback, sensor_qos)
 
         self.info_sub = self.create_subscription(
             CameraInfo, self.camera_info_topic,
-            self._camera_info_callback, latched_qos)
+            self._camera_info_callback, reliable_qos)
 
         # ------------------------------------------------------------------
         # Publishers
         # ------------------------------------------------------------------
-        self.detection_pub = self.create_publisher(
-            PoseWithCovarianceStamped,
-            '/aruco/detection',
-            reliable_qos
-        )
-        self.marker_pub = self.create_publisher(
-            MarkerArray,
-            '/aruco/markers',
-            reliable_qos
-        )
+        # All detections this frame as a PoseArray
+        self.pose_array_pub = self.create_publisher(
+            PoseArray, '/aruco/detections', reliable_qos)
 
-        # ------------------------------------------------------------------
-        # Detection timer
-        # ------------------------------------------------------------------
-        self.create_timer(1.0 / self.detection_rate, self._detect)
+        # Per-marker-ID pose topic: /aruco/{id}/pose
+        # Built dynamically as new IDs are seen
+        self._id_publishers: dict = {}
+
+        # RViz marker array
+        self.marker_pub = self.create_publisher(
+            MarkerArray, '/aruco/markers', reliable_qos)
+
+        # Debug annotated image
+        if self.publish_debug:
+            self.debug_pub = self.create_publisher(
+                Image, '/aruco/debug_image', sensor_qos)
 
         self.get_logger().info(
             f'ArucoDetector ready\n'
-            f'  rgb        ← {self.rgb_topic}\n'
-            f'  depth      ← {self.depth_topic}\n'
-            f'  dict       = {dict_name}\n'
-            f'  marker_size= {self.marker_size_m} m\n'
-            f'  standoff   = {self.standoff_m} m\n'
-            f'  rate       = {self.detection_rate} Hz\n'
-            f'  TF         : {self.camera_frame} → {self.world_frame}'
+            f'  image        ← {self.image_topic}\n'
+            f'  camera_info  ← {self.camera_info_topic}\n'
+            f'  camera_frame = {self.camera_frame}\n'
+            f'  marker_size  = {self.marker_size_m} m\n'
+            f'  aruco_dict   = {aruco_dict_name}\n'
+            f'  detections   → /aruco/detections\n'
+            f'  per-ID       → /aruco/{{id}}/pose'
         )
 
     # ==========================================================================
-    # Callbacks — just buffer the latest frames
+    # Camera info callback — capture intrinsics once
     # ==========================================================================
-
-    def _rgb_callback(self, msg: Image):
-        self.latest_rgb = msg
-
-    def _depth_callback(self, msg: Image):
-        self.latest_depth = msg
 
     def _camera_info_callback(self, msg: CameraInfo):
-        if self.camera_info_ok:
+        if self.camera_info_received:
             return   # only need it once
-        self.camera_matrix  = np.array(msg.k, dtype=np.float64).reshape((3, 3))
-        self.dist_coeffs    = np.array(msg.d, dtype=np.float64)
-        self.camera_info_ok = True
+
+        self.camera_matrix = np.array(msg.k, dtype=np.float64).reshape((3, 3))
+        self.dist_coeffs   = np.array(msg.d, dtype=np.float64)
+        self.camera_info_received = True
+
         self.get_logger().info(
-            f'Camera intrinsics received:\n'
+            f'Camera intrinsics received\n'
             f'  fx={self.camera_matrix[0,0]:.1f}  fy={self.camera_matrix[1,1]:.1f}\n'
-            f'  cx={self.camera_matrix[0,2]:.1f}  cy={self.camera_matrix[1,2]:.1f}')
+            f'  cx={self.camera_matrix[0,2]:.1f}  cy={self.camera_matrix[1,2]:.1f}\n'
+            f'  distortion={self.dist_coeffs.tolist()}'
+        )
 
     # ==========================================================================
-    # Detection loop
+    # Image callback — main detection pipeline
     # ==========================================================================
 
-    def _detect(self):
-        # Guard: need intrinsics and both frames
-        if not self.camera_info_ok:
+    def _image_callback(self, msg: Image):
+        if not self.camera_info_received:
             self.get_logger().warn(
-                'Waiting for camera_info…', throttle_duration_sec=5.0)
-            return
-        if self.latest_rgb is None or self.latest_depth is None:
-            self.get_logger().warn(
-                'Waiting for RGB + depth frames…', throttle_duration_sec=5.0)
+                'Waiting for camera intrinsics…',
+                throttle_duration_sec=5.0)
             return
 
-        # Convert to OpenCV
+        # Convert ROS image → OpenCV BGR
         try:
-            bgr   = self.bridge.imgmsg_to_cv2(
-                self.latest_rgb, desired_encoding='bgr8')
-            depth = self.bridge.imgmsg_to_cv2(
-                self.latest_depth, desired_encoding='passthrough')
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
-            self.get_logger().warn(f'CvBridge error: {e}')
+            self.get_logger().error(f'cv_bridge conversion failed: {e}')
             return
 
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Detect markers
-        corners, ids, _ = self.detector.detectMarkers(gray)
+        # ── Detect markers ────────────────────────────────────────────────
+        corners, ids, rejected = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
+
+        if self.publish_debug:
+            debug_frame = frame.copy()
 
         if ids is None or len(ids) == 0:
-            return   # nothing detected this frame
+            if self.publish_debug:
+                self._publish_debug(debug_frame, msg.header)
+            return
 
-        # Process each detected marker
-        for idx, marker_id in enumerate(ids.flatten()):
-            corner_pts = corners[idx][0]   # shape (4, 2), float32
+        # ── Filter tiny detections ────────────────────────────────────────
+        valid_corners = []
+        valid_ids     = []
+        for i, corner in enumerate(corners):
+            area = cv2.contourArea(corner[0])
+            if area >= self.min_detection_area:
+                valid_corners.append(corner)
+                valid_ids.append(ids[i][0])
 
-            # ── 1. Marker centre in pixel space ───────────────────────────
-            cx_px = float(np.mean(corner_pts[:, 0]))
-            cy_px = float(np.mean(corner_pts[:, 1]))
+        if not valid_corners:
+            if self.publish_debug:
+                self._publish_debug(debug_frame, msg.header)
+            return
 
-            # ── 2. Depth at marker centre (median over a small patch) ─────
-            depth_m = self._sample_depth(depth, cx_px, cy_px)
-            if depth_m is None:
-                self.get_logger().warn(
-                    f'Marker {marker_id}: invalid depth at '
-                    f'({cx_px:.0f}, {cy_px:.0f}) — skipping.')
+        # ── Solve PnP for each marker ─────────────────────────────────────
+        # Group by marker ID to average duplicate detections (e.g. cube faces)
+        id_poses: dict = {}   # marker_id → list of (tvec, rvec)
+
+        for i, corner in enumerate(valid_corners):
+            marker_id = valid_ids[i]
+
+            success, rvec, tvec = cv2.solvePnP(
+                self.obj_points,
+                corner[0],
+                self.camera_matrix,
+                self.dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE   # best for square markers
+            )
+
+            if not success:
                 continue
 
-            # ── 3. Back-project to 3D in camera frame ────────────────────
-            #   X_cam = (cx_px - cx) * Z / fx
-            #   Y_cam = (cy_px - cy) * Z / fy
-            #   Z_cam = depth_m
-            fx = self.camera_matrix[0, 0]
-            fy = self.camera_matrix[1, 1]
-            cx = self.camera_matrix[0, 2]
-            cy = self.camera_matrix[1, 2]
+            if marker_id not in id_poses:
+                id_poses[marker_id] = []
+            id_poses[marker_id].append((tvec.flatten(), rvec.flatten()))
 
-            x_cam = (cx_px - cx) * depth_m / fx
-            y_cam = (cy_px - cy) * depth_m / fy
-            z_cam = depth_m
+            if self.publish_debug:
+                cv2.aruco.drawDetectedMarkers(debug_frame, [corner], np.array([[marker_id]]))
+                cv2.drawFrameAxes(
+                    debug_frame, self.camera_matrix, self.dist_coeffs,
+                    rvec, tvec, self.marker_size_m * 0.5)
 
-            # ── 4. Estimate marker normal using solvePnP ─────────────────
-            #   This gives us the rotation of the marker so we can compute
-            #   the standoff direction correctly.
-            half = self.marker_size_m / 2.0
-            obj_pts = np.array([
-                [-half,  half, 0.0],
-                [ half,  half, 0.0],
-                [ half, -half, 0.0],
-                [-half, -half, 0.0],
-            ], dtype=np.float64)
+        # ── Average duplicates and publish ───────────────────────────────
+        now        = msg.header.stamp
+        pose_array = PoseArray()
+        pose_array.header.stamp    = now
+        pose_array.header.frame_id = self.camera_frame
+        rviz_array = MarkerArray()
+        rviz_id    = 0
 
-            img_pts = corner_pts.astype(np.float64)
+        for marker_id, pose_list in id_poses.items():
 
-            ok, rvec, tvec = cv2.solvePnP(
-                obj_pts, img_pts,
-                self.camera_matrix, self.dist_coeffs,
-                flags=cv2.SOLVEPNP_IPPE_SQUARE)
+            # Average translation and rotation across all detections of this ID
+            avg_tvec = np.mean([p[0] for p in pose_list], axis=0)
+            avg_rvec = np.mean([p[1] for p in pose_list], axis=0)
 
-            if not ok:
-                self.get_logger().warn(
-                    f'Marker {marker_id}: solvePnP failed — using '
-                    f'depth centre without standoff rotation.')
-                normal_cam = np.array([0.0, 0.0, -1.0])  # fallback: face camera
-            else:
-                # Marker normal in camera frame = rotation of Z-axis of marker
-                R, _ = cv2.Rodrigues(rvec)
-                normal_cam = -R[:, 2]   # marker faces along -Z of marker frame
+            # Convert rvec → quaternion
+            qx, qy, qz, qw = self._rvec_to_quaternion(avg_rvec)
 
-            # ── 5. Compute goal = marker centre + standoff * normal ───────
-            marker_pos_cam = np.array([x_cam, y_cam, z_cam])
-            goal_pos_cam   = marker_pos_cam + self.standoff_m * normal_cam
+            # ── Build Pose (camera frame) ─────────────────────────────────
+            pose = Pose()
+            pose.position.x    = float(avg_tvec[0])
+            pose.position.y    = float(avg_tvec[1])
+            pose.position.z    = float(avg_tvec[2])
+            pose.orientation.x = qx
+            pose.orientation.y = qy
+            pose.orientation.z = qz
+            pose.orientation.w = qw
+            pose_array.poses.append(pose)
 
-            # ── 6. Transform goal from camera frame to world frame ────────
-            goal_world = self._transform_to_world(
-                goal_pos_cam, normal_cam,
-                self.latest_rgb.header.stamp)
+            # ── PoseWithCovarianceStamped on /aruco/{id}/pose ─────────────
+            pwcs = PoseWithCovarianceStamped()
+            pwcs.header.stamp    = now
+            pwcs.header.frame_id = self.camera_frame   # ← camera frame
+            # Encode marker ID in child frame_id for downstream consumers
+            pwcs.pose.pose = pose
 
-            if goal_world is None:
-                continue   # TF not available yet
+            pub = self._get_id_publisher(marker_id)
+            pub.publish(pwcs)
 
-            # ── 7. Publish detection + RViz marker ───────────────────────
-            self._publish_detection(marker_id, goal_world)
-            self._publish_rviz_marker(marker_id, goal_world, depth_m)
+            # ── RViz marker ───────────────────────────────────────────────
+            dist = float(np.linalg.norm(avg_tvec))
+            rviz_array.markers.append(
+                self._make_rviz_marker(
+                    rviz_id, now, pose, marker_id, dist))
+            rviz_id += 1
 
             self.get_logger().info(
-                f'Marker {marker_id} detected | '
-                f'depth={depth_m:.2f} m | '
-                f'goal=({goal_world.pose.pose.position.x:.2f}, '
-                f'{goal_world.pose.pose.position.y:.2f})',
-                throttle_duration_sec=1.0)
+                f'ArUco ID={marker_id} | '
+                f'pos=({avg_tvec[0]:.3f}, {avg_tvec[1]:.3f}, {avg_tvec[2]:.3f}) m '
+                f'in {self.camera_frame} | '
+                f'dist={dist:.3f} m'
+                + (f' [averaged {len(pose_list)} faces]'
+                   if len(pose_list) > 1 else ''),
+                throttle_duration_sec=0.5
+            )
+
+        self.pose_array_pub.publish(pose_array)
+        self.marker_pub.publish(rviz_array)
+
+        if self.publish_debug:
+            self._publish_debug(debug_frame, msg.header)
 
     # ==========================================================================
-    # Depth sampling — median over a small patch for robustness
+    # Helpers
     # ==========================================================================
 
-    def _sample_depth(self, depth_img: np.ndarray,
-                      cx_px: float, cy_px: float) -> float | None:
+    def _get_id_publisher(self, marker_id: int):
+        """Lazily create a publisher for /aruco/{id}/pose."""
+        if marker_id not in self._id_publishers:
+            topic = f'/aruco/{marker_id}/pose'
+            reliable_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=10
+            )
+            self._id_publishers[marker_id] = self.create_publisher(
+                PoseWithCovarianceStamped, topic, reliable_qos)
+            self.get_logger().info(
+                f'New publisher created: {topic}')
+        return self._id_publishers[marker_id]
+
+    @staticmethod
+    def _rvec_to_quaternion(rvec: np.ndarray):
         """
-        Samples depth_img within a square patch of radius depth_sample_r
-        around (cx_px, cy_px).  Returns the median in metres, or None if
-        no valid readings exist.
-
-        The D435i depth image is uint16 in millimetres.
+        Converts an OpenCV rotation vector (Rodrigues) to a quaternion (x,y,z,w).
         """
-        r   = self.depth_sample_r
-        h, w = depth_img.shape[:2]
-        x0  = max(0,   int(cx_px) - r)
-        x1  = min(w-1, int(cx_px) + r)
-        y0  = max(0,   int(cy_px) - r)
-        y1  = min(h-1, int(cy_px) + r)
+        angle = np.linalg.norm(rvec)
+        if angle < 1e-9:
+            return 0.0, 0.0, 0.0, 1.0
 
-        patch = depth_img[y0:y1+1, x0:x1+1].astype(np.float32)
-        valid = patch[(patch > 0)]   # 0 = no measurement
+        axis  = rvec / angle
+        s     = math.sin(angle / 2.0)
+        return (float(axis[0] * s),
+                float(axis[1] * s),
+                float(axis[2] * s),
+                float(math.cos(angle / 2.0)))
 
-        if valid.size == 0:
-            return None
+    def _make_rviz_marker(self, marker_id_rviz: int, stamp,
+                          pose: Pose, marker_id: int, dist: float) -> Marker:
+        m = Marker()
+        m.header.stamp    = stamp
+        m.header.frame_id = self.camera_frame
+        m.ns     = 'aruco_detections'
+        m.id     = marker_id_rviz
+        m.type   = Marker.CUBE
+        m.action = Marker.ADD
+        m.pose   = pose
+        m.scale.x = self.marker_size_m
+        m.scale.y = self.marker_size_m
+        m.scale.z = 0.01   # flat marker representation
+        m.color  = ColorRGBA(r=1.0, g=0.8, b=0.0, a=0.85)
 
-        depth_m = float(np.median(valid)) / 1000.0   # mm → m
+        # Lifetime: marker disappears if not re-detected within 0.5 s
+        m.lifetime.sec     = 0
+        m.lifetime.nanosec = 500_000_000
+        return m
 
-        if not (self.min_depth_m <= depth_m <= self.max_depth_m):
-            return None
-
-        return depth_m
-
-    # ==========================================================================
-    # TF transform: camera frame → world frame
-    # ==========================================================================
-
-    def _transform_to_world(
-            self,
-            pos_cam: np.ndarray,
-            normal_cam: np.ndarray,
-            stamp) -> PoseWithCovarianceStamped | None:
-        """
-        Builds a PoseStamped in camera frame, transforms it to world frame
-        using Isaac ROS VSLAM's TF tree, and returns a
-        PoseWithCovarianceStamped ready to publish.
-
-        The orientation is set so the robot faces the marker (yaw aligned
-        with the inverse of the marker normal projected onto the XY plane).
-        """
+    def _publish_debug(self, frame: np.ndarray, header):
         try:
-            tf_stamped = self._tf_buffer.lookup_transform(
-                self.world_frame,
-                self.camera_frame,
-                rclpy.time.Time(),          # latest available
-                timeout=rclpy.duration.Duration(seconds=0.1))
-        except TransformException as e:
-            self.get_logger().warn(
-                f'TF {self.camera_frame} → {self.world_frame} '
-                f'unavailable: {e}',
-                throttle_duration_sec=3.0)
-            return None
-
-        # Build PoseStamped in camera frame
-        pose_cam = PoseStamped()
-        pose_cam.header.stamp    = stamp
-        pose_cam.header.frame_id = self.camera_frame
-        pose_cam.pose.position.x = float(pos_cam[0])
-        pose_cam.pose.position.y = float(pos_cam[1])
-        pose_cam.pose.position.z = float(pos_cam[2])
-        pose_cam.pose.orientation.w = 1.0   # orientation handled after transform
-
-        # Transform position to world frame
-        pose_world = tf2_geometry_msgs.do_transform_pose(pose_cam, tf_stamped)
-
-        # Compute goal yaw: robot should face toward the marker from the goal.
-        # The marker normal in world frame points FROM marker TOWARD goal.
-        # Robot faces opposite direction (back toward marker).
-        # We project the normal onto XY plane and compute yaw.
-        n = normal_cam / (np.linalg.norm(normal_cam) + 1e-9)
-
-        # Rotate normal to world frame (rotation only, no translation)
-        import tf_transformations
-        q = tf_stamped.transform.rotation
-        q_arr = [q.x, q.y, q.z, q.w]
-        R_world = tf_transformations.quaternion_matrix(q_arr)[:3, :3]
-        n_world = R_world @ n
-
-        # Robot faces from goal BACK toward marker → opposite of normal
-        yaw = math.atan2(-n_world[1], -n_world[0])
-
-        # Pack into PoseWithCovarianceStamped
-        result = PoseWithCovarianceStamped()
-        result.header.stamp    = stamp
-        result.header.frame_id = str(0)   # placeholder; overwritten below
-        result.pose.pose.position.x    = pose_world.pose.position.x
-        result.pose.pose.position.y    = pose_world.pose.position.y
-        result.pose.pose.position.z    = 0.0   # ground plane
-        result.pose.pose.orientation.z = math.sin(yaw / 2.0)
-        result.pose.pose.orientation.w = math.cos(yaw / 2.0)
-
-        return result
-
-    # ==========================================================================
-    # Publishing
-    # ==========================================================================
-
-    def _publish_detection(self, marker_id: int,
-                           pose: PoseWithCovarianceStamped):
-        """
-        Publishes the detection with the marker ID encoded in header.frame_id
-        so MissionController can filter by target_marker_id without a custom msg.
-        """
-        pose.header.frame_id = str(marker_id)
-        self.detection_pub.publish(pose)
-
-    def _publish_rviz_marker(self, marker_id: int,
-                              pose: PoseWithCovarianceStamped,
-                              depth_m: float):
-        """Publishes a sphere + text label for RViz."""
-        now   = self.get_clock().now().to_msg()
-        array = MarkerArray()
-
-        # Sphere at detected goal position
-        sphere = Marker()
-        sphere.header.stamp    = now
-        sphere.header.frame_id = self.world_frame
-        sphere.ns     = 'aruco_detections'
-        sphere.id     = marker_id * 2
-        sphere.type   = Marker.SPHERE
-        sphere.action = Marker.ADD
-        sphere.pose   = pose.pose.pose
-        sphere.scale  = Vector3(x=0.15, y=0.15, z=0.15)
-        sphere.color  = ColorRGBA(r=0.0, g=1.0, b=1.0, a=1.0)
-        array.markers.append(sphere)
-
-        # Text label above the sphere
-        label = Marker()
-        label.header.stamp    = now
-        label.header.frame_id = self.world_frame
-        label.ns     = 'aruco_labels'
-        label.id     = marker_id * 2 + 1
-        label.type   = Marker.TEXT_VIEW_FACING
-        label.action = Marker.ADD
-        label.pose   = pose.pose.pose
-        label.pose.position.z += 0.25
-        label.scale.z = 0.25
-        label.color   = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-        label.text    = f'ID:{marker_id}  {depth_m:.2f}m'
-        array.markers.append(label)
-
-        self.marker_pub.publish(array)
+            debug_msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+            debug_msg.header = header
+            self.debug_pub.publish(debug_msg)
+        except Exception as e:
+            self.get_logger().error(f'Debug image publish failed: {e}')
 
 
 # ==============================================================================

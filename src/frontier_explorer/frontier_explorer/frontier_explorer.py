@@ -83,32 +83,41 @@ class FrontierExplorer(Node):
         self.declare_parameter('min_cluster_size',  5)
         self.declare_parameter('max_frontier_dist', 10.0)
         self.declare_parameter('update_rate',       1.0)
-        self.declare_parameter('goal_reached_dist', 0.40)
         self.declare_parameter('w_dist',            0.7)
         self.declare_parameter('w_size',            0.3)
+        self.declare_parameter('w_heading',         0.4)
         self.declare_parameter('active',            True)
         self.declare_parameter('odom_topic', '')   # Switch between simulation and real robot
         self.declare_parameter('safe_goal_radius', 0.30)   # m — must be >= astar inflation_radius
+        self.declare_parameter('min_goal_dist',    0.20) 
+        self.declare_parameter('goal_reached_dist', 0.12)   # just above spline tolerance of 0.1 m
+        self.declare_parameter('require_camera_coverage', True)
+        # Topic published by camera_fov_tracker; set empty string to disable
+        self.declare_parameter('fov_map_topic', '/camera/fov_map')
 
-        self.map_topic         = self.get_parameter('map_topic').value
-        self.pose_topic        = self.get_parameter('pose_topic').value
-        self.goal_topic        = self.get_parameter('goal_topic').value
-        self.marker_topic      = self.get_parameter('marker_topic').value
-        self.world_frame       = self.get_parameter('world_frame').value
-        self.min_cluster_size  = int(self.get_parameter('min_cluster_size').value)
-        self.max_frontier_dist = float(self.get_parameter('max_frontier_dist').value)
-        self.update_rate       = float(self.get_parameter('update_rate').value)
-        self.goal_reached_dist = float(self.get_parameter('goal_reached_dist').value)
-        self.w_dist            = float(self.get_parameter('w_dist').value)
-        self.w_size            = float(self.get_parameter('w_size').value)
-        self.active            = bool(self.get_parameter('active').value)
-        self.odom_topic        = self.get_parameter('odom_topic').value
-        self.safe_goal_radius = float(self.get_parameter('safe_goal_radius').value)
+        self.map_topic               = self.get_parameter('map_topic').value
+        self.pose_topic              = self.get_parameter('pose_topic').value
+        self.goal_topic              = self.get_parameter('goal_topic').value
+        self.marker_topic            = self.get_parameter('marker_topic').value
+        self.world_frame             = self.get_parameter('world_frame').value
+        self.min_cluster_size        = int(self.get_parameter('min_cluster_size').value)
+        self.max_frontier_dist       = float(self.get_parameter('max_frontier_dist').value)
+        self.update_rate             = float(self.get_parameter('update_rate').value)
+        self.w_dist                  = float(self.get_parameter('w_dist').value)
+        self.w_size                  = float(self.get_parameter('w_size').value)
+        self.w_heading               = float(self.get_parameter('w_heading').value)
+        self.active                  = bool(self.get_parameter('active').value)
+        self.odom_topic              = self.get_parameter('odom_topic').value
+        self.safe_goal_radius        = float(self.get_parameter('safe_goal_radius').value)
+        self.min_goal_dist           = float(self.get_parameter('min_goal_dist').value)
+        self.goal_reached_dist       = float(self.get_parameter('goal_reached_dist').value)
+        self.require_camera_coverage = bool(self.get_parameter('require_camera_coverage').value)
+        self.fov_map_topic           = self.get_parameter('fov_map_topic').value
 
         # ------------------------------------------------------------------
         # State
         # ------------------------------------------------------------------
-        self.map_data       = None   # np.ndarray (height, width) int8
+        self.map_data       = None   # np.ndarray (height, width) int8 — SLAM map
         self.map_resolution = None
         self.map_origin_x   = None
         self.map_origin_y   = None
@@ -116,15 +125,38 @@ class FrontierExplorer(Node):
         self.map_height     = None
         self.map_received   = False
 
+        # Drone map — used by _safe_goal to validate against A*'s actual map
+        self.drone_map_data    = None   # np.ndarray (height, width) int8
+        self.drone_map_received = False
+
         self.robot_x        = 0.0
         self.robot_y        = 0.0
+        self.robot_yaw      = 0.0   # radians, updated from pose/odom callbacks
         self.pose_received  = False
 
         self.current_goal_x = None
         self.current_goal_y = None
 
-        self.visited_goals         = []    # list of (wx, wy) already sent
-        self.goal_blacklist_radius = 0.50  # m — don't revisit within this radius   
+        self.visited_goals         = []   # failure blacklist — A* said lethal
+        self.goal_blacklist_radius = 0.30
+
+        self.reached_goals            = []   # list of (wx, wy, timestamp)
+        self.reached_blacklist_radius = 0.20  # m
+        self.reached_blacklist_ttl    = 30.0  # s — expire after this long
+
+        self._reset_state()
+
+        # Prevent re-publishing the same goal every tick
+        self._last_published_goal: tuple | None = None
+
+        # Camera FOV mask — received from camera_fov_tracker
+        # bool array (height, width); None until first message arrives
+        self.fov_map_data:       np.ndarray | None = None
+        self.fov_map_resolution: float | None      = None
+        self.fov_map_origin_x:   float | None      = None
+        self.fov_map_origin_y:   float | None      = None
+        self.fov_map_width:      int   | None      = None
+        self.fov_map_height:     int   | None      = None
 
         # TF buffer — used when odom_topic is set (real robot mode)
         self._tf_buffer   = tf2_ros.Buffer()
@@ -152,6 +184,14 @@ class FrontierExplorer(Node):
             OccupancyGrid,
             self.map_topic,
             self._map_callback,
+            latched_qos
+        )
+
+        # Drone map — for safe goal validation (same map A* uses)
+        self.create_subscription(
+            OccupancyGrid,
+            '/drone/map',
+            self._drone_map_callback,
             latched_qos
         )
         
@@ -192,6 +232,15 @@ class FrontierExplorer(Node):
             self._active_callback,
             reliable_qos
         )
+
+        # Camera FOV mask — published by camera_fov_tracker
+        if self.fov_map_topic:
+            self.create_subscription(
+                OccupancyGrid,
+                self.fov_map_topic,
+                self._fov_map_callback,
+                latched_qos,
+            )
 
         # ------------------------------------------------------------------
         # Publishers
@@ -237,9 +286,16 @@ class FrontierExplorer(Node):
             (self.map_height, self.map_width))
         self.map_received   = True
 
+    def _drone_map_callback(self, msg: OccupancyGrid):
+        """Store the drone/full map for use in _safe_goal validation."""
+        self.drone_map_data    = np.array(msg.data, dtype=np.int8).reshape(
+            (msg.info.height, msg.info.width))
+        self.drone_map_received = True
+
     def _pose_callback(self, msg: PoseWithCovarianceStamped):
         self.robot_x       = msg.pose.pose.position.x
         self.robot_y       = msg.pose.pose.position.y
+        self.robot_yaw = self._yaw_from_quaternion(msg.pose.pose.orientation)
         self.pose_received = True
 
 
@@ -263,6 +319,7 @@ class FrontierExplorer(Node):
 
         self.robot_x       = pose_world.pose.position.x
         self.robot_y       = pose_world.pose.position.y
+        self.robot_yaw = self._yaw_from_quaternion(msg.pose.pose.orientation)
         self.pose_received = True
 
 
@@ -270,9 +327,11 @@ class FrontierExplorer(Node):
         self.active = msg.data
         # Clear visited goal blacklist
         if self.active:
-            self.visited_goals  = []
-            self.current_goal_x = None
-            self.current_goal_y = None
+            self.visited_goals          = []
+            self.reached_goals          = []   # list of (wx, wy, timestamp)
+            self.current_goal_x         = None
+            self.current_goal_y         = None
+            self._last_published_goal   = None
             
         self.get_logger().info(
             f'FrontierExplorer {"activated" if self.active else "deactivated"} '
@@ -288,9 +347,89 @@ class FrontierExplorer(Node):
         # Blacklist the failed goal with a larger radius so we don't keep
         # trying positions in the same lethal area
         self.visited_goals.append((fx, fy))
-        # Clear current goal so _explore() picks a new one immediately
         self.current_goal_x = None
         self.current_goal_y = None
+        self._last_published_goal = None
+
+    def _fov_map_callback(self, msg: OccupancyGrid):
+        """Receive the camera-seen mask from camera_fov_tracker."""
+        self.fov_map_resolution = msg.info.resolution
+        self.fov_map_origin_x   = msg.info.origin.position.x
+        self.fov_map_origin_y   = msg.info.origin.position.y
+        self.fov_map_width      = msg.info.width
+        self.fov_map_height     = msg.info.height
+        # Values are 0 (unseen) or 100 (seen) — convert to bool mask
+        self.fov_map_data = (
+            np.array(msg.data, dtype=np.int8)
+              .reshape((self.fov_map_height, self.fov_map_width)) > 0
+        )
+
+    def _camera_saw_cell(self, wx: float, wy: float) -> bool:
+        """
+        Return True if the map cell at world position (wx, wy) has been
+        seen by the RGB camera at least once.
+
+        If the fov_map hasn't arrived yet (camera_fov_tracker not running,
+        or require_camera_coverage=False), always returns True so exploration
+        is not blocked.
+        """
+        if not self.require_camera_coverage:
+            return True
+        if self.fov_map_data is None:
+            return True   # no mask yet — don't block exploration
+        ci = int((wx - self.fov_map_origin_x) / self.fov_map_resolution)
+        cj = int((wy - self.fov_map_origin_y) / self.fov_map_resolution)
+        if not (0 <= ci < self.fov_map_width and 0 <= cj < self.fov_map_height):
+            return False  # outside the tracked area — treat as unseen
+        return bool(self.fov_map_data[cj, ci])
+
+    def _cluster_has_unseen_cells(self, cells: list) -> bool:
+        """
+        Return True if the unknown space BEHIND this frontier cluster has not
+        been seen by the camera — i.e. there is unexplored territory adjacent
+        to these frontier cells that the camera has never swept.
+
+        Frontier cells are FREE cells bordering UNKNOWN cells. We check the
+        unknown neighbours: if any unknown neighbour cell is camera-unseen,
+        the robot needs to go there and sweep its camera over it.
+
+        Falls back to True (don't block) if coverage data isn't available.
+        """
+        if not self.require_camera_coverage:
+            return True
+        if self.fov_map_data is None:
+            return True
+        if self.map_data is None:
+            return True
+
+        res = self.fov_map_resolution
+        ox  = self.fov_map_origin_x
+        oy  = self.fov_map_origin_y
+        W   = self.fov_map_width
+        H   = self.fov_map_height
+
+        cell_set = set(cells)
+
+        for (ci_slam, cj_slam) in cells:
+            # Check the 4-connected unknown neighbours of each frontier cell
+            for dci, dcj in [(1,0),(-1,0),(0,1),(0,-1)]:
+                ni, nj = ci_slam + dci, cj_slam + dcj
+                if not (0 <= ni < self.map_width and 0 <= nj < self.map_height):
+                    continue
+                if self.map_data[nj, ni] != -1:
+                    continue   # not unknown — skip
+
+                # This neighbour is unknown — has the camera seen it?
+                wx = self.map_origin_x + (ni + 0.5) * self.map_resolution
+                wy = self.map_origin_y + (nj + 0.5) * self.map_resolution
+                ci = int((wx - ox) / res)
+                cj = int((wy - oy) / res)
+                if not (0 <= ci < W and 0 <= cj < H):
+                    return True   # outside fov map → treat as unseen
+                if not self.fov_map_data[cj, ci]:
+                    return True   # unknown neighbour not yet seen by camera
+
+        return False  # all unknown neighbours already seen by camera
 
     # ==========================================================================
     # Main exploration loop
@@ -309,7 +448,6 @@ class FrontierExplorer(Node):
                 'Waiting for robot pose…', throttle_duration_sec=5.0)
             return
         
-        # ── Wait until robot reaches current goal before picking a new one ──
         if self.current_goal_x is not None:
             dist_to_goal = math.hypot(
                 self.robot_x - self.current_goal_x,
@@ -320,7 +458,29 @@ class FrontierExplorer(Node):
                     f'{self.current_goal_y:.2f}) — '
                     f'{dist_to_goal:.2f} m remaining.',
                     throttle_duration_sec=2.0)
-                return   # ← don't pick a new goal yet
+                # Re-publish periodically so A* recovers if it restarts mid-journey.
+                # Do NOT re-score or pick a new frontier — we are committed.
+                if (self._last_published_goal is None or
+                        not math.isclose(self.current_goal_x,
+                                        self._last_published_goal[0], abs_tol=0.01) or
+                        not math.isclose(self.current_goal_y,
+                                        self._last_published_goal[1], abs_tol=0.01)):
+                    self._last_published_goal = (self.current_goal_x, self.current_goal_y)
+                    self._publish_goal(self.current_goal_x, self.current_goal_y)
+                return   # ← hard return: no re-scoring, no goal switching
+            else:
+                # Robot arrived — log it and clear so we pick the next frontier
+                self.reached_goals.append((
+                    self.current_goal_x,
+                    self.current_goal_y,
+                    self.get_clock().now().nanoseconds * 1e-9
+                ))
+                self.get_logger().info(
+                    f'Arrived at frontier ({self.current_goal_x:.2f}, '
+                    f'{self.current_goal_y:.2f}) — selecting next.')
+                self.current_goal_x = None
+                self.current_goal_y = None
+                self._last_published_goal = None
 
         # Recompute frontiers
         frontier_cells = self._detect_frontiers()
@@ -350,15 +510,21 @@ class FrontierExplorer(Node):
         gx, gy = best
         self.current_goal_x = gx
         self.current_goal_y = gy
-        # Add to blacklist
-        self.visited_goals.append((gx, gy)) 
+        # Do NOT blacklist here — only blacklist on _goal_failed_callback.
+        # Pre-blacklisting caused valid frontier clusters to be permanently
+        # excluded as the robot moves and centroids shift slightly.
 
-        self._publish_goal(gx, gy)
+        # Only publish if this is a new goal — prevents A* spam
+        if (self._last_published_goal is None or
+                not math.isclose(gx, self._last_published_goal[0], abs_tol=0.01) or
+                not math.isclose(gy, self._last_published_goal[1], abs_tol=0.01)):
+            self._last_published_goal = (gx, gy)
+            self._publish_goal(gx, gy)
+            self.get_logger().info(
+                f'Frontier goal → ({gx:.2f}, {gy:.2f}) | '
+                f'{len(clusters)} clusters found')
+
         self._publish_markers(clusters, best)
-
-        self.get_logger().info(
-            f'Frontier goal → ({gx:.2f}, {gy:.2f}) | '
-            f'{len(clusters)} clusters found')
 
     # ==========================================================================
     # Step 1 — Detect frontier cells
@@ -461,23 +627,35 @@ class FrontierExplorer(Node):
     def _pick_best_cluster(self, clusters: list):
         """
         Scores each cluster with:
-          score = w_dist * (1 / distance_m) + w_size * cluster_area_m2
+          perceived_dist = real_dist / max(heading_score, 0.05)
+          score = w_dist * norm_prox + w_size * norm_area
 
-        where:
-          distance_m      = Euclidean distance robot → safe centroid
-          cluster_area_m2 = len(cells) * resolution²  (information gain proxy)
+        heading_score is a cosine-based term in [0, 1]:
+          0°   → 1.0  (straight ahead — no inflation)
+          90°  → 0.5  (side — appears twice as far)
+          150° → 0.03 (near-behind — appears ~33× as far)
+          >150°→ multiplied by 0.1 first (hard U-turn deterrent)
 
-        Both terms are normalised across all candidates before weighting so
-        that neither dominates purely due to scale differences.
+        Baking heading into the effective distance means a closer frontier
+        behind the robot can never rescue itself with proximity alone —
+        it has to compete on equal perceived-distance terms with a farther
+        frontier that's straight ahead.  Normalising a separate heading
+        term would wash out the penalty whenever all candidates face similar
+        directions (range collapses → heading contributes nothing).
 
-        Returns the (world_x, world_y) of the highest-scoring cluster's safe
-        centroid, or None if no cluster qualifies within max_frontier_dist.
+        w_heading is intentionally removed from the formula; the parameter
+        is kept for launch-file compatibility but ignored.
         """
         robot_x, robot_y = self.robot_x, self.robot_y
         res = self.map_resolution
 
-        # --- Compute raw metrics for every qualifying cluster ---
-        candidates = []   # (distance_m, area_m2, wx, wy)
+        self.get_logger().warn(
+            f'Scoring {len(clusters)} clusters | '
+            f'drone_map_ready={self.drone_map_received} | '
+            f'fov_map_ready={self.fov_map_data is not None} | '
+            f'require_coverage={self.require_camera_coverage}')
+
+        candidates = []
 
         for cells in clusters:
             ci_safe, cj_safe = self._safe_centroid(cells)
@@ -486,45 +664,91 @@ class FrontierExplorer(Node):
 
             safe = self._safe_goal(wx, wy)
             if safe is None:
-                continue       # skip this cluster entirely
+                self.get_logger().warn(
+                    f'  Cluster centroid ({wx:.2f},{wy:.2f}) — '
+                    f'_safe_goal returned None (lethal or out of bounds)')
+                continue
             wx, wy = safe
 
             dist = math.hypot(wx - robot_x, wy - robot_y)
             if dist > self.max_frontier_dist:
+                self.get_logger().warn(
+                    f'  Cluster ({wx:.2f},{wy:.2f}) — '
+                    f'dist {dist:.2f} > max {self.max_frontier_dist}')
                 continue
 
-            if self._is_blacklisted(wx, wy):  
+            if self._is_blacklisted(wx, wy):
+                self.get_logger().warn(
+                    f'  Cluster ({wx:.2f},{wy:.2f}) — blacklisted')
+                continue
+
+            if self._is_recently_reached(wx, wy):
+                self.get_logger().warn(
+                    f'  Cluster ({wx:.2f},{wy:.2f}) — recently reached, skipping')
+                continue
+
+            # Filter micro goals
+            if dist < self.min_goal_dist:
+                self.get_logger().warn(
+                    f'  Cluster ({wx:.2f},{wy:.2f}) — '
+                    f'too close ({dist:.2f} m < min {self.min_goal_dist:.2f} m), skipping')
+                continue
+
+            if not self._cluster_has_unseen_cells(cells):
+                self.get_logger().warn(
+                    f'  Cluster ({wx:.2f},{wy:.2f}) — '
+                    f'all unknown neighbours already camera-seen')
                 continue
 
             area_m2 = len(cells) * (res ** 2)
-            candidates.append((dist, area_m2, wx, wy))
+
+            # ── Heading-inflated perceived distance ────────────────────────
+            # heading_score ∈ [0, 1]: 1.0 = straight ahead, 0.0 = directly behind.
+            bearing    = math.atan2(wy - robot_y, wx - robot_x)
+            angle_diff = abs(math.atan2(
+                math.sin(bearing - self.robot_yaw),
+                math.cos(bearing - self.robot_yaw)
+            ))  # in [0, π]
+
+            heading_score = (1.0 + math.cos(angle_diff)) / 2.0
+
+            # Hard penalty for U-turns (>150°): multiplied before dividing distance
+            if angle_diff > math.radians(150):
+                heading_score *= 0.1
+
+            # Floor avoids division by zero for pure U-turns (heading_score ≈ 0)
+            _HEADING_FLOOR = 0.05
+            perceived_dist = dist / max(heading_score, _HEADING_FLOOR)
+
+            candidates.append((dist, perceived_dist, area_m2, heading_score, wx, wy))
 
         if not candidates:
             return None
 
-        # --- Normalise each metric to [0, 1] across candidates ---
-        dists   = [c[0] for c in candidates]
-        areas   = [c[1] for c in candidates]
+        # ── Normalise perceived distance and area to [0, 1] ───────────────
+        perc_dists = [c[1] for c in candidates]
+        areas      = [c[2] for c in candidates]
 
-        min_d, max_d = min(dists), max(dists)
-        min_a, max_a = min(areas), max(areas)
+        min_pd, max_pd = min(perc_dists), max(perc_dists)
+        min_a,  max_a  = min(areas),      max(areas)
 
-        range_d = max_d - min_d if max_d > min_d else 1.0
-        range_a = max_a - min_a if max_a > min_a else 1.0
+        range_pd = max_pd - min_pd if max_pd > min_pd else 1.0
+        range_a  = max_a  - min_a  if max_a  > min_a  else 1.0
 
-        # --- Score: higher is better ---
         best_score    = -float('inf')
         best_centroid = None
 
-        for (dist, area_m2, wx, wy) in candidates:
-            norm_prox = 1.0 - (dist  - min_d) / range_d   # closer  → higher
-            norm_area = (area_m2 - min_a) / range_a        # larger  → higher
+        for (dist, perceived_dist, area_m2, heading_score, wx, wy) in candidates:
+            norm_prox = 1.0 - (perceived_dist - min_pd) / range_pd
+            norm_area = (area_m2 - min_a) / range_a
 
             score = self.w_dist * norm_prox + self.w_size * norm_area
 
             self.get_logger().debug(
                 f'Frontier ({wx:.2f},{wy:.2f}) | dist={dist:.2f}m '
-                f'area={area_m2:.3f}m² | score={score:.3f}')
+                f'angle={math.degrees(angle_diff):.1f}° '
+                f'h={heading_score:.3f} perc_d={perceived_dist:.2f}m | '
+                f'score={score:.3f}')
 
             if score > best_score:
                 best_score    = score
@@ -562,17 +786,17 @@ class FrontierExplorer(Node):
     def _safe_goal(self, wx: float, wy: float) -> tuple | None:
         """
         Walks from the frontier centroid toward the robot, step by step.
-        Accepts the first cell that is FREE and has no OCCUPIED neighbour
-        within inflation_radius cells — approximating the inflated drone map
-        without needing direct access to it.
+        Validates against the DRONE map (same map A* uses) so that goals
+        that pass this check will also pass A*'s lethal cell check.
+        Falls back to SLAM map if drone map hasn't arrived yet.
         """
         robot_x, robot_y = self.robot_x, self.robot_y
-        step = self.map_resolution * 2.0   # step 2 cells at a time toward robot
+        step = self.map_resolution * 2.0
 
-        # How many cells to check around the candidate for obstacles
-        # Matches AStarPlanner2 default inflation_radius=0.20m / 0.05 res = 4 cells
-        # After — use a parameter so it can be tuned to match astar_planner2's inflation
         clear_radius_cells = max(1, int(self.safe_goal_radius / self.map_resolution))
+
+        # Use drone map for validation if available — matches what A* sees
+        check_map = self.drone_map_data if self.drone_map_received else self.map_data
 
         dx = robot_x - wx
         dy = robot_y - wy
@@ -580,12 +804,10 @@ class FrontierExplorer(Node):
         if dist < 1e-6:
             return None
 
-        # Unit vector toward robot
         ux = dx / dist
         uy = dy / dist
 
-        # Try up to 20 steps toward robot
-        for i in range(20):
+        for i in range(40):
             cx = wx + ux * step * i
             cy = wy + uy * step * i
 
@@ -595,10 +817,11 @@ class FrontierExplorer(Node):
             if not (0 <= ci < self.map_width and 0 <= cj < self.map_height):
                 continue
 
+            # Must be free in SLAM map (known free space)
             if int(self.map_data[cj, ci]) != FREE:
                 continue
 
-            # Must have no OCCUPIED cell within clear_radius_cells
+            # Must be clear in drone map (no lethal inflation)
             obstacle_nearby = False
             for dj in range(-clear_radius_cells, clear_radius_cells + 1):
                 for di in range(-clear_radius_cells, clear_radius_cells + 1):
@@ -606,7 +829,7 @@ class FrontierExplorer(Node):
                     nj = cj + dj
                     if not (0 <= ni < self.map_width and 0 <= nj < self.map_height):
                         continue
-                    if int(self.map_data[nj, ni]) >= LETHAL_THRESHOLD:
+                    if int(check_map[nj, ni]) >= LETHAL_THRESHOLD:
                         obstacle_nearby = True
                         break
                 if obstacle_nearby:
@@ -621,6 +844,18 @@ class FrontierExplorer(Node):
     def _is_blacklisted(self, wx: float, wy: float) -> bool:
         for (gx, gy) in self.visited_goals:
             if math.hypot(wx - gx, wy - gy) < self.goal_blacklist_radius:
+                return True
+        return False
+
+    def _is_recently_reached(self, wx: float, wy: float) -> bool:
+        now = self.get_clock().now().nanoseconds * 1e-9
+        # Expire old entries first
+        self.reached_goals = [
+            (gx, gy, t) for (gx, gy, t) in self.reached_goals
+            if now - t < self.reached_blacklist_ttl
+        ]
+        for (gx, gy, _t) in self.reached_goals:
+            if math.hypot(wx - gx, wy - gy) < self.reached_blacklist_radius:
                 return True
         return False
 
@@ -713,6 +948,23 @@ class FrontierExplorer(Node):
         """Call this when the mission switches to HOMING — discard current goal."""
         self.current_goal_x = None
         self.current_goal_y = None
+
+    def _yaw_from_quaternion(self, q) -> float:
+        return math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        )
+    
+
+    def _reset_state(self):
+        """Full state reset — called on init and whenever active goes False."""
+        self.current_goal_x          = None
+        self.current_goal_y          = None
+        self._last_published_goal    = None
+        self.visited_goals           = []
+        self.reached_goals           = []
+        self._frontier_goal_dirty    = False
+        self.get_logger().info('FrontierExplorer state reset.')
 
 
 # ==============================================================================

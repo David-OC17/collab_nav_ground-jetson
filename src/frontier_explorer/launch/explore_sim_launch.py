@@ -31,15 +31,15 @@ def generate_launch_description():
     # Launch arguments
     # ------------------------------------------------------------------
     args = [
-        DeclareLaunchArgument('scenario',          default_value='room2',
-            description='Map scenario: room | room2 | corridor'),
+        DeclareLaunchArgument('scenario',          default_value='room3',
+            description='Map scenario: room1 | room2 | room3'),
         DeclareLaunchArgument('map_resolution',    default_value='0.05',
             description='Map resolution in m/cell'),
-        DeclareLaunchArgument('map_width_m',       default_value='12.0',
+        DeclareLaunchArgument('map_width_m',       default_value='4.0',
             description='Map width in metres'),
-        DeclareLaunchArgument('map_height_m',      default_value='12.0',
+        DeclareLaunchArgument('map_height_m',      default_value='4.0',
             description='Map height in metres'),
-        DeclareLaunchArgument('sensor_range_m',    default_value='4.0',
+        DeclareLaunchArgument('sensor_range_m',    default_value='1.0',
             description='Simulated SLAM sensor reveal range in metres'),
         DeclareLaunchArgument('publish_rate',      default_value='2.0',
             description='SLAM map publish rate in Hz'),
@@ -49,16 +49,23 @@ def generate_launch_description():
         DeclareLaunchArgument('goal_reached_dist', default_value='0.35',
             description='Distance to ArUco goal that triggers DONE (m)'),
 
-        DeclareLaunchArgument('w_dist',            default_value='0.7',
+        DeclareLaunchArgument('w_dist',            default_value='0.85',
             description='Frontier scoring weight for proximity'),
-        DeclareLaunchArgument('w_size',            default_value='0.3',
+        DeclareLaunchArgument('w_size',            default_value='0.15',
             description='Frontier scoring weight for cluster area'),
+        DeclareLaunchArgument('w_heading',         default_value='0.40',
+            description='Frontier scoring weight for heading changes'),
         DeclareLaunchArgument('min_cluster_size',  default_value='5',
             description='Minimum frontier cluster size in cells'),
         DeclareLaunchArgument('max_frontier_dist', default_value='8.0',
             description='Maximum frontier distance in metres'),
         DeclareLaunchArgument('update_rate',       default_value='1.0',
             description='Frontier explorer update rate in Hz'),
+
+        DeclareLaunchArgument('min_goal_dist',    default_value='0.40',
+            description='Ignore frontier goals closer than this (m)'),
+        DeclareLaunchArgument('goal_reached_dist', default_value='0.12',
+            description='Distance at which robot is considered to have reached frontier (m)'),
 
         DeclareLaunchArgument('max_speed',         default_value='0.30',
             description='Spline follower max speed in m/s'),
@@ -74,6 +81,14 @@ def generate_launch_description():
             description='Launch RViz (true/false)'),
         DeclareLaunchArgument('odom_topic', default_value='',
             description='EKF odometry topic for real robot (empty = simulation mode)'),
+
+        DeclareLaunchArgument('robot_start_x', default_value='1.7'),
+        DeclareLaunchArgument('robot_start_y', default_value='1.7'),
+
+        DeclareLaunchArgument('aruco_marker_x', default_value='-1.7',
+            description='Simulated ArUco marker world X position (m)'),
+        DeclareLaunchArgument('aruco_marker_y', default_value='-1.7',
+            description='Simulated ArUco marker world Y position (m)'),
     ]
 
     # ------------------------------------------------------------------
@@ -92,6 +107,11 @@ def generate_launch_description():
             'map_height_m':         LaunchConfiguration('map_height_m'),
             'sensor_range_m':       LaunchConfiguration('sensor_range_m'),
             'publish_rate':         LaunchConfiguration('publish_rate'),
+            'max_camera_range_m':   1.5,   # camera sees ~1.5 m ahead, not entire room
+            'camera_hfov_deg':      69.4,
+            'camera_near_m':        0.15,
+            'robot_start_x':        LaunchConfiguration('robot_start_x'),
+            'robot_start_y':        LaunchConfiguration('robot_start_y'),
         }]
     )
 
@@ -101,18 +121,23 @@ def generate_launch_description():
         name='frontier_explorer',
         output='screen',
         parameters=[{
-            'map_topic':            '/slam/map',   # ← partial SLAM map
-            'pose_topic':           '/follower/pose',
-            'goal_topic':           '/frontier/goal',
-            'world_frame':          LaunchConfiguration('world_frame'),
-            'w_dist':               LaunchConfiguration('w_dist'),
-            'w_size':               LaunchConfiguration('w_size'),
-            'min_cluster_size':     LaunchConfiguration('min_cluster_size'),
-            'max_frontier_dist':    LaunchConfiguration('max_frontier_dist'),
-            'update_rate':          LaunchConfiguration('update_rate'),
-            'active':               False,          # starts silent, controller activates it
-            'odom_topic':           LaunchConfiguration('odom_topic'), 
-            'safe_goal_radius': 0.45,   # slightly larger than astar's inflation+robot radius
+            'map_topic':                '/slam/map',
+            'pose_topic':               '/follower/pose',
+            'goal_topic':               '/frontier/goal',
+            'world_frame':              LaunchConfiguration('world_frame'),
+            'w_dist':                   LaunchConfiguration('w_dist'),
+            'w_size':                   LaunchConfiguration('w_size'),
+            'w_heading':                LaunchConfiguration('w_heading'),
+            'min_cluster_size':         LaunchConfiguration('min_cluster_size'),
+            'max_frontier_dist':        LaunchConfiguration('max_frontier_dist'),
+            'update_rate':              LaunchConfiguration('update_rate'),
+            'active':                   False,
+            'odom_topic':               LaunchConfiguration('odom_topic'),
+            'min_goal_dist':            LaunchConfiguration('min_goal_dist'),
+            'goal_reached_dist':        LaunchConfiguration('goal_reached_dist'),
+            'safe_goal_radius':         0.20,   # tighter for 4×4 m map
+            'require_camera_coverage':  False,
+            'fov_map_topic':            '/camera/fov_map',
         }]
     )
 
@@ -159,6 +184,10 @@ def generate_launch_description():
         executable='odom_to_pose',
         name='odom_to_pose',
         output='screen',
+        parameters=[{
+            'robot_start_x': LaunchConfiguration('robot_start_x'),
+            'robot_start_y': LaunchConfiguration('robot_start_y'),
+        }]
     )
 
     pose_to_tf = Node(
@@ -168,16 +197,22 @@ def generate_launch_description():
         output='screen',
     )
 
-    # aruco_detector = Node(
-    #     package='frontier_explorer',
-    #     executable='aruco_detector',
-    #     name='aruco_detector',
-    #     output='screen',
-    #     parameters=[{
-    #         'world_frame':          LaunchConfiguration('world_frame'),
-    #         'robot_base_frame':     LaunchConfiguration('robot_base_frame'),
-    #     }]
-    # )
+    fake_aruco_detector = Node(
+    package='frontier_explorer',
+    executable='fake_aruco_detector',
+    name='fake_aruco_detector',
+    output='screen',
+    parameters=[{
+        'marker_x':        LaunchConfiguration('aruco_marker_x'),
+        'marker_y':        LaunchConfiguration('aruco_marker_y'),
+        'marker_id':       LaunchConfiguration('target_marker_id'),
+        'camera_hfov_deg': 69.4,    # must match fake_map_publisher
+        'camera_range_m':  4.0,     # must match fake_map_publisher
+        'camera_near_m':   0.15,    # must match fake_map_publisher
+        'publish_rate':    10.0,
+        'world_frame':     LaunchConfiguration('world_frame'),
+    }]
+)
 
     rviz_node = Node(
         package='rviz2',
@@ -194,7 +229,10 @@ def generate_launch_description():
         explorer_controller,
         astar_planner,
         spline_follower,
-        # aruco_detector,
+        fake_aruco_detector,
+        # camera_fov_tracker — not used in sim; fake_map_publisher publishes
+        # /camera/fov_map directly using the robot pose + yaw wedge geometry.
+        # Re-enable for real robot deployment.
         odom_to_pose,
         pose_to_tf,
         rviz_node,

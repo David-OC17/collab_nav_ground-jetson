@@ -2,33 +2,48 @@
 """
 Fake Map Publisher for ROS 2 Humble
 =====================================
-Publishes two OccupancyGrid maps for simulation:
+Publishes three OccupancyGrid maps for simulation:
 
-  /drone/map  — complete, fully known map. Published once at startup and
-                latched. Used by AStarPlanner2 for safe path planning.
+  /drone/map      — complete, fully known map. Published once at startup
+                    and latched. Used by AStarPlanner2 for safe path planning.
 
-  /slam/map   — partial map that starts fully unknown (-1) and progressively
-                reveals cells as the robot moves, simulating onboard SLAM.
-                Used by FrontierExplorer to detect frontier boundaries.
-                Reveal uses Bresenham line-of-sight raycast from each visited
-                robot position within sensor_range_m.
+  /slam/map       — partial map that starts fully unknown (-1) and progressively
+                    reveals cells as the robot moves, simulating onboard LIDAR
+                    SLAM with a 360-degree sensor. Used by FrontierExplorer.
+
+  /camera/fov_map — cells that have been seen by the simulated RGB camera.
+                    The camera is modelled as a forward-facing wedge:
+                      • H-FOV  ±34.7°  (D435i colour sensor at 69.4° total)
+                      • Range  0.15 m … 4.0 m  (scaled for 4 m map)
+                    Line-of-sight blocked by occupied cells, same as SLAM.
+                    Published as 0 (unseen) / 100 (seen) and latched.
 
 Subscribes:
-  - /follower/pose  (geometry_msgs/PoseWithCovarianceStamped) — robot pose
-    Used to grow the SLAM map reveal as the robot explores.
+  - /follower/pose  (geometry_msgs/PoseWithCovarianceStamped) — robot pose + yaw
 
 Publishes:
-  - /drone/map  (nav_msgs/OccupancyGrid, TRANSIENT_LOCAL) — full fused map
-  - /slam/map   (nav_msgs/OccupancyGrid, TRANSIENT_LOCAL) — partial SLAM map
+  - /drone/map      (nav_msgs/OccupancyGrid, TRANSIENT_LOCAL) — full map
+  - /slam/map       (nav_msgs/OccupancyGrid, TRANSIENT_LOCAL) — growing LIDAR map
+  - /camera/fov_map (nav_msgs/OccupancyGrid, TRANSIENT_LOCAL) — camera seen mask
+
+Scenarios (4 × 4 m room, origin at centre → extents −2 … +2 m):
+  room1    — scattered pillars and a partial wall creating blind corners
+  room2    — L-shaped wall dividing the space with small box obstacles
+  room3    — two tall vertical bars near opposite walls, corridor between them
 
 Parameters:
-  scenario              'room'   — environment: 'room' | 'room2' | 'corridor'
+  scenario              'room3'  — environment: 'room1' | 'room2' | 'room3'
   map_resolution        0.05     m/cell
-  map_width_m           12.0     m
-  map_height_m          12.0     m
-  publish_rate          2.0      Hz  — how often to republish /slam/map
-  sensor_range_m        4.0      m   — robot sensor reveal radius
-  position_log_spacing  0.20     m   — min distance moved before logging new pose
+  map_width_m           4.0      m
+  map_height_m          4.0      m
+  publish_rate          2.0      Hz
+  sensor_range_m        2.0      m   — LIDAR reveal radius (360°)
+  max_camera_range_m    4.0      m   — camera far-clip distance
+  camera_hfov_deg       69.4     °   — D435i colour sensor H-FOV
+  camera_near_m         0.15     m   — near-clip
+  position_log_spacing  0.10     m
+  robot_start_x        -1.5      m   — initial pose logged on first tick
+  robot_start_y        -1.5      m
 """
 
 import math
@@ -49,21 +64,32 @@ class FakeMapPublisher(Node):
         # ------------------------------------------------------------------
         # Parameters
         # ------------------------------------------------------------------
-        self.declare_parameter('scenario',             'room')
+        self.declare_parameter('scenario',             'room3')
         self.declare_parameter('map_resolution',       0.05)
-        self.declare_parameter('map_width_m',          12.0)
-        self.declare_parameter('map_height_m',         12.0)
+        self.declare_parameter('map_width_m',          4.0)
+        self.declare_parameter('map_height_m',         4.0)
         self.declare_parameter('publish_rate',         2.0)
-        self.declare_parameter('sensor_range_m',       4.0)
-        self.declare_parameter('position_log_spacing', 0.20)
+        self.declare_parameter('sensor_range_m',       2.0)
+        self.declare_parameter('max_camera_range_m',   4.0)
+        self.declare_parameter('camera_hfov_deg',      69.4)
+        self.declare_parameter('camera_near_m',        0.15)
+        self.declare_parameter('position_log_spacing', 0.10)
+        self.declare_parameter('robot_start_x',       1.7)
+        self.declare_parameter('robot_start_y',       1.7)
 
-        self.scenario      = self.get_parameter('scenario').value
-        self.map_res       = float(self.get_parameter('map_resolution').value)
-        self.map_width_m   = float(self.get_parameter('map_width_m').value)
-        self.map_height_m  = float(self.get_parameter('map_height_m').value)
-        self.publish_rate  = float(self.get_parameter('publish_rate').value)
-        self.sensor_range  = float(self.get_parameter('sensor_range_m').value)
-        self.log_spacing   = float(self.get_parameter('position_log_spacing').value)
+        self.scenario          = self.get_parameter('scenario').value
+        self.map_res           = float(self.get_parameter('map_resolution').value)
+        self.map_width_m       = float(self.get_parameter('map_width_m').value)
+        self.map_height_m      = float(self.get_parameter('map_height_m').value)
+        self.publish_rate      = float(self.get_parameter('publish_rate').value)
+        self.sensor_range      = float(self.get_parameter('sensor_range_m').value)
+        self.camera_range      = float(self.get_parameter('max_camera_range_m').value)
+        self.camera_half_angle = math.radians(
+            float(self.get_parameter('camera_hfov_deg').value) / 2.0)
+        self.camera_near       = float(self.get_parameter('camera_near_m').value)
+        self.log_spacing       = float(self.get_parameter('position_log_spacing').value)
+        self.robot_start_x     = float(self.get_parameter('robot_start_x').value)
+        self.robot_start_y     = float(self.get_parameter('robot_start_y').value)
 
         # Derived
         self.map_cells_x  = int(self.map_width_m  / self.map_res)
@@ -74,14 +100,19 @@ class FakeMapPublisher(Node):
         # ------------------------------------------------------------------
         # State
         # ------------------------------------------------------------------
-        self.visited_positions = []       # list of (x, y) robot has visited
-        self._last_logged_pos  = None     # last position we logged
+        self.visited_poses: list[tuple[float, float, float]] = []
+        self._last_logged_pos = None
 
-        # Pre-build the full grid once — reused for drone map and LoS checks
+        # Persistent camera-seen boolean mask
+        self._camera_seen = [False] * (self.map_cells_x * self.map_cells_y)
+
         self._full_grid = self._build_full_grid()
 
+        # Seed the LIDAR reveal at start position (yaw unknown — no camera wedge yet)
+        self._log_pose(self.robot_start_x, self.robot_start_y, None)
+
         # ------------------------------------------------------------------
-        # QoS — latched so late subscribers always receive the map
+        # QoS
         # ------------------------------------------------------------------
         latched_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -99,15 +130,16 @@ class FakeMapPublisher(Node):
         # Publishers
         # ------------------------------------------------------------------
         self.drone_map_pub = self.create_publisher(
-            OccupancyGrid, '/drone/map', latched_qos)
-
-        self.slam_map_pub = self.create_publisher(
-            OccupancyGrid, '/slam/map', latched_qos)
+            OccupancyGrid, '/drone/map',      latched_qos)
+        self.slam_map_pub  = self.create_publisher(
+            OccupancyGrid, '/slam/map',       latched_qos)
+        self.cam_fov_pub   = self.create_publisher(
+            OccupancyGrid, '/camera/fov_map', latched_qos)
 
         # ------------------------------------------------------------------
         # Subscriber
         # ------------------------------------------------------------------
-        self.pose_sub = self.create_subscription(
+        self.create_subscription(
             PoseWithCovarianceStamped,
             '/follower/pose',
             self._pose_callback,
@@ -115,103 +147,142 @@ class FakeMapPublisher(Node):
         )
 
         # ------------------------------------------------------------------
-        # Publish drone map once (full, latched)
+        # Startup publications
         # ------------------------------------------------------------------
         self.drone_map_pub.publish(self._make_msg(self._full_grid))
+        self.slam_map_pub.publish(self._make_msg(
+            [-1] * (self.map_cells_x * self.map_cells_y)))
+        self.cam_fov_pub.publish(self._make_msg(
+            [0]  * (self.map_cells_x * self.map_cells_y)))
+
         self.get_logger().info(
             f'FakeMapPublisher ready\n'
             f'  scenario     = {self.scenario}\n'
-            f'  size         = {self.map_cells_x} x {self.map_cells_y} cells\n'
+            f'  map size     = {self.map_width_m} × {self.map_height_m} m  '
+            f'({self.map_cells_x} × {self.map_cells_y} cells)\n'
             f'  resolution   = {self.map_res} m/cell\n'
-            f'  sensor_range = {self.sensor_range} m\n'
-            f'  /drone/map published (full, latched)\n'
-            f'  /slam/map   will grow as robot moves'
+            f'  LIDAR range  = {self.sensor_range} m (360°)\n'
+            f'  Camera H-FOV = {math.degrees(self.camera_half_angle*2):.1f}°  '
+            f'range {self.camera_near:.2f}–{self.camera_range:.1f} m\n'
+            f'  robot start  = ({self.robot_start_x}, {self.robot_start_y})'
         )
 
-        # Publish an initial fully-unknown SLAM map immediately
-        unknown_grid = [-1] * (self.map_cells_x * self.map_cells_y)
-        self.slam_map_pub.publish(self._make_msg(unknown_grid))
-
-        # ------------------------------------------------------------------
-        # Timer — republish growing SLAM map
-        # ------------------------------------------------------------------
-        self.create_timer(1.0 / self.publish_rate, self._publish_slam_map)
+        self.create_timer(1.0 / self.publish_rate, self._publish_maps)
 
     # ==========================================================================
-    # Pose callback — log position if robot moved enough
+    # Pose callback
     # ==========================================================================
 
     def _pose_callback(self, msg: PoseWithCovarianceStamped):
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
-
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        )
         if self._last_logged_pos is None or \
                 math.hypot(x - self._last_logged_pos[0],
                            y - self._last_logged_pos[1]) >= self.log_spacing:
-            self.visited_positions.append((x, y))
-            self._last_logged_pos = (x, y)
+            self._log_pose(x, y, yaw)   # real yaw from odometry
+
+    def _log_pose(self, x: float, y: float, yaw: float | None):
+        self.visited_poses.append((x, y, yaw or 0.0))
+        self._last_logged_pos = (x, y)
+        # Only paint the camera wedge when we have a real yaw from odometry
+        if yaw is not None:
+            self._update_camera_seen(x, y, yaw)
 
     # ==========================================================================
-    # SLAM map publisher — grows as robot visits new positions
+    # Timer — publish all three maps
     # ==========================================================================
 
-    def _publish_slam_map(self):
+    def _publish_maps(self):
         slam_grid = self._build_partial_slam_grid()
         self.slam_map_pub.publish(self._make_msg(slam_grid))
 
+        fov_grid = [100 if s else 0 for s in self._camera_seen]
+        self.cam_fov_pub.publish(self._make_msg(fov_grid))
+
         revealed = sum(1 for c in slam_grid if c != -1)
+        cam_seen = sum(self._camera_seen)
         total    = len(slam_grid)
         self.get_logger().debug(
-            f'SLAM map: {revealed}/{total} cells revealed '
-            f'({100*revealed/total:.1f}%) | '
-            f'{len(self.visited_positions)} poses logged',
+            f'SLAM {100*revealed/total:.1f}% | '
+            f'Camera {100*cam_seen/total:.1f}% | '
+            f'{len(self.visited_poses)} poses',
             throttle_duration_sec=2.0)
 
     # ==========================================================================
-    # Partial SLAM grid — Bresenham line-of-sight reveal
+    # LIDAR — 360° circle reveal with LoS
     # ==========================================================================
 
     def _build_partial_slam_grid(self) -> list:
-        """
-        Starts fully unknown (-1). For each logged robot position, reveals
-        all cells within sensor_range_m that have clear line-of-sight.
-        """
         revealed = [-1] * (self.map_cells_x * self.map_cells_y)
         sensor_cells = int(self.sensor_range / self.map_res)
 
-        for (rx, ry) in self.visited_positions:
+        for (rx, ry, _yaw) in self.visited_poses:
             rci = int((rx - self.map_origin_x) / self.map_res)
             rcj = int((ry - self.map_origin_y) / self.map_res)
 
             for dj in range(-sensor_cells, sensor_cells + 1):
                 for di in range(-sensor_cells, sensor_cells + 1):
+                    if math.sqrt(di*di + dj*dj) > sensor_cells:
+                        continue
                     ci = rci + di
                     cj = rcj + dj
-
                     if not (0 <= ci < self.map_cells_x and
                             0 <= cj < self.map_cells_y):
                         continue
-
-                    if math.sqrt(di*di + dj*dj) > sensor_cells:
-                        continue
-
                     if self._has_line_of_sight(rci, rcj, ci, cj):
                         idx = cj * self.map_cells_x + ci
                         revealed[idx] = self._full_grid[idx]
 
         return revealed
 
+    # ==========================================================================
+    # Camera — forward wedge, accumulated
+    # ==========================================================================
+
+    def _update_camera_seen(self, rx: float, ry: float, yaw: float):
+        rci = int((rx - self.map_origin_x) / self.map_res)
+        rcj = int((ry - self.map_origin_y) / self.map_res)
+
+        far_cells  = int(self.camera_range / self.map_res)
+        near_cells = max(1, int(self.camera_near / self.map_res))
+
+        for dj in range(-far_cells, far_cells + 1):
+            for di in range(-far_cells, far_cells + 1):
+                dist_cells = math.sqrt(di * di + dj * dj)
+                if dist_cells < near_cells or dist_cells > far_cells:
+                    continue
+                ci = rci + di
+                cj = rcj + dj
+                if not (0 <= ci < self.map_cells_x and
+                        0 <= cj < self.map_cells_y):
+                    continue
+                # atan2(dj, di): dj=world ΔY, di=world ΔX — correct in ROS grid
+                cell_angle = math.atan2(dj, di)
+                # Robust wrap into (−π, +π] avoiding modulo edge cases
+                delta = math.atan2(
+                    math.sin(cell_angle - yaw),
+                    math.cos(cell_angle - yaw)
+                )
+                if abs(delta) > self.camera_half_angle:
+                    continue
+                if self._has_line_of_sight(rci, rcj, ci, cj):
+                    self._camera_seen[cj * self.map_cells_x + ci] = True
+
+    # ==========================================================================
+    # Bresenham LoS
+    # ==========================================================================
+
     def _has_line_of_sight(self, x0: int, y0: int,
                             x1: int, y1: int) -> bool:
-        """
-        Bresenham raycast from (x0,y0) to (x1,y1).
-        Returns False if any intermediate cell is lethal (value >= 100).
-        """
         dx = abs(x1 - x0); sx = 1 if x0 < x1 else -1
         dy = abs(y1 - y0); sy = 1 if y0 < y1 else -1
         err = dx - dy
         x, y = x0, y0
-
         while True:
             if (x, y) == (x1, y1):
                 return True
@@ -249,70 +320,90 @@ class FakeMapPublisher(Node):
     # ==========================================================================
 
     def _build_full_grid(self) -> list:
-        size = self.map_cells_x * self.map_cells_y
-        grid = [0] * size
-
-        if self.scenario == 'room':
-            self._build_room(grid)
-        elif self.scenario == 'room2':
-            self._build_room2(grid)
-        elif self.scenario == 'corridor':
-            self._build_corridor(grid)
+        grid = [0] * (self.map_cells_x * self.map_cells_y)
+        builders = {
+            'room1': self._build_room1,
+            'room2': self._build_room2,
+            'room3': self._build_room3,
+        }
+        if self.scenario in builders:
+            builders[self.scenario](grid)
         else:
             self.get_logger().warn(
-                f'Unknown scenario "{self.scenario}" — using empty room.')
-            self._rect(grid, -4.0, -4.0, 8.0, 8.0, fill=False)
-
+                f'Unknown scenario "{self.scenario}" — valid: room1 | room2 | room3')
+            self._build_room1(grid)
         return grid
 
     # ==========================================================================
-    # Scenario builders
+    # Scenario builders  (4 × 4 m, origin at centre, extents −2 … +2 m)
     # ==========================================================================
 
-    def _build_room(self, grid: list):
-        self._rect(grid, -4.0, -4.0, 8.0, 8.0, fill=False)
-        self._rect(grid, -2.5, -2.5, 0.5, 0.5, fill=True)
-        self._rect(grid,  2.0, -2.5, 0.5, 0.5, fill=True)
-        self._rect(grid, -2.5,  2.0, 0.5, 0.5, fill=True)
-        self._rect(grid,  2.0,  2.0, 0.5, 0.5, fill=True)
+    def _build_room1(self, grid: list):
+        """
+        Random-ish scatter: four small square pillars near the corners and a
+        short diagonal-ish wall in the centre-left, creating blind pockets that
+        the LIDAR maps but the camera may not see.
 
-    def _build_corridor(self, grid: list):
-        self._rect(grid, -5.0, -0.75, 10.0, 1.5, fill=False)
-        for ox, oy in [(-3.5, -0.3), (-1.5, 0.3), (0.5, -0.3),
-                       ( 2.0,  0.3), ( 3.5, -0.3)]:
-            self._rect(grid, ox - 0.15, oy - 0.15, 0.3, 0.3, fill=True)
+        Walls at ±2 m, obstacles well inside so the robot has room to navigate.
+        """
+        # Outer walls
+        self._rect(grid, -2.0, -2.0, 4.0, 4.0, fill=False)
+
+        # Four corner pillars (0.3 × 0.3 m), inset 0.5 m from each corner
+        self._rect(grid, -1.7, -1.7, 0.3, 0.3, fill=True)   # SW
+        self._rect(grid,  1.4, -1.7, 0.3, 0.3, fill=True)   # SE
+        self._rect(grid, -1.7,  1.4, 0.3, 0.3, fill=True)   # NW
+        self._rect(grid,  1.4,  1.4, 0.3, 0.3, fill=True)   # NE
+
+        # Short wall stub from the west side towards the centre
+        self._rect(grid, -2.0, -0.15, 1.0, 0.15, fill=True)
+
+        # Small isolated box near centre-right
+        self._rect(grid,  0.5, -0.4, 0.3, 0.3, fill=True)
 
     def _build_room2(self, grid: list):
-        self._rect(grid, -4.0, -4.0, 8.0, 8.0, fill=False)
-        self._rect(grid, -3.8,  1.3,  3.2, 0.2, fill=True)
-        self._rect(grid,  0.6,  1.3,  3.2, 0.2, fill=True)
-        self._rect(grid, -3.2,  2.2,  0.4, 0.4, fill=True)
-        self._rect(grid,  1.5,  0.0,  0.8, 0.8, fill=True)
-        self._rect(grid, -1.5, -0.8,  0.25, 1.6, fill=True)
-        self._rect(grid,  2.5, -3.2,  0.5, 0.5, fill=True)
-        self._rect(grid, -3.5, -3.5,  0.2, 2.5, fill=True)
-        self._rect(grid, -3.5, -3.5,  2.0, 0.2, fill=True)
-        self._rect(grid,  1.5, -3.5,  0.2, 2.0, fill=True)
-        self._rect(grid,  3.2, -3.5,  0.2, 2.0, fill=True)
-        self._rect(grid,  1.5, -3.5,  1.9, 0.2, fill=True)
-        for ox, oy in [(-2.5,-1.5),(-1.8,-0.5),(-1.0,0.5),(-0.2,1.0)]:
-            self._rect(grid, ox, oy, 0.35, 0.35, fill=True)
-        self._rect(grid,  2.2, -1.5,  1.5, 0.2, fill=True)
-        self._rect(grid,  2.2, -1.5,  0.2, 1.0, fill=True)
-        self._rect(grid,  1.0, -2.5,  1.4, 0.2, fill=True)
-        self._rect(grid,  2.2, -2.5,  0.2, 0.8, fill=True)
-        self._rect(grid,  2.2, -3.3,  1.5, 0.2, fill=True)
-        for ox, oy in [(2.0,2.5),(2.6,2.0),(3.0,2.8),(2.3,3.2)]:
-            self._rect(grid, ox, oy, 0.3, 0.3, fill=True)
-        self._rect(grid, -3.0, -0.1,  2.0, 0.15, fill=True)
-        self._rect(grid,  0.5, -0.1,  1.0, 0.15, fill=True)
+        """
+        L-shaped wall dividing the room into two connected zones, plus two
+        small box obstacles to create additional occlusion.
+
+        The gap in the L-wall is wide enough for the robot to pass through.
+        """
+        # Outer walls
+        self._rect(grid, -2.0, -2.0, 4.0, 4.0, fill=False)
+
+        # L-shaped divider:
+        #   horizontal arm — runs from the west wall almost to centre
+        self._rect(grid, -2.0,  0.2, 1.6, 0.15, fill=True)
+        #   vertical arm — drops from the end of the horizontal arm downward
+        self._rect(grid, -0.55, -0.8, 0.15, 1.0, fill=True)
+
+        # Two small square boxes on the eastern side
+        self._rect(grid,  0.8, -1.4, 0.3, 0.3, fill=True)
+        self._rect(grid,  0.8,  0.8, 0.3, 0.3, fill=True)
+
+    def _build_room3(self, grid: list):
+        """
+        Two tall narrow vertical bars in the middle area of the room,
+        staggered so there is a corridor between them.
+
+          Left bar:  x ∈ [−1.3, −0.9],  y ∈ [−1.8,  0.0]  (lower half)
+          Right bar: x ∈ [ 0.9,  1.3],  y ∈ [ 0.0,  1.8]  (upper half)
+        """
+        # Outer walls
+        self._rect(grid, -2.0, -2.0, 4.0, 4.0, fill=False)
+
+        # Left bar — lower half, shifted toward centre
+        self._rect(grid, -1.3, -1.8, 0.4, 1.8, fill=True)
+
+        # Right bar — upper half, shifted toward centre
+        self._rect(grid,  0.9,  0.0, 0.4, 1.8, fill=True)
 
     # ==========================================================================
-    # Primitive
+    # Rect primitive  _rect(grid, x, y, w, h)  — bottom-left corner + size
     # ==========================================================================
 
     def _rect(self, grid: list, x: float, y: float,
-              w: float, h: float, thickness: float = 0.15,
+              w: float, h: float, thickness: float = 0.10,
               fill: bool = False):
         ci0 = max(0, min(int((x     - self.map_origin_x) / self.map_res),
                          self.map_cells_x - 1))

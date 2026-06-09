@@ -11,6 +11,7 @@ Visualization Manager:
   Class: ""
   Displays:
 
+    # ── Base layer: drone/full map (solid, bottom) ──────────────────────────
     - Alpha: 1.0
       Class: rviz_default_plugins/Map
       Color Scheme: map
@@ -25,11 +26,12 @@ Visualization Manager:
       Use Timestamp: false
       Value: true
 
-    - Alpha: 0.6
+    # ── SLAM map: what the LIDAR has seen (semi-transparent over drone) ─────
+    - Alpha: 0.65
       Class: rviz_default_plugins/Map
       Color Scheme: map
       Enabled: true
-      Name: SLAM Map
+      Name: SLAM Map (LIDAR)
       Topic:
         Depth: 1
         Durability Policy: Transient Local
@@ -39,6 +41,36 @@ Visualization Manager:
       Use Timestamp: false
       Value: true
 
+    # ── Camera FOV mask: cells the RGB camera has ever seen ─────────────────
+    # Rendered as a costmap (raw): free=0 shows transparent, seen=100 shows
+    # as a distinct colour on top of the SLAM layer.
+    - Alpha: 0.55
+      Class: rviz_default_plugins/Map
+      Color Scheme: costmap
+      Enabled: true
+      Name: Camera FOV (seen)
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /camera/fov_map
+      Use Timestamp: false
+      Value: true
+
+    # ── Current-frame camera frustum footprint (live wedge on floor) ────────
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Camera FOV footprint
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /camera/fov_marker
+      Value: true
+
+    # ── Frontier clusters ────────────────────────────────────────────────────
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: Frontiers
@@ -50,6 +82,7 @@ Visualization Manager:
         Value: /frontier/markers
       Value: true
 
+    # ── A* planned path ──────────────────────────────────────────────────────
     - Alpha: 1.0
       Buffer Length: 1
       Class: rviz_default_plugins/Path
@@ -74,26 +107,60 @@ Visualization Manager:
         Value: /trajectory_planner2/path
       Value: true
 
-    - Class: rviz_default_plugins/Odometry
-      Angle Tolerance: 0.1
+    # ── Robot pose ───────────────────────────────────────────────────────────
+    # ── Real robot pose (odom_to_pose → /follower/pose) ─────────────────────
+    # This is the ground-truth robot position used by SLAM, frontier explorer,
+    # and A*. Orange arrow — large and unambiguous.
+    - Class: rviz_default_plugins/PoseWithCovariance
+      Alpha: 1.0
+      Axes Length: 0.3
+      Axes Radius: 0.02
+      Color:
+        B: 0
+        G: 140
+        R: 255
       Covariance:
         Value: false
       Enabled: true
+      Head Length: 0.20
+      Head Radius: 0.10
+      Name: Robot pose (ground truth)
+      Shaft Length: 0.40
+      Shaft Radius: 0.04
+      Shape: Arrow
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /follower/pose
+      Value: true
+
+    # ── Robot odometry reference arrow (spline follower target point) ───────────
+    # NOTE: disabled at startup — spline publishes (0,0) at idle via _publish_zero()
+    # which creates a phantom arrow at map centre unrelated to the real robot pose.
+    # Enable manually in RViz once the mission has started and the spline is active.
+    # Position Tolerance set high so minor idle jitter never triggers a spurious update.
+    - Class: rviz_default_plugins/Odometry
+      Angle Tolerance: 0.5
+      Covariance:
+        Value: false
+      Enabled: false
       Keep: 1
-      Name: Robot reference
-      Position Tolerance: 0.01
+      Name: Spline target (enable after mission start)
+      Position Tolerance: 0.5
       Shape:
-        Alpha: 1
-        Axes Length: 0.3
-        Axes Radius: 0.02
+        Alpha: 0.8
+        Axes Length: 0.2
+        Axes Radius: 0.015
         Color:
-          B: 25
-          G: 255
+          B: 255
+          G: 180
           R: 0
-        Head Length: 0.07
-        Head Radius: 0.035
-        Shaft Length: 0.23
-        Shaft Radius: 0.015
+        Head Length: 0.08
+        Head Radius: 0.04
+        Shaft Length: 0.16
+        Shaft Radius: 0.012
         Value: Arrow
       Topic:
         Depth: 10
@@ -103,17 +170,7 @@ Visualization Manager:
         Value: /amr/reference
       Value: true
 
-    - Class: rviz_default_plugins/Marker
-      Enabled: true
-      Name: Mission status
-      Topic:
-        Depth: 10
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /mission/status_marker
-      Value: true
-
+    # ── ArUco navigation goal ────────────────────────────────────────────────
     - Alpha: 1.0
       Class: rviz_default_plugins/Pose
       Color:
@@ -135,31 +192,7 @@ Visualization Manager:
         Value: /aruco/goal/pose
       Value: true
 
-    - Class: rviz_default_plugins/PoseWithCovariance
-      Alpha: 1.0
-      Axes Length: 0.3
-      Axes Radius: 0.02
-      Color:
-        B: 0
-        G: 120
-        R: 255
-      Covariance:
-        Value: false
-      Enabled: true
-      Head Length: 0.15
-      Head Radius: 0.07
-      Name: Robot pose
-      Shaft Length: 0.3
-      Shaft Radius: 0.03
-      Shape: Arrow
-      Topic:
-        Depth: 10
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /follower/pose
-      Value: true
-
+    # ── ArUco detected cube markers (3-D cubes in world frame) ──────────────
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: ArUco detections
@@ -169,6 +202,30 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /aruco/markers
+      Value: true
+
+    # ── Mission state text overlay ───────────────────────────────────────────
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Mission status
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /mission/status_marker
+      Value: true
+
+    # ── ArUco annotated camera feed ──────────────────────────────────────────
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: ArUco camera feed
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /aruco/debug_image
       Value: true
 
   Enabled: true
