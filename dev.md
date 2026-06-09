@@ -324,24 +324,6 @@ src/arena_marker_localizer/scripts/calibrate_bias_v3 \
     --out        src/arena_marker_localizer/config/corrected_T_map_from_opti.yaml \
     --max-cam-offset 0.10
 ```
-Starting:
-```YAML
-    T_map_from_opti:
-      x    : 1.785956
-      y    : 1.809220
-      z    : 0.000000
-      roll : 0.000000   # 0.000 deg
-      pitch: 0.000000   # 0.000 deg
-      yaw  : 1.570795   # 90.000 deg
-
-    T_drone_from_cam:
-      x    : 0.035000
-      y    : 0.000000
-      z    : 0.000000
-      roll : 3.141590   # 180.000 deg
-      pitch: 0.000000   # 0.000 deg
-      yaw  : 0.044292   # 2.538 deg
-```
 ```bash
 src/arena_marker_localizer/scripts/calibrate_bias_v3 \
     --test-video  src/arena_map_builder/data/drone_scans/scan18/scan.mp4 \
@@ -393,12 +375,6 @@ src/arena_marker_localizer/scripts/calibrate_bias_v3 \
     --out        src/arena_marker_localizer/config/corrected_T_map_from_opti.yaml \
     --max-cam-offset 0.10
 ```
-After correction:
-```YAML
-  Percentiles  : p25=34.6 cm  p50=80.2 cm  p75=101.5 cm  p90=119.8 cm  p95=133.5 cm
-  Mean θ error : 1.6°  max=7.2°
-  θ percentiles: p50=0.7°  p75=1.4°  p90=4.1
-```
 
 ## Isaac Ros Visual Slam
 
@@ -418,13 +394,17 @@ cd /home/jetson/collab_nav_ground-jetson/src/arena_map_builder/sweep
 
 
 # ── 1. Run the sweep (overnight) ─────────────────────────────────────────
-python sweep.py # with scan 18
-python sweep.py # with scan 21
-# Results land in ./results/  (one run_<id>/ directory per run)
-# Safe to Ctrl-C and resume — progress is saved after every run.
-# Re-run failed runs afterward with:
-#   python3 sweep.py --retry-failed
+# Terminal 1
+ROS_DOMAIN_ID=1 python sweep.py \
+    --video ../../data/drone_scans/scan18/scan.mp4 \
+    --output-dir results/scan18 \
+    --goal-marker-id 3 --amr-marker-id 2
 
+# Terminal 2
+ROS_DOMAIN_ID=2 python sweep.py \
+    --video ../../data/drone_scans/scan21/scan.mp4 \
+    --output-dir results/scan21 \
+    --goal-marker-id 5 --amr-marker-id 0
 
 # ── 2. Manual pass/fail/unsure labeling ───────────────────────────────────
 python3 label.py \
@@ -489,3 +469,30 @@ Major stages and substages:
 TODO:
 - Verify safe mode is active
 - Verify stitching output is good, else fallback to frontier exploration
+
+
+## Running in your laptop
+
+```bash
+mamba create -n arena_builder -c robostack-staging -c conda-forge \
+    python=3.11 \
+    ros-humble-desktop ros-humble-cv-bridge \
+    ros-humble-nav-msgs ros-humble-geometry-msgs ros-humble-sensor-msgs \
+    ros-humble-std-srvs ros-humble-action-msgs ros-humble-std-msgs \
+    ros-humble-rosidl-default-generators \
+    ros-humble-ament-cmake ros-humble-ament-cmake-python \
+    colcon-common-extensions rosdep \
+    'numpy<2' opencv pyyaml \
+    compilers cmake pkg-config make ninja
+
+mamba activate arena_builder
+
+cd /home/david/Documents/UNI_S.8/Robo/project/collab_nav_ground-jetson
+colcon build --packages-select arena_map_builder_msgs arena_map_builder \
+    --symlink-install
+
+source install/setup.bash
+
+mamba install -c conda-forge 'cuda-version=12.*' cudnn
+pip install onnxruntime-gpu
+```
