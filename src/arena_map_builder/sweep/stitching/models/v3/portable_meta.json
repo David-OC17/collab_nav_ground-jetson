@@ -1,0 +1,9 @@
+{
+  "format": "portable_random_forest_v1",
+  "n_trees": 200,
+  "n_classes": 2,
+  "n_features": 45,
+  "pass_class_index": 1,
+  "source_model": "model.joblib",
+  "sklearn_class": "RandomForestClassifier"
+}

@@ -24,6 +24,15 @@ string                debug_dir          # where intermediate images were writte
 geometry_msgs/Point   goal_marker_position
 geometry_msgs/Point   amr_marker_position
 
+# Diagnostic feature vector for runtime map-quality classification (XGBoost).
+# Two parallel arrays: feature_names[i] is the key for feature_values[i].
+# These are the SAME 46 features map_diagnostics.MapDiagnostics.to_feature_vector()
+# produces and that the offline sweep writes to metrics.yaml, computed here the
+# same way (None -> -1.0, bool -> 0.0/1.0) so a model trained on the sweep CSV
+# can score them directly. Empty when diagnostics could not be computed.
+string[]              feature_names
+float64[]             feature_values
+
 ---
 
 # ── Feedback ───────────────────────────────────────────────────────────

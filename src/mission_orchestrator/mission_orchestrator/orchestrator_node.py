@@ -26,7 +26,8 @@ Major stages and substages
      04    Launch arena_marker_localizer service node + wait for readiness
      04.a  Call /localize_markers (ORIENTATION source) — runs while the map builds
      04.b  Join the map-builder result (POSITION source), publish /aruco/.../pose
-           and the OccupancyGrid to /drone/map
+           and the OccupancyGrid to /drone/map -- if either position or orientation is not available, do not publish /aruco/goal/pose and do publish /aruco/amr/pose as a trivial transform (all zeroes)
+    04.c   Run arena_map_builder's map classifier (returns pass/fail) -- if returns pass, continue with regular pipeline, if fails launch frontier exploration and continue with regular pipeline
  05  Isaac ROS Visual SLAM (cuSLAM) bringup
      05.a  Verify Intel RealSense D435i is plugged in
      05.b  Start Docker container + launch visual SLAM (via start_vslam.sh)
@@ -44,6 +45,7 @@ Major stages and substages
      08.c  Launch odom-based mapper (no SLAM)
  09  Trajectory planner bringup
  10  Enter observer mode and log updates
+     10.a If we are in frontier exploration mode, send /map_fail_fallback/start True
 
 From stage 10 onward the orchestrator only observes; the mapper and
 trajectory_planner operate autonomously.
@@ -223,6 +225,11 @@ class MissionOrchestratorNode(Node):
         self._map_goal_handle = None
         self._map_result_future = None
         self._map_send_error: Optional[str] = None
+
+        # Diagnostic feature vector returned by BuildArenaMap (the full 46-feature
+        # map-quality set, same keys as the offline sweep's metrics.yaml).
+        # Populated in _await_map_result; consumed by the runtime classifier.
+        self._map_features: Dict[str, float] = {}
 
         # ── ROS 2 sync primitives ──
         self._imu_ready_event = threading.Event()
@@ -949,6 +956,22 @@ class MissionOrchestratorNode(Node):
         self._log.info(
             f"  Marker centres (m from grid origin): "
             f"goal=({gp.x:.3f}, {gp.y:.3f})  amr=({ap.x:.3f}, {ap.y:.3f})")
+
+        # Parse the diagnostic feature vector (parallel name/value arrays) into a
+        # dict for the runtime classifier. Empty if the server could not compute
+        # it — not fatal here; downstream consumers decide how to handle that.
+        self._map_features = {
+            str(name): float(val)
+            for name, val in zip(result.feature_names, result.feature_values)
+        }
+        n_feat = len(self._map_features)
+        if n_feat:
+            self._log.info(f"  Map quality features: {n_feat} received "
+                           f"(e.g. blob_count={self._map_features.get('blob_count')}, "
+                           f"green_hull_convexity="
+                           f"{self._map_features.get('green_hull_convexity')})")
+        else:
+            self._log.warning("  Map quality features: none returned by server")
         return result
 
     # ════════════════════════════════════════════════════════════════════════

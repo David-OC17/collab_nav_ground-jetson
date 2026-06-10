@@ -48,7 +48,7 @@ from std_srvs.srv import Trigger
 from arena_map_builder_msgs.action import BuildArenaMap
 
 # Vendored (do-not-modify) processing modules
-from arena_map_builder.processing.transfer_obstacles import TransferConfig
+from arena_map_builder.processing.transfer_obstacles import TransferConfig, run_pipeline
 from arena_map_builder.processing.drone_map_grid_gen import (
     ExtractionConfig,
     ReconstructConfig,
@@ -71,6 +71,7 @@ from arena_map_builder.occupancy import (
     occupancy_to_grid_array,
     locate_color_marker_m,
 )
+from arena_map_builder.map_diagnostics import compute_stitcher_diagnostics
 
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 
@@ -893,10 +894,91 @@ class BuildArenaMapServer(Node):
             f"{result.amr_marker_position.y:.3f})"
         )
 
+        # Diagnostic feature vector for the runtime map-quality classifier.
+        # Computed the SAME way the offline sweep does (sweep._collect_diagnostics)
+        # so the values match the metrics.yaml feature set a model was trained on.
+        # Never fatal: on any failure the arrays stay empty and the build succeeds.
+        feats = self._collect_feature_vector(stitched_path, debug_dir, bg_path,
+                                             use_online)
+        result.feature_names  = list(feats.keys())
+        result.feature_values = [float(v) for v in feats.values()]
+        if feats:
+            self.get_logger().info(
+                f"Diagnostic features: {len(feats)} returned in result")
+        else:
+            self.get_logger().warning(
+                "Diagnostic features: none computed (empty vector returned)")
+
         # Result is fully populated → publish the map and finalise the goal.
         self._map_pub.publish(msg)
         goal_handle.succeed()
         return result
+
+    def _collect_feature_vector(
+        self,
+        stitched_path: str,
+        debug_dir: str,
+        bg_path: str,
+        use_online: bool,
+    ) -> Dict[str, float]:
+        """Compute the full 46-feature diagnostic vector for the result.
+
+        Mirrors sweep._collect_diagnostics so the runtime features are identical
+        to those the offline sweep writes to metrics.yaml:
+
+          Groups 1 + 6 (stitch_* / stitcher_* / pg_*):
+              compute_stitcher_diagnostics() on the stitched-map image. In online
+              mode the live MapReconstructor's stats + finalize report are passed
+              so Group 6 is populated; otherwise Group 6 falls back to defaults
+              (pg_* = -1.0), exactly as the sweep does without the stitcher JSON.
+
+          Groups 2 - 5 (dewarp_* / green_* / blob_* / marker_*):
+              a fresh run_pipeline(..., return_diagnostics=True) on the stitched
+              map with default TransferConfig/DiagnosticsConfig — the same call
+              the sweep makes. Re-running (rather than reusing this build's
+              consistency stages) guarantees the feature distribution matches the
+              training set regardless of this run's transfer parameters.
+
+        Any failure is caught and logged; the corresponding group is simply
+        omitted so the build never fails on diagnostics.
+        """
+        feats: Dict[str, float] = {}
+
+        # ── Groups 1 + 6: stitcher diagnostics ──────────────────────────
+        try:
+            stitched_img = cv2.imread(stitched_path)
+            if stitched_img is None:
+                raise IOError(f"cannot read stitched map: {stitched_path!r}")
+            stitcher_stats = None
+            finalize_report = None
+            if use_online and getattr(self, "_online_rec", None) is not None:
+                stitcher_stats = getattr(self._online_rec, "stats", None)
+                finalize_report = getattr(
+                    self._online_rec, "_last_finalize_report", None)
+            feats.update(compute_stitcher_diagnostics(
+                stitched_map=stitched_img,
+                stitcher_stats=stitcher_stats,
+                finalize_report=finalize_report,
+            ))
+        except Exception as exc:
+            self.get_logger().warning(
+                f"Stitcher diagnostics (Groups 1+6) failed: {exc}")
+
+        # ── Groups 2 - 5: re-run the transfer pipeline for diagnostics ──
+        try:
+            result = run_pipeline(
+                stitched_path, bg_path,
+                cfg=TransferConfig(),
+                verbose=False,
+                return_diagnostics=True,
+            )
+            if len(result) == 3:
+                feats.update(result[2])
+        except Exception as exc:
+            self.get_logger().warning(
+                f"Transfer diagnostics (Groups 2-5) failed: {exc}")
+
+        return feats
 
     # -----------------------------------------------------------------------
     # Termination helpers
