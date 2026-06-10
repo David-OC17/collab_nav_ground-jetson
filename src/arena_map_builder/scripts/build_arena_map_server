@@ -258,7 +258,7 @@ class BuildArenaMapServer(Node):
         # appear in stitch.reconstruct.marker_color_map (they have to be coloured
         # in for the transfer stage to locate them); the run aborts otherwise.
         self.declare_parameter("marker.goal_id", 0)
-        self.declare_parameter("marker.amr_id",  5)
+        self.declare_parameter("marker.amr_id",  4)
 
         # --- Transfer (TransferConfig) --------------------------------------
         self.declare_parameter("transfer.correct_perspective", True)
