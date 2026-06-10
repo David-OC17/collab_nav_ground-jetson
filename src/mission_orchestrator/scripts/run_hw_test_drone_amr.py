@@ -59,6 +59,8 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
     def _stage_04a_call_localize_markers(self):
         return []
     def _stage_04b_publish_aruco_poses(self, markers) -> None: pass
+    # 04.c no-op: skip the quality classifier and frontier-exploration fallback.
+    def _stage_04c_classify_and_branch(self, markers) -> None: pass
 
     # ── No-op: VSLAM (05), e-stop (07), mapping (08), planner (09) ────────────
     def _stage_05a_verify_realsense(self) -> None: pass

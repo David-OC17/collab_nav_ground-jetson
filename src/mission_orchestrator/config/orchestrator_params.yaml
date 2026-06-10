@@ -73,6 +73,32 @@ orchestrator:
     ready_topic: "/trajectory_planner2/path"  # topic the node advertises on startup
     ready_timeout_sec: 30.0
 
+  # ── Map-quality classifier (stage 04.c) ──────────────────────────────────
+  # Scores the stitched map from the BuildArenaMap diagnostic features. PASS →
+  # publish /drone/map + goal pose; FAIL → dump the map and run frontier
+  # exploration. enabled=false skips the gate (always PASS).
+  map_classifier:
+    enabled: true
+    model_dir: "/home/jetson/collab_nav_ground-jetson/src/arena_map_builder/sweep/stitching/models/latest"
+
+  # ── Frontier-exploration fallback (stages 09.b + 10.a) ───────────────────
+  # Launched only when the map FAILS classification. astar_planner2 +
+  # spline_follower are NOT launched here — they come from stage 09 (the planner
+  # is pointed at fusion_map_topic in fail mode).
+  frontier:
+    start_topic: "/map_fail_fallback/start"   # Bool — explorer_controller trigger
+    start_ready_timeout_sec: 30.0             # wait for subscriber before publishing
+    fusion_map_topic: "/fusion/map"           # planner map_topic in fail mode (published by stage 08)
+    odom_topic: "/amr/ekf/odom"               # EKF odometry for frontier_explorer
+    world_frame: "world"                      # root TF frame (alignment_node publishes world→odom)
+    slam_map_topic: "/slam/map"               # frontier-detection map (TRANSIENT_LOCAL)
+    image_topic: "/camera/camera/color/image_raw"        # D435i RGB
+    camera_info_topic: "/camera/camera/color/camera_info"
+    marker_size_m: 0.13                       # physical ArUco side length [m]
+    aruco_dict: "DICT_4X4_50"
+    rviz: false
+    # target_marker_id is taken from aruco.goal_marker_id
+
   # ── map_fusion ──────────────────────────────────────────────────────────
   map_fusion:
     ready_topic: "/fusion/status"            # published immediately on node start

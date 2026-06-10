@@ -25,9 +25,17 @@ Major stages and substages
      (kickoff) online_stop (if online) + send BuildArenaMap goal in the BACKGROUND
      04    Launch arena_marker_localizer service node + wait for readiness
      04.a  Call /localize_markers (ORIENTATION source) — runs while the map builds
-     04.b  Join the map-builder result (POSITION source), publish /aruco/.../pose
-           and the OccupancyGrid to /drone/map -- if either position or orientation is not available, do not publish /aruco/goal/pose and do publish /aruco/amr/pose as a trivial transform (all zeroes)
-    04.c   Run arena_map_builder's map classifier (returns pass/fail) -- if returns pass, continue with regular pipeline, if fails launch frontier exploration and continue with regular pipeline
+     04.b  Join the map-builder result (POSITION source) and publish
+           /aruco/amr/pose (POSITION from the map-builder, ORIENTATION from the
+           localizer). If the AMR position/orientation is unavailable, publish an
+           all-NaN pose -- alignment_node reads that as "no data" and falls back
+           to the trivial identity transform. The OccupancyGrid and goal pose are
+           published by 04.c, gated on the classifier.
+    04.c   Run arena_map_builder's map classifier (pass/fail) on the BuildArenaMap
+           diagnostic features. PASS -> publish the OccupancyGrid to /drone/map
+           and /aruco/goal/pose, continue the regular pipeline. FAIL -> dump the
+           map (publish neither), the planner uses /fusion/map (stage 09), and the
+           frontier-exploration stack is launched at 09.b and triggered at 10.a.
  05  Isaac ROS Visual SLAM (cuSLAM) bringup
      05.a  Verify Intel RealSense D435i is plugged in
      05.b  Start Docker container + launch visual SLAM (via start_vslam.sh)
@@ -43,9 +51,14 @@ Major stages and substages
      08.a  Launch oradar lidar
      08.b  Launch alignment_node (/aruco/amr/pose → world->odom tf)
      08.c  Launch odom-based mapper (no SLAM)
- 09  Trajectory planner bringup
+ 09  Trajectory planner bringup (astar_planner2 + spline_follower)
+     map_topic = /drone/map on PASS, /fusion/map on FAIL (the dumped-map case)
+     09.b (FAIL only) Launch the frontier-exploration fallback stack; it idles
+          until the 10.a trigger. astar_planner2 + spline_follower come from 09,
+          not from this stack (single planner instance).
  10  Enter observer mode and log updates
-     10.a If we are in frontier exploration mode, send /map_fail_fallback/start True
+     10.a If we are in frontier exploration mode (map FAILED), send True on
+          /map_fail_fallback/start once the rest of the bringup is complete
 
 From stage 10 onward the orchestrator only observes; the mapper and
 trajectory_planner operate autonomously.
@@ -90,7 +103,7 @@ from rclpy.qos import (
     HistoryPolicy,
 )
 
-from geometry_msgs.msg import Point, PoseStamped, PoseWithCovarianceStamped, Twist
+from geometry_msgs.msg import Point, PoseStamped, PoseWithCovarianceStamped, Quaternion, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import BatteryState, Image, Imu
 from std_msgs.msg import Bool, Int32
@@ -231,6 +244,13 @@ class MissionOrchestratorNode(Node):
         # Populated in _await_map_result; consumed by the runtime classifier.
         self._map_features: Dict[str, float] = {}
 
+        # Map-quality decision (stage 04.c). When the classifier rejects the
+        # stitched map, _map_failed is True: the OccupancyGrid + goal pose are not
+        # published, the planner uses the fusion map, and frontier exploration is
+        # launched after stage 09 and triggered at 10.a.
+        self._classifier = None          # lazily constructed MapQualityClassifier
+        self._map_failed: bool = False
+
         # ── ROS 2 sync primitives ──
         self._imu_ready_event = threading.Event()
         self._imu_msg_count: int = 0
@@ -342,6 +362,20 @@ class MissionOrchestratorNode(Node):
             PoseWithCovarianceStamped, cfg['aruco']['goal_pose_topic'], latched)
         self._pub_drone_map = self.create_publisher(
             OccupancyGrid, cfg['map_builder']['drone_map_topic'], latched)
+
+        # Frontier-exploration fallback trigger (stage 10.a). Reliable + VOLATILE
+        # to match explorer_controller's /map_fail_fallback/start subscription
+        # (it deliberately does not replay to late joiners), so we publish only
+        # after confirming the subscriber is up.
+        fallback_qos = QoSProfile(
+            depth=1, history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        self._pub_map_fail_start = self.create_publisher(
+            Bool,
+            cfg.get('frontier', {}).get('start_topic', '/map_fail_fallback/start'),
+            fallback_qos)
 
         self._loc_client = self.create_client(
             LocalizeMarkers, cfg['marker_localizer']['service_name'])
@@ -1038,71 +1072,164 @@ class MissionOrchestratorNode(Node):
         return markers
 
     def _stage_04b_publish_aruco_poses(self, markers: List) -> None:
-        self._log.info("╔══ Stage 04.b: Join map result → publish poses + OccupancyGrid")
+        self._log.info("╔══ Stage 04.b: Join map result → publish AMR pose")
         cfg_a = self._cfg['aruco']
         amr_id = cfg_a['amr_marker_id']
-        goal_id = cfg_a['goal_marker_id']
-
         by_id = {int(m.id): m for m in markers}
 
-        if amr_id not in by_id:
-            raise MissionAbortError(
-                f"AMR marker id={amr_id} not found in localizer response "
-                f"(found ids: {sorted(by_id.keys())})")
-        if goal_id not in by_id:
-            raise MissionAbortError(
-                f"Goal marker id={goal_id} not found in localizer response "
-                f"(found ids: {sorted(by_id.keys())})")
-
-        # Join the background map-build result (POSITION + OccupancyGrid). 02.c.
+        # Join the background map-build result (POSITION + OccupancyGrid +
+        # diagnostic features). Stored on self._last_map_result for stage 04.c.
         map_result = self._await_map_result()
-        self._publish_drone_map(map_result.map)
 
-        # POSITION comes from the arena_map_builder result; ORIENTATION (and
-        # covariance + header/frame) from the marker localizer. Both express the
-        # marker in the same map frame (origin at the OccupancyGrid bottom-left),
-        # so substituting only the position is frame-consistent.
-        amr_pose = self._build_marker_pose(
-            by_id[amr_id], map_result.amr_marker_position, "AMR", amr_id)
-        goal_pose = self._build_marker_pose(
-            by_id[goal_id], map_result.goal_marker_position, "goal", goal_id)
-
+        # AMR pose: POSITION from the map-builder, ORIENTATION from the localizer.
+        # If either is unavailable, publish an all-NaN pose so alignment_node
+        # falls back to the trivial identity transform (no world→odom offset).
+        amr_pose, amr_ok = self._build_amr_pose(
+            by_id.get(amr_id), map_result.amr_marker_position)
         self._pub_aruco_amr.publish(amr_pose)
-        self._pub_aruco_goal.publish(goal_pose)
-        self._log.info(
-            f"  AMR  (marker {amr_id}): map pos="
-            f"({amr_pose.pose.pose.position.x:.3f}, {amr_pose.pose.pose.position.y:.3f}) "
-            f"θ={math.degrees(_yaw_from_quat(amr_pose.pose.pose.orientation)):.1f}° "
-            f"→ {cfg_a['amr_pose_topic']}")
-        self._log.info(
-            f"  goal (marker {goal_id}): map pos="
-            f"({goal_pose.pose.pose.position.x:.3f}, {goal_pose.pose.pose.position.y:.3f}) "
-            f"θ={math.degrees(_yaw_from_quat(goal_pose.pose.pose.orientation)):.1f}° "
-            f"→ {cfg_a['goal_pose_topic']}")
+        if amr_ok:
+            self._log.info(
+                f"  AMR (marker {amr_id}): map pos="
+                f"({amr_pose.pose.pose.position.x:.3f}, "
+                f"{amr_pose.pose.pose.position.y:.3f}) "
+                f"θ={math.degrees(_yaw_from_quat(amr_pose.pose.pose.orientation)):.1f}° "
+                f"→ {cfg_a['amr_pose_topic']}")
+        else:
+            self._log.warning(
+                f"  AMR (marker {amr_id}) unavailable (not localized or NaN "
+                f"position) → published all-NaN pose; alignment_node will use "
+                f"the identity transform")
         self._log.info("╚══ Stage 04.b OK")
 
-    def _build_marker_pose(self, marker, position, label: str, marker_id: int):
-        """Build the PoseWithCovarianceStamped to publish for one marker.
+    def _stage_04c_classify_and_branch(self, markers: List) -> None:
+        """Classify the stitched map; gate the OccupancyGrid + goal pose on it.
 
-        POSITION is taken from the map-builder result (`position` is a
-        geometry_msgs/Point in metres from the OccupancyGrid's bottom-left
-        origin); ORIENTATION, covariance, and the header/frame are taken from the
-        localizer's `marker.pose_with_covariance`. The localizer's map frame and
-        the grid frame share that same origin, so only the position is swapped.
-
-        Aborts the mission if the map-builder could not locate the marker (its
-        result Point is NaN) — there is then no valid position to publish.
+        PASS → publish /drone/map and the goal pose; the regular pipeline
+               continues using the stitched map.
+        FAIL → dump the map (publish neither /drone/map nor the goal pose). The
+               planner will use the fusion map (stage 09) and frontier
+               exploration is launched after stage 09 and triggered at 10.a.
         """
-        if math.isnan(position.x) or math.isnan(position.y):
-            raise MissionAbortError(
-                f"{label} marker (id={marker_id}) was not located in the arena "
-                f"map (map-builder returned a NaN position); cannot publish its "
-                f"pose.")
+        self._log.info("╔══ Stage 04.c: Map-quality classification")
+        cfg_a = self._cfg['aruco']
+        goal_id = cfg_a['goal_marker_id']
+        by_id = {int(m.id): m for m in markers}
+        map_result = self._last_map_result
+
+        self._map_failed = not self._classify_map()
+
+        if not self._map_failed:
+            # Good map → publish it and the goal pose.
+            self._publish_drone_map(map_result.map)
+            goal_pose = self._build_goal_pose(
+                by_id.get(goal_id), map_result.goal_marker_position)
+            if goal_pose is not None:
+                self._pub_aruco_goal.publish(goal_pose)
+                self._log.info(
+                    f"  goal (marker {goal_id}): map pos="
+                    f"({goal_pose.pose.pose.position.x:.3f}, "
+                    f"{goal_pose.pose.pose.position.y:.3f}) "
+                    f"θ={math.degrees(_yaw_from_quat(goal_pose.pose.pose.orientation)):.1f}° "
+                    f"→ {cfg_a['goal_pose_topic']}")
+            else:
+                self._log.warning(
+                    f"  goal (marker {goal_id}) unavailable → not publishing "
+                    f"{cfg_a['goal_pose_topic']}")
+            self._log.info("╚══ Stage 04.c OK: map PASSED — continuing with stitched map")
+        else:
+            # Bad map → dump it: publish neither the grid nor the goal pose.
+            self._log.warning(
+                f"  Map FAILED classification — dumping stitched map: not "
+                f"publishing {self._cfg['map_builder']['drone_map_topic']} or "
+                f"{cfg_a['goal_pose_topic']}; frontier exploration will take over")
+            self._log.info("╚══ Stage 04.c OK: map FAILED — frontier exploration mode")
+
+    def _classify_map(self) -> bool:
+        """Return True if the stitched map is good enough to use.
+
+        Uses the diagnostic feature vector returned by BuildArenaMap (stored in
+        self._map_features) and the trained RandomForest. Safe defaults: an empty
+        feature vector → FAIL (no quality evidence, explore); a classifier
+        load/predict error → PASS (don't force exploration on infrastructure
+        problems). Disable entirely via config map_classifier.enabled=false.
+        """
+        cfg_c = self._cfg.get('map_classifier', {})
+        if not cfg_c.get('enabled', True):
+            self._log.info("  Map classifier disabled → treating map as PASS")
+            return True
+
+        if not self._map_features:
+            self._log.warning(
+                "  No map-quality features in the result → treating map as FAIL "
+                "(will explore)")
+            return False
+
+        try:
+            if self._classifier is None:
+                from mission_orchestrator.map_quality_classifier import (
+                    MapQualityClassifier)
+                model_dir = cfg_c.get('model_dir') or None
+                self._classifier = MapQualityClassifier(model_dir)
+                self._log.info(f"  Loaded classifier: {self._classifier!r}")
+            result = self._classifier.evaluate(self._map_features)
+            self._log.info(f"  Classifier → {result}")
+            if result.missing:
+                self._log.warning(
+                    f"  {len(result.missing)} expected feature(s) missing "
+                    f"(sentinel-filled): {', '.join(result.missing)}")
+            return result.good
+        except Exception as exc:
+            self._log.error(
+                f"  Map classifier error ({exc}) → treating map as PASS "
+                f"(continuing with the stitched map)")
+            return True
+
+    def _build_amr_pose(self, marker, position):
+        """Build the AMR PoseWithCovarianceStamped (POSITION from map-builder,
+        ORIENTATION from the localizer), in the `world` frame.
+
+        Returns (pose, available). When the marker was not localized or the
+        map-builder position is NaN, returns an all-NaN pose with available=False
+        — a "no data" signal that alignment_node turns into the identity
+        transform.
+        """
+        now = self.get_clock().now().to_msg()
+        if (marker is None or position is None
+                or math.isnan(position.x) or math.isnan(position.y)):
+            nan = float('nan')
+            pose = PoseWithCovarianceStamped()
+            pose.header.frame_id = 'world'
+            pose.header.stamp = now
+            pose.pose.pose.position = Point(x=nan, y=nan, z=nan)
+            pose.pose.pose.orientation = Quaternion(x=nan, y=nan, z=nan, w=nan)
+            return pose, False
 
         pose = marker.pose_with_covariance   # PoseWithCovarianceStamped (localizer)
         pose.pose.pose.position.x = float(position.x)
         pose.pose.pose.position.y = float(position.y)
         pose.pose.pose.position.z = 0.0
+        pose.header.frame_id = 'world'
+        pose.header.stamp = now
+        return pose, True
+
+    def _build_goal_pose(self, marker, position):
+        """Build the goal PoseWithCovarianceStamped, or None if unavailable.
+
+        POSITION is taken from the map-builder result; ORIENTATION, covariance,
+        and header come from the localizer's `marker.pose_with_covariance`. The
+        localizer's map frame and the grid frame share the same origin, so only
+        the position is swapped. Returns None when the marker was not localized or
+        the map-builder could not place it (NaN position).
+        """
+        if (marker is None or position is None
+                or math.isnan(position.x) or math.isnan(position.y)):
+            return None
+
+        pose = marker.pose_with_covariance   # PoseWithCovarianceStamped (localizer)
+        pose.pose.pose.position.x = float(position.x)
+        pose.pose.pose.position.y = float(position.y)
+        pose.pose.pose.position.z = 0.0
+        pose.header.frame_id = 'world'
         pose.header.stamp = self.get_clock().now().to_msg()
         return pose
 
@@ -1321,17 +1448,91 @@ class MissionOrchestratorNode(Node):
     # ════════════════════════════════════════════════════════════════════════
 
     def _stage_09_trajectory_planner(self) -> None:
-        self._log.info("╔══ Stage 09: Launch trajectory_planner")
+        # The planner's map_topic depends on the 04.c decision: the good stitched
+        # map (/drone/map) on PASS, or the fusion map (/fusion/map) on FAIL since
+        # the stitched map was dumped and frontier exploration takes over.
+        if self._map_failed:
+            map_topic = self._cfg.get('frontier', {}).get(
+                'fusion_map_topic', '/fusion/map')
+            self._log.info(
+                f"╔══ Stage 09: Launch trajectory_planner (map FAILED → {map_topic})")
+        else:
+            map_topic = self._cfg['map_builder'].get('drone_map_topic', '/drone/map')
+            self._log.info("╔══ Stage 09: Launch trajectory_planner")
+
         proc = subprocess.Popen(
-            ['ros2', 'launch', 'trajectory_planner', 'planner_launch.py'],
+            ['ros2', 'launch', 'trajectory_planner', 'planner_launch.py',
+             f'map_topic:={map_topic}'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self._processes['trajectory_planner'] = proc
-        self._log.info(f"  trajectory_planner launched (pid={proc.pid})")
+        self._log.info(f"  trajectory_planner launched (pid={proc.pid}) "
+                       f"map_topic={map_topic}")
         cfg_tp = self._cfg['trajectory_planner']
         self._wait_for_publisher(
             cfg_tp['ready_topic'], cfg_tp['ready_timeout_sec'], 'trajectory_planner')
         self._log.info("╚══ Stage 09 OK")
+
+    # ── Frontier-exploration fallback (stage 09.b + 10.a) ─────────────────────
+
+    def _stage_09b_launch_frontier(self) -> None:
+        """Launch the frontier-exploration fallback stack (FAIL mode only).
+
+        Deferred to here (after stage 09) so its prerequisites — SLAM, EKF, the
+        D435i driver, the AMR controller, and the trajectory planner — are
+        already up. The nodes idle until the 10.a trigger on
+        /map_fail_fallback/start. astar_planner2 + spline_follower are NOT started
+        here; they come from stage 09 (the single planner instance)."""
+        cfg_f = self._cfg.get('frontier', {})
+        goal_id = self._cfg['aruco']['goal_marker_id']
+        self._log.info("╔══ Stage 09.b: Launch frontier-exploration fallback")
+        cmd = [
+            'ros2', 'launch', 'frontier_explorer', 'frontier_explorer_launch.py',
+            f"odom_topic:={cfg_f.get('odom_topic', '/amr/ekf/odom')}",
+            f"world_frame:={cfg_f.get('world_frame', 'world')}",
+            f"slam_map_topic:={cfg_f.get('slam_map_topic', '/slam/map')}",
+            f"image_topic:={cfg_f.get('image_topic', '/camera/camera/color/image_raw')}",
+            f"camera_info_topic:={cfg_f.get('camera_info_topic', '/camera/camera/color/camera_info')}",
+            f"target_marker_id:={goal_id}",
+            f"marker_size_m:={cfg_f.get('marker_size_m', 0.13)}",
+            f"aruco_dict:={cfg_f.get('aruco_dict', 'DICT_4X4_50')}",
+            f"rviz:={'true' if cfg_f.get('rviz', False) else 'false'}",
+        ]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._processes['frontier_exploration'] = proc
+        self._log.info(
+            f"  frontier_explorer launched (pid={proc.pid}) — idle until 10.a")
+        self._log.info("╚══ Stage 09.b OK")
+
+    def _stage_10a_start_frontier(self) -> None:
+        """Trigger frontier exploration by publishing True on the start topic.
+
+        Sent once the rest of the bringup is complete. The subscriber uses
+        VOLATILE QoS (no replay), so we wait for it to appear before publishing
+        and send a few times to be safe."""
+        if not self._map_failed:
+            return
+        cfg_f = self._cfg.get('frontier', {})
+        topic = cfg_f.get('start_topic', '/map_fail_fallback/start')
+        timeout = float(cfg_f.get('start_ready_timeout_sec', 30.0))
+        self._log.info(f"╔══ Stage 10.a: Start frontier exploration → {topic}")
+
+        deadline = time.monotonic() + timeout
+        while self._pub_map_fail_start.get_subscription_count() == 0:
+            if time.monotonic() > deadline:
+                self._log.warning(
+                    f"  No subscriber on {topic} after {timeout:.0f}s — "
+                    f"publishing anyway")
+                break
+            time.sleep(0.5)
+
+        msg = Bool()
+        msg.data = True
+        for _ in range(3):
+            self._pub_map_fail_start.publish(msg)
+            time.sleep(0.2)
+        self._log.info("╚══ Stage 10.a OK: frontier exploration triggered")
 
     # ════════════════════════════════════════════════════════════════════════
     # Stage 10 — Observer
@@ -1449,6 +1650,7 @@ class MissionOrchestratorNode(Node):
             self._stage_04_launch_marker_localizer()
             markers = self._stage_04a_call_localize_markers()
             self._stage_04b_publish_aruco_poses(markers)
+            self._stage_04c_classify_and_branch(markers)
 
             # ── 05 Isaac ROS Visual SLAM bringup ──
             self._log.info("━━━━━━  Stage 05: Isaac ROS Visual SLAM bringup  ━━━━━━")
@@ -1476,8 +1678,15 @@ class MissionOrchestratorNode(Node):
             # ── 09 Trajectory planner bringup ──
             self._log.info("━━━━━━  Stage 09: Trajectory planner bringup  ━━━━━━")
             self._stage_09_trajectory_planner()
+            # 09.b (map FAILED only): bring up the frontier-exploration stack now
+            # that its prerequisites are running; it idles until the 10.a trigger.
+            if self._map_failed:
+                self._stage_09b_launch_frontier()
 
             # ── 10 Observer ──
+            # 10.a: if the map failed, start frontier exploration now that the
+            # rest of the bringup is complete.
+            self._stage_10a_start_frontier()
             self._mission_complete = True
             self._log.info(
                 "━━━━━━  MISSION ORCHESTRATION COMPLETE  ━━━━━━\n"

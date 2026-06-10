@@ -184,6 +184,10 @@ class _MockDroneOrchestrator(MissionOrchestratorNode):
             f"╠══ Stage 04.b (MOCK): map markers (m)  "
             f"goal=({gp.x:.3f}, {gp.y:.3f})  amr=({ap_.x:.3f}, {ap_.y:.3f})")
 
+    # 04.c no-op: the map is already published above; skip the quality
+    # classifier and the frontier-exploration fallback for this mock stream.
+    def _stage_04c_classify_and_branch(self, markers) -> None: pass
+
     # ── No-ops: optitrack, drone bring-up, localizer, vslam, rasp, mapping ───
 
     def _stage_01a_check_optitrack(self) -> None: pass

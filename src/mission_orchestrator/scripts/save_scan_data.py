@@ -140,8 +140,9 @@ class _SaveScanOrchestrator(MissionOrchestratorNode):
     # ── Stage 04.b override: join map result → publish + SAVE poses & map ─────
 
     def _stage_04b_publish_aruco_poses(self, markers) -> None:
-        # super() awaits the map result, publishes the poses + OccupancyGrid, and
-        # stores self._last_map_result.
+        # super() awaits the map result, publishes the AMR pose, and stores
+        # self._last_map_result. The map + goal pose are published/saved in the
+        # 04.c override below.
         super()._stage_04b_publish_aruco_poses(markers)
 
         cfg_a = self._cfg['aruco']
@@ -150,20 +151,25 @@ class _SaveScanOrchestrator(MissionOrchestratorNode):
         by_id = {int(m.id): m for m in markers}
         mr = self._last_map_result
 
-        # Re-derive the SAME published poses (idempotent) for saving.
-        amr_pose = self._build_marker_pose(
-            by_id[amr_id], mr.amr_marker_position, "AMR", amr_id)
-        goal_pose = self._build_marker_pose(
-            by_id[goal_id], mr.goal_marker_position, "goal", goal_id)
+        # Re-derive the SAME published poses (idempotent) for saving. _build_amr_pose
+        # returns an all-NaN pose when the AMR is unavailable; _build_goal_pose
+        # returns None.
+        amr_pose, _amr_ok = self._build_amr_pose(
+            by_id.get(amr_id), mr.amr_marker_position)
+        goal_pose = self._build_goal_pose(
+            by_id.get(goal_id), mr.goal_marker_position)
 
         amr_path = os.path.join(self._output_dir, 'aruco_amr_pose.yaml')
         goal_path = os.path.join(self._output_dir, 'aruco_goal_pose.yaml')
         map_path = os.path.join(self._output_dir, 'drone_map.yaml')
         save_pose(amr_path, amr_pose)
-        save_pose(goal_path, goal_pose)
         save_grid(map_path, mr.map)
         self._log.info(f"  [save] aruco_amr_pose.yaml  → {amr_path!r}")
-        self._log.info(f"  [save] aruco_goal_pose.yaml → {goal_path!r}")
+        if goal_pose is not None:
+            save_pose(goal_path, goal_pose)
+            self._log.info(f"  [save] aruco_goal_pose.yaml → {goal_path!r}")
+        else:
+            self._log.warning("  [save] goal pose unavailable — not saved")
         self._log.info(
             f"  [save] drone_map.yaml ({mr.map.info.width}×{mr.map.info.height} "
             f"cells) → {map_path!r}")
@@ -173,7 +179,25 @@ class _SaveScanOrchestrator(MissionOrchestratorNode):
         if self._gt_markers is not None:
             self._log.info("  [gt] Marker pose error vs ground truth:")
             self._print_marker_gt_error("AMR", amr_id, amr_pose)
-            self._print_marker_gt_error("goal", goal_id, goal_pose)
+            if goal_pose is not None:
+                self._print_marker_gt_error("goal", goal_id, goal_pose)
+
+    def _stage_04c_classify_and_branch(self, markers) -> None:
+        # Scan-save harness: always keep the stitched map. Skip the quality
+        # classifier and the frontier-exploration fallback (publishing the map +
+        # goal pose exactly as the PASS branch would), so node.run() never
+        # launches frontier exploration for a data-capture run.
+        self._map_failed = False
+        cfg_a = self._cfg['aruco']
+        goal_id = cfg_a['goal_marker_id']
+        by_id = {int(m.id): m for m in markers}
+        mr = self._last_map_result
+
+        self._publish_drone_map(mr.map)
+        goal_pose = self._build_goal_pose(
+            by_id.get(goal_id), mr.goal_marker_position)
+        if goal_pose is not None:
+            self._pub_aruco_goal.publish(goal_pose)
 
     def _print_marker_gt_error(self, label: str, marker_id: int, pose) -> None:
         """Print the final pose's error vs ground truth for one marker:

@@ -195,6 +195,10 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
             f"(res={grid.info.resolution} m/cell)")
         self._log.info("╚══ Stage 04.b [MOCK] OK: poses + drone map published")
 
+    # 04.c no-op: the saved (known-good) map is already published above; never
+    # run the quality classifier or the frontier-exploration fallback here.
+    def _stage_04c_classify_and_branch(self, markers) -> None: pass
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point

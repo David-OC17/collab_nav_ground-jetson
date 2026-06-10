@@ -65,6 +65,10 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
         self._log.info("  Press Ctrl+C to abort the drone and exit.")
         self._log.info("══════════════════════════════════════════════════")
 
+    # 04.c no-op: no stitched map here — skip the quality classifier and the
+    # frontier-exploration fallback.
+    def _stage_04c_classify_and_branch(self, markers) -> None: pass
+
     # ── No-op: VSLAM (05), Rasp (06), e-stop (07), mapping (08), planner (09) ─
     def _stage_05a_verify_realsense(self) -> None: pass
     def _stage_05b_start_vslam(self) -> None: pass
