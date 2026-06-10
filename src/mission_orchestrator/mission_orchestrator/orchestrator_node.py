@@ -21,7 +21,7 @@ Major stages and substages
      03.f  Observe drone state transitions 1→2→3→4 with per-stage timeouts
      03.g  Wait for scan.mp4 + telemetry.csv (fresh within max_age_sec)
      03.h  Verify scan.mp4 integrity via ffmpeg
- 04  Aruco localizer
+ 04  Drone Aruco localizer
      (kickoff) online_stop (if online) + send BuildArenaMap goal in the BACKGROUND
      04    Launch arena_marker_localizer service node + wait for readiness
      04.a  Call /localize_markers (ORIENTATION source) — runs while the map builds
@@ -33,9 +33,10 @@ Major stages and substages
            published by 04.c, gated on the classifier.
     04.c   Run arena_map_builder's map classifier (pass/fail) on the BuildArenaMap
            diagnostic features. PASS -> publish the OccupancyGrid to /drone/map
-           and /aruco/goal/pose, continue the regular pipeline. FAIL -> dump the
-           map (publish neither), the planner uses /fusion/map (stage 09), and the
-           frontier-exploration stack is launched at 09.b and triggered at 10.a.
+           and /aruco/goal/pose, continue the regular pipeline. FAIL (map
+           unavailable or classifier reject) -> publish a border template grid to
+           /drone/map (no goal pose), the planner uses /fusion/map (stage 11), and
+           the frontier-exploration stack is launched at 11.b and triggered at 12.a.
  05  Isaac ROS Visual SLAM (cuSLAM) bringup
      05.a  Verify Intel RealSense D435i is plugged in
      05.b  Start Docker container + launch visual SLAM (via start_vslam.sh)
@@ -47,20 +48,27 @@ Major stages and substages
      06.d  Wait for /imu/data_raw to publish N messages
  07  Emergency stop bringup
      07.a  Launch emergency_stop node; verify /amr/emergency_stop is inactive
- 08  Mapping bringup
-     08.a  Launch oradar lidar
-     08.b  Launch alignment_node (/aruco/amr/pose → world->odom tf)
-     08.c  Launch odom-based mapper (no SLAM)
- 09  Trajectory planner bringup (astar_planner2 + spline_follower)
+ 08  AMR Aruco localizer
+     08.a  Launch aruco_localizer (/aruco_pose → EKF). Camera source follows
+           vslam.enabled: RealSense color when disabled, the VSLAM RealSense IR
+           stream when enabled.
+ 09  Mapping bringup
+     09.a  Launch oradar lidar
+     09.b  Launch alignment_node (/aruco/amr/pose → world->odom tf)
+     09.c  Launch odom-based mapper (no SLAM)
+ 10  Map fusion
+     Launch fusion.launch.py (overlays the drone map and the AMR-built map);
+     wait for /fusion/status before continuing.
+ 11  Trajectory planner bringup (astar_planner2 + spline_follower)
      map_topic = /drone/map on PASS, /fusion/map on FAIL (the dumped-map case)
-     09.b (FAIL only) Launch the frontier-exploration fallback stack; it idles
-          until the 10.a trigger. astar_planner2 + spline_follower come from 09,
+     11.b (FAIL only) Launch the frontier-exploration fallback stack; it idles
+          until the 12.a trigger. astar_planner2 + spline_follower come from 11,
           not from this stack (single planner instance).
- 10  Enter observer mode and log updates
-     10.a If we are in frontier exploration mode (map FAILED), send True on
+ 12  Enter observer mode and log updates
+     12.a If we are in frontier exploration mode (map FAILED), send True on
           /map_fail_fallback/start once the rest of the bringup is complete
 
-From stage 10 onward the orchestrator only observes; the mapper and
+From stage 12 onward the orchestrator only observes; the mapper and
 trajectory_planner operate autonomously.
 
 Map-builder mode (config map_builder.online, default online)
@@ -971,16 +979,32 @@ class MissionOrchestratorNode(Node):
             raise MissionAbortError(self._map_send_error or "BuildArenaMap goal rejected")
         self._log.info("╚══ Map build: running in background")
 
-    def _await_map_result(self) -> "BuildArenaMap.Result":
-        """Block until the background BuildArenaMap result arrives; return it."""
+    def _await_map_result(self) -> "Optional[BuildArenaMap.Result]":
+        """Block until the background BuildArenaMap result arrives; return it.
+
+        On any failure (no goal in flight, timeout, or a non-success result) this
+        does NOT abort the mission: it logs a warning, clears
+        self._last_map_result, and returns None. The fail path (stage 04.c) then
+        publishes the border template map and runs frontier exploration."""
+        if self._map_result_future is None:
+            self._log.warning(
+                "  No BuildArenaMap goal in flight — map result unavailable")
+            self._last_map_result = None
+            return None
         timeout = float(self._cfg['map_builder']['action_timeout_sec'])
         evt = threading.Event()
         self._map_result_future.add_done_callback(lambda _: evt.set())
         if not evt.wait(timeout=timeout):
-            raise MissionAbortError(f"BuildArenaMap timed out after {timeout}s")
+            self._log.warning(f"  BuildArenaMap timed out after {timeout}s — "
+                              f"treating map as unavailable")
+            self._last_map_result = None
+            return None
         result = self._map_result_future.result().result
         if not result.success:
-            raise MissionAbortError(f"BuildArenaMap failed: {result.message}")
+            self._log.warning(f"  BuildArenaMap failed: {result.message} — "
+                              f"treating map as unavailable")
+            self._last_map_result = None
+            return None
         self._last_map_result = result   # exposed for subclasses (e.g. save_scan)
         self._log.info(
             f"  Map built: {result.map.info.width}×{result.map.info.height} cells, "
@@ -1082,10 +1106,12 @@ class MissionOrchestratorNode(Node):
         map_result = self._await_map_result()
 
         # AMR pose: POSITION from the map-builder, ORIENTATION from the localizer.
-        # If either is unavailable, publish an all-NaN pose so alignment_node
-        # falls back to the trivial identity transform (no world→odom offset).
+        # If either is unavailable (including a missing/failed map build), publish
+        # an all-NaN pose so alignment_node falls back to the trivial identity
+        # transform (no world→odom offset).
+        amr_position = map_result.amr_marker_position if map_result is not None else None
         amr_pose, amr_ok = self._build_amr_pose(
-            by_id.get(amr_id), map_result.amr_marker_position)
+            by_id.get(amr_id), amr_position)
         self._pub_aruco_amr.publish(amr_pose)
         if amr_ok:
             self._log.info(
@@ -1106,9 +1132,10 @@ class MissionOrchestratorNode(Node):
 
         PASS → publish /drone/map and the goal pose; the regular pipeline
                continues using the stitched map.
-        FAIL → dump the map (publish neither /drone/map nor the goal pose). The
-               planner will use the fusion map (stage 09) and frontier
-               exploration is launched after stage 09 and triggered at 10.a.
+        FAIL (map unavailable OR classifier reject) → publish a border template
+               grid to /drone/map and no goal pose. The planner will use the
+               fusion map (stage 11) and frontier exploration is launched after
+               stage 11 and triggered at 12.a.
         """
         self._log.info("╔══ Stage 04.c: Map-quality classification")
         cfg_a = self._cfg['aruco']
@@ -1116,7 +1143,8 @@ class MissionOrchestratorNode(Node):
         by_id = {int(m.id): m for m in markers}
         map_result = self._last_map_result
 
-        self._map_failed = not self._classify_map()
+        map_ok = (map_result is not None) and self._classify_map()
+        self._map_failed = not map_ok
 
         if not self._map_failed:
             # Good map → publish it and the goal pose.
@@ -1137,11 +1165,14 @@ class MissionOrchestratorNode(Node):
                     f"{cfg_a['goal_pose_topic']}")
             self._log.info("╚══ Stage 04.c OK: map PASSED — continuing with stitched map")
         else:
-            # Bad map → dump it: publish neither the grid nor the goal pose.
+            # Bad/unavailable map → publish a border template grid to /drone/map
+            # (no goal pose). Frontier exploration takes over.
             self._log.warning(
-                f"  Map FAILED classification — dumping stitched map: not "
-                f"publishing {self._cfg['map_builder']['drone_map_topic']} or "
-                f"{cfg_a['goal_pose_topic']}; frontier exploration will take over")
+                f"  Map FAILED (unavailable or classifier reject) — publishing "
+                f"border template to {self._cfg['map_builder']['drone_map_topic']}, "
+                f"no goal pose on {cfg_a['goal_pose_topic']}; frontier "
+                f"exploration will take over")
+            self._publish_drone_map(self._build_template_grid())
             self._log.info("╚══ Stage 04.c OK: map FAILED — frontier exploration mode")
 
     def _classify_map(self) -> bool:
@@ -1247,6 +1278,38 @@ class MissionOrchestratorNode(Node):
         # Confirm our own subscriber fires (latched; same process)
         if not self._drone_map_event.wait(timeout=5.0):
             self._log.warning("  /drone/map subscriber did not echo back within 5s (may be ok)")
+
+    def _build_template_grid(self) -> OccupancyGrid:
+        """Build a bordered empty OccupancyGrid from map_builder.template_grid.
+
+        Free everywhere except an outer ring of `border_cells` wall cells. Used as
+        the fail-mode /drone/map when the stitched map is unavailable/rejected."""
+        cfg_t = self._cfg['map_builder']['template_grid']
+        res = float(cfg_t['resolution_m_per_cell'])
+        W = round(float(cfg_t['arena_width_m']) / res)
+        H = round(float(cfg_t['arena_height_m']) / res)
+        wall_occ = int(cfg_t['wall_occ'])
+        free_occ = int(cfg_t['free_occ'])
+        border = int(cfg_t['border_cells'])
+
+        data = [free_occ] * (W * H)
+        for y in range(H):
+            for x in range(W):
+                if x < border or x >= W - border or y < border or y >= H - border:
+                    data[y * W + x] = wall_occ
+
+        grid = OccupancyGrid()
+        grid.header.frame_id = str(cfg_t['frame_id'])
+        grid.header.stamp = self.get_clock().now().to_msg()
+        grid.info.resolution = res
+        grid.info.width = W
+        grid.info.height = H
+        grid.info.origin.position.x = 0.0
+        grid.info.origin.position.y = 0.0
+        grid.info.origin.position.z = 0.0
+        grid.info.origin.orientation.w = 1.0
+        grid.data = data
+        return grid
 
     # ════════════════════════════════════════════════════════════════════════
     # Stage 05 — Isaac ROS Visual SLAM (cuSLAM) bringup
@@ -1409,11 +1472,46 @@ class MissionOrchestratorNode(Node):
             f"╚══ Stage 07.a OK: {n_samples} messages on {topic} all False")
 
     # ════════════════════════════════════════════════════════════════════════
-    # Stage 08 — Mapping bringup
+    # Stage 08 — AMR Aruco localizer
     # ════════════════════════════════════════════════════════════════════════
 
-    def _stage_08a_launch_oradar(self) -> None:
-        self._log.info("╔══ Stage 08.a: Launch oradar lidar")
+    def _stage_08_amr_localizer(self) -> None:
+        """Launch the AMR ArUco localizer (/aruco_pose → EKF).
+
+        Camera source follows the vslam.enabled flag: with VSLAM disabled the
+        localizer uses the RealSense color stream (use_realsense:=true,
+        defaults); with VSLAM enabled it consumes the VSLAM RealSense IR stream
+        (use_realsense:=false, IR image/info topics + IR optical frame)."""
+        self._log.info("╔══ Stage 08: Launch AMR aruco_localizer")
+        cfg_al = self._cfg.get('amr_localizer', {})
+        cmd = ['ros2', 'launch', 'aruco_localizer', 'aruco_localizer.launch.py']
+        if self._cfg.get('vslam', {}).get('enabled', False):
+            cmd += [
+                'use_realsense:=false',
+                f"image_topic:={cfg_al.get('vslam_image_topic', '/camera/infra1/image_rect_raw')}",
+                f"camera_info_topic:={cfg_al.get('vslam_camera_info_topic', '/camera/infra1/camera_info')}",
+                f"camera_frame:={cfg_al.get('vslam_camera_frame', 'camera_infra1_optical_frame')}",
+            ]
+            self._log.info("  VSLAM enabled → localizer uses the VSLAM RealSense IR stream")
+        else:
+            cmd += ['use_realsense:=true']
+            self._log.info("  VSLAM disabled → localizer uses its own RealSense color stream")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._processes['amr_localizer'] = proc
+        self._log.info(f"  aruco_localizer launched (pid={proc.pid})")
+        pose_topic = cfg_al.get('pose_topic', '/aruco_pose')
+        timeout = float(cfg_al.get('ready_timeout_sec', 30.0))
+        self._wait_for_publisher(pose_topic, timeout, 'amr_localizer')
+        self._log.info("╚══ Stage 08 OK")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 09 — Mapping bringup
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_09a_launch_oradar(self) -> None:
+        self._log.info("╔══ Stage 09.a: Launch oradar lidar")
         proc = subprocess.Popen(
             ['ros2', 'launch', 'oradar_lidar', 'ms200_scan.launch.py'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1423,31 +1521,48 @@ class MissionOrchestratorNode(Node):
         cfg_or = self._cfg['oradar']
         self._wait_for_publisher(
             cfg_or['scan_topic'], cfg_or['ready_timeout_sec'], 'oradar')
-        self._log.info("╚══ Stage 08.a OK")
+        self._log.info("╚══ Stage 09.a OK")
 
-    def _stage_08b_publish_static_tf(self) -> None:
-        self._log.info("╔══ Stage 08.b: Launch alignment_node (world->odom tf)")
+    def _stage_09b_publish_static_tf(self) -> None:
+        self._log.info("╔══ Stage 09.b: Launch alignment_node (world->odom tf)")
         proc = subprocess.Popen(
             ['ros2', 'run', 'amr_drone_nav', 'alignment_node'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self._processes['world_odom_tf'] = proc
-        self._log.info(f"╚══ Stage 08.b OK: alignment_node launched (pid={proc.pid})")
+        self._log.info(f"╚══ Stage 09.b OK: alignment_node launched (pid={proc.pid})")
 
-    def _stage_08c_amr_mapper(self) -> None:
-        self._log.info("╔══ Stage 08.c: Launch odom-based mapper (no SLAM)")
+    def _stage_09c_amr_mapper(self) -> None:
+        self._log.info("╔══ Stage 09.c: Launch odom-based mapper (no SLAM)")
         proc = subprocess.Popen(
             ['ros2', 'launch', 'world_mapper', 'mapper.launch.py'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self._processes['amr_mapper'] = proc
-        self._log.info(f"╚══ Stage 08.c OK: amr_mapper launched (pid={proc.pid})")
+        self._log.info(f"╚══ Stage 09.c OK: amr_mapper launched (pid={proc.pid})")
 
     # ════════════════════════════════════════════════════════════════════════
-    # Stage 09 — Trajectory planner bringup
+    # Stage 10 — Map fusion
     # ════════════════════════════════════════════════════════════════════════
 
-    def _stage_09_trajectory_planner(self) -> None:
+    def _stage_10_map_fusion(self) -> None:
+        self._log.info("╔══ Stage 10: Launch map fusion")
+        proc = subprocess.Popen(
+            ['ros2', 'launch', 'fusion', 'fusion.launch.py'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._processes['map_fusion'] = proc
+        self._log.info(f"  fusion launched (pid={proc.pid})")
+        cfg_mf = self._cfg['map_fusion']
+        self._wait_for_publisher(
+            cfg_mf['ready_topic'], cfg_mf['ready_timeout_sec'], 'map_fusion')
+        self._log.info("╚══ Stage 10 OK")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Stage 11 — Trajectory planner bringup
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _stage_11_trajectory_planner(self) -> None:
         # The planner's map_topic depends on the 04.c decision: the good stitched
         # map (/drone/map) on PASS, or the fusion map (/fusion/map) on FAIL since
         # the stitched map was dumped and frontier exploration takes over.
@@ -1455,10 +1570,10 @@ class MissionOrchestratorNode(Node):
             map_topic = self._cfg.get('frontier', {}).get(
                 'fusion_map_topic', '/fusion/map')
             self._log.info(
-                f"╔══ Stage 09: Launch trajectory_planner (map FAILED → {map_topic})")
+                f"╔══ Stage 11: Launch trajectory_planner (map FAILED → {map_topic})")
         else:
             map_topic = self._cfg['map_builder'].get('drone_map_topic', '/drone/map')
-            self._log.info("╔══ Stage 09: Launch trajectory_planner")
+            self._log.info("╔══ Stage 11: Launch trajectory_planner")
 
         proc = subprocess.Popen(
             ['ros2', 'launch', 'trajectory_planner', 'planner_launch.py',
@@ -1471,21 +1586,21 @@ class MissionOrchestratorNode(Node):
         cfg_tp = self._cfg['trajectory_planner']
         self._wait_for_publisher(
             cfg_tp['ready_topic'], cfg_tp['ready_timeout_sec'], 'trajectory_planner')
-        self._log.info("╚══ Stage 09 OK")
+        self._log.info("╚══ Stage 11 OK")
 
-    # ── Frontier-exploration fallback (stage 09.b + 10.a) ─────────────────────
+    # ── Frontier-exploration fallback (stage 11.b + 12.a) ─────────────────────
 
-    def _stage_09b_launch_frontier(self) -> None:
+    def _stage_11b_launch_frontier(self) -> None:
         """Launch the frontier-exploration fallback stack (FAIL mode only).
 
-        Deferred to here (after stage 09) so its prerequisites — SLAM, EKF, the
+        Deferred to here (after stage 11) so its prerequisites — SLAM, EKF, the
         D435i driver, the AMR controller, and the trajectory planner — are
-        already up. The nodes idle until the 10.a trigger on
+        already up. The nodes idle until the 12.a trigger on
         /map_fail_fallback/start. astar_planner2 + spline_follower are NOT started
-        here; they come from stage 09 (the single planner instance)."""
+        here; they come from stage 11 (the single planner instance)."""
         cfg_f = self._cfg.get('frontier', {})
         goal_id = self._cfg['aruco']['goal_marker_id']
-        self._log.info("╔══ Stage 09.b: Launch frontier-exploration fallback")
+        self._log.info("╔══ Stage 11.b: Launch frontier-exploration fallback")
         cmd = [
             'ros2', 'launch', 'frontier_explorer', 'frontier_explorer_launch.py',
             f"odom_topic:={cfg_f.get('odom_topic', '/amr/ekf/odom')}",
@@ -1502,10 +1617,10 @@ class MissionOrchestratorNode(Node):
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self._processes['frontier_exploration'] = proc
         self._log.info(
-            f"  frontier_explorer launched (pid={proc.pid}) — idle until 10.a")
-        self._log.info("╚══ Stage 09.b OK")
+            f"  frontier_explorer launched (pid={proc.pid}) — idle until 12.a")
+        self._log.info("╚══ Stage 11.b OK")
 
-    def _stage_10a_start_frontier(self) -> None:
+    def _stage_12a_start_frontier(self) -> None:
         """Trigger frontier exploration by publishing True on the start topic.
 
         Sent once the rest of the bringup is complete. The subscriber uses
@@ -1516,7 +1631,7 @@ class MissionOrchestratorNode(Node):
         cfg_f = self._cfg.get('frontier', {})
         topic = cfg_f.get('start_topic', '/map_fail_fallback/start')
         timeout = float(cfg_f.get('start_ready_timeout_sec', 30.0))
-        self._log.info(f"╔══ Stage 10.a: Start frontier exploration → {topic}")
+        self._log.info(f"╔══ Stage 12.a: Start frontier exploration → {topic}")
 
         deadline = time.monotonic() + timeout
         while self._pub_map_fail_start.get_subscription_count() == 0:
@@ -1532,16 +1647,16 @@ class MissionOrchestratorNode(Node):
         for _ in range(3):
             self._pub_map_fail_start.publish(msg)
             time.sleep(0.2)
-        self._log.info("╚══ Stage 10.a OK: frontier exploration triggered")
+        self._log.info("╚══ Stage 12.a OK: frontier exploration triggered")
 
     # ════════════════════════════════════════════════════════════════════════
-    # Stage 10 — Observer
+    # Stage 12 — Observer
     # ════════════════════════════════════════════════════════════════════════
 
-    def _stage_10_observer(self) -> None:
-        self._log.info("╔══ Stage 10: Enter observer mode")
+    def _stage_12_observer(self) -> None:
+        self._log.info("╔══ Stage 12: Enter observer mode")
         self._start_observer()
-        self._log.info("╚══ Stage 10 OK: observing")
+        self._log.info("╚══ Stage 12 OK: observing")
 
     # ── Observer implementation ──────────────────────────────────────────────
 
@@ -1652,11 +1767,14 @@ class MissionOrchestratorNode(Node):
             self._stage_04b_publish_aruco_poses(markers)
             self._stage_04c_classify_and_branch(markers)
 
-            # ── 05 Isaac ROS Visual SLAM bringup ──
-            self._log.info("━━━━━━  Stage 05: Isaac ROS Visual SLAM bringup  ━━━━━━")
-            self._stage_05a_verify_realsense()
-            self._stage_05b_start_vslam()
-            self._stage_05c_check_vslam_odometry()
+            # ── 05 Isaac ROS Visual SLAM bringup (gated on vslam.enabled) ──
+            if self._cfg.get('vslam', {}).get('enabled', False):
+                self._log.info("━━━━━━  Stage 05: Isaac ROS Visual SLAM bringup  ━━━━━━")
+                self._stage_05a_verify_realsense()
+                self._stage_05b_start_vslam()
+                self._stage_05c_check_vslam_odometry()
+            else:
+                self._log.info("Stage 05 VSLAM disabled — skipping")
 
             # ── 06 Rasp bringup ──
             self._log.info("━━━━━━  Stage 06: Rasp bringup  ━━━━━━")
@@ -1669,30 +1787,38 @@ class MissionOrchestratorNode(Node):
             self._log.info("━━━━━━  Stage 07: Emergency stop bringup  ━━━━━━")
             self._stage_07a_emergency_stop()
 
-            # ── 08 Mapping bringup ──
-            self._log.info("━━━━━━  Stage 08: Mapping bringup  ━━━━━━")
-            self._stage_08a_launch_oradar()
-            self._stage_08b_publish_static_tf()
-            self._stage_08c_amr_mapper()
+            # ── 08 AMR Aruco localizer ──
+            self._log.info("━━━━━━  Stage 08: AMR Aruco localizer  ━━━━━━")
+            self._stage_08_amr_localizer()
 
-            # ── 09 Trajectory planner bringup ──
-            self._log.info("━━━━━━  Stage 09: Trajectory planner bringup  ━━━━━━")
-            self._stage_09_trajectory_planner()
-            # 09.b (map FAILED only): bring up the frontier-exploration stack now
-            # that its prerequisites are running; it idles until the 10.a trigger.
+            # ── 09 Mapping bringup ──
+            self._log.info("━━━━━━  Stage 09: Mapping bringup  ━━━━━━")
+            self._stage_09a_launch_oradar()
+            self._stage_09b_publish_static_tf()
+            self._stage_09c_amr_mapper()
+
+            # ── 10 Map fusion ──
+            self._log.info("━━━━━━  Stage 10: Map fusion  ━━━━━━")
+            self._stage_10_map_fusion()
+
+            # ── 11 Trajectory planner bringup ──
+            self._log.info("━━━━━━  Stage 11: Trajectory planner bringup  ━━━━━━")
+            self._stage_11_trajectory_planner()
+            # 11.b (map FAILED only): bring up the frontier-exploration stack now
+            # that its prerequisites are running; it idles until the 12.a trigger.
             if self._map_failed:
-                self._stage_09b_launch_frontier()
+                self._stage_11b_launch_frontier()
 
-            # ── 10 Observer ──
-            # 10.a: if the map failed, start frontier exploration now that the
+            # ── 12 Observer ──
+            # 12.a: if the map failed, start frontier exploration now that the
             # rest of the bringup is complete.
-            self._stage_10a_start_frontier()
+            self._stage_12a_start_frontier()
             self._mission_complete = True
             self._log.info(
                 "━━━━━━  MISSION ORCHESTRATION COMPLETE  ━━━━━━\n"
                 "mapper and trajectory_planner are now operating autonomously.\n"
                 "Press Ctrl+C to exit.")
-            self._stage_10_observer()
+            self._stage_12_observer()
 
         except MissionAbortError as exc:
             self._log.error(f"MISSION ABORTED: {exc}")

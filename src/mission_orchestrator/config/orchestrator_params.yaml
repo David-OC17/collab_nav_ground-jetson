@@ -68,6 +68,15 @@ orchestrator:
     amr_pose_topic: "/aruco/amr/pose"
     goal_pose_topic: "/aruco/goal/pose"
 
+  # ── AMR Aruco localizer (stage 08) ───────────────────────────────────────
+  amr_localizer:
+    pose_topic: "/aruco_pose"
+    ready_timeout_sec: 30.0
+    # used only when vslam.enabled (IR stream from the VSLAM RealSense):
+    vslam_image_topic: "/camera/infra1/image_rect_raw"
+    vslam_camera_info_topic: "/camera/infra1/camera_info"
+    vslam_camera_frame: "camera_infra1_optical_frame"
+
   # ── trajectory_planner ──────────────────────────────────────────────────
   trajectory_planner:
     ready_topic: "/trajectory_planner2/path"  # topic the node advertises on startup
@@ -124,6 +133,18 @@ orchestrator:
     server_ready_timeout_sec: 30.0
     drone_map_topic: "/drone/map"
 
+    # ── Template grid (fail-mode empty map) ───────────────────────────────
+    # Published to /drone/map when the stitched map fails classification, so
+    # downstream consumers have a bordered empty arena to fall back on.
+    template_grid:
+      arena_width_m: 4.0
+      arena_height_m: 4.0
+      resolution_m_per_cell: 0.05
+      wall_occ: 100
+      free_occ: 0
+      border_cells: 2
+      frame_id: "world"
+
     # ── Online vs offline stitching ───────────────────────────────────────
     # online: true  → bring the map-builder server up in ONLINE mode before the
     #   flight; it stitches live from the drone's processed-image stream during
@@ -142,6 +163,7 @@ orchestrator:
 
   # ── Isaac ROS Visual SLAM (cuVSLAM) — stage 05 ──────────────────────────
   vslam:
+    enabled: false                       # gate stage 05 (VSLAM bringup)
     odometry_topic: "/visual_slam/tracking/odometry"
     odometry_timeout_sec: 30.0           # max wait for the first odometry msg
     realsense_usb_id: "8086:0b3a"        # Intel RealSense D435i USB id (lsusb)

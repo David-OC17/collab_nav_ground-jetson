@@ -90,13 +90,15 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
     def _stage_06c_launch_amr(self) -> None: pass
     def _stage_06d_wait_imu_ready(self) -> None: pass
     def _stage_07a_emergency_stop(self) -> None: pass
+    def _stage_08_amr_localizer(self) -> None: pass
+    def _stage_10_map_fusion(self) -> None: pass
 
-    # ── Flag-gated: trajectory_planner (09) ──────────────────────────────────
-    def _stage_09_trajectory_planner(self) -> None:
+    # ── Flag-gated: trajectory_planner (11) ──────────────────────────────────
+    def _stage_11_trajectory_planner(self) -> None:
         if self.skip_trajectory_planner:
-            self._log.info("  [stage 09] trajectory_planner skipped (--trajectory-planner=false)")
+            self._log.info("  [stage 11] trajectory_planner skipped (--trajectory-planner=false)")
             return
-        super()._stage_09_trajectory_planner()
+        super()._stage_11_trajectory_planner()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -78,10 +78,12 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
     def _stage_06c_launch_amr(self) -> None: pass
     def _stage_06d_wait_imu_ready(self) -> None: pass
     def _stage_07a_emergency_stop(self) -> None: pass
-    def _stage_08a_launch_oradar(self) -> None: pass
-    def _stage_08b_publish_static_tf(self) -> None: pass
-    def _stage_08c_amr_mapper(self) -> None: pass
-    def _stage_09_trajectory_planner(self) -> None: pass
+    def _stage_08_amr_localizer(self) -> None: pass
+    def _stage_09a_launch_oradar(self) -> None: pass
+    def _stage_09b_publish_static_tf(self) -> None: pass
+    def _stage_09c_amr_mapper(self) -> None: pass
+    def _stage_10_map_fusion(self) -> None: pass
+    def _stage_11_trajectory_planner(self) -> None: pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -67,11 +67,13 @@ class _HwTestOrchestrator(MissionOrchestratorNode):
     def _stage_05b_start_vslam(self) -> None: pass
     def _stage_05c_check_vslam_odometry(self) -> None: pass
     def _stage_07a_emergency_stop(self) -> None: pass
-    def _stage_08a_launch_oradar(self) -> None: pass
-    def _stage_08b_publish_static_tf(self) -> None: pass
-    def _stage_08c_amr_mapper(self) -> None: pass
+    def _stage_08_amr_localizer(self) -> None: pass
+    def _stage_09a_launch_oradar(self) -> None: pass
+    def _stage_09b_publish_static_tf(self) -> None: pass
+    def _stage_09c_amr_mapper(self) -> None: pass
+    def _stage_10_map_fusion(self) -> None: pass
 
-    def _stage_09_trajectory_planner(self) -> None:
+    def _stage_11_trajectory_planner(self) -> None:
         self._log.info("══════════════════════════════════════════════════")
         self._log.info("  Stages 01 + 03 + 06 PASSED")
         self._log.info("  tello_driver, tello_map and the AMR service are running.")
