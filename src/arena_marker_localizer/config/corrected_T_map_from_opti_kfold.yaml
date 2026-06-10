@@ -1,10 +1,10 @@
 summary:
   n_folds: 6
   total_test_points: 14
-  min_pos_error_m: 0.060596
-  mean_pos_error_m: 0.190522
-  max_pos_error_m: 0.328066
-  mean_ang_error_deg: 0.9791
+  min_pos_error_m: 0.033539
+  mean_pos_error_m: 0.191343
+  max_pos_error_m: 0.33918
+  mean_ang_error_deg: 0.9119
 folds:
 - fold: 1
   train_pairs:
@@ -18,19 +18,19 @@ folds:
   test_pairs:
   - 1
   fitted:
-    c_x: -0.028003
-    c_y: 0.050519
-    dx_d: -0.1
-    dy_d: -0.082285
-    dz_d: 0.1
+    c_x: 0.021977
+    c_y: 0.010948
+    dx_d: -0.030877
+    dy_d: -0.022869
+    dz_d: 0.008191
     scale: 0.0
-  condition_number: 18.44
+  condition_number: 18.45
   degenerate: false
-  rms_pos_m: 0.234405
+  rms_pos_m: 0.235579
   test_pos_errors_m:
-  - 0.317356
-  - 0.095791
-  mean_ang_err_deg: 0.5219
+  - 0.308042
+  - 0.126907
+  mean_ang_err_deg: 0.5727
 - fold: 2
   train_pairs:
   - 1
@@ -43,18 +43,18 @@ folds:
   test_pairs:
   - 2
   fitted:
-    c_x: -0.038275
-    c_y: 0.038927
-    dx_d: -0.1
-    dy_d: -0.072867
+    c_x: 0.014803
+    c_y: 0.003651
+    dx_d: -0.040472
+    dy_d: -0.014352
     dz_d: 0.1
     scale: 0.0
   condition_number: 18.36
   degenerate: false
-  rms_pos_m: 0.186619
+  rms_pos_m: 0.202321
   test_pos_errors_m:
-  - 0.186619
-  mean_ang_err_deg: 0.4477
+  - 0.202321
+  mean_ang_err_deg: 0.2653
 - fold: 3
   train_pairs:
   - 1
@@ -67,20 +67,20 @@ folds:
   test_pairs:
   - 3
   fitted:
-    c_x: -0.050822
-    c_y: 0.04155
-    dx_d: -0.1
-    dy_d: -0.07611
+    c_x: -0.001613
+    c_y: 0.004755
+    dx_d: -0.022926
+    dy_d: -0.01837
     dz_d: 0.1
     scale: 0.0
-  condition_number: 16.14
+  condition_number: 16.13
   degenerate: false
-  rms_pos_m: 0.108555
+  rms_pos_m: 0.09885
   test_pos_errors_m:
-  - 0.136883
-  - 0.060596
-  - 0.11377
-  mean_ang_err_deg: 1.5895
+  - 0.118992
+  - 0.033539
+  - 0.118449
+  mean_ang_err_deg: 1.529
 - fold: 4
   train_pairs:
   - 1
@@ -93,19 +93,19 @@ folds:
   test_pairs:
   - 4
   fitted:
-    c_x: -0.042802
-    c_y: 0.038815
-    dx_d: -0.1
-    dy_d: -0.04696
+    c_x: 0.01542
+    c_y: 0.018606
+    dx_d: -0.053568
+    dy_d: 0.015142
     dz_d: 0.1
     scale: 0.0
-  condition_number: 17.31
+  condition_number: 17.39
   degenerate: false
-  rms_pos_m: 0.11269
+  rms_pos_m: 0.149939
   test_pos_errors_m:
-  - 0.099652
-  - 0.124368
-  mean_ang_err_deg: 1.0791
+  - 0.110312
+  - 0.181093
+  mean_ang_err_deg: 0.8611
 - fold: 5
   train_pairs:
   - 1
@@ -118,22 +118,22 @@ folds:
   test_pairs:
   - 5
   fitted:
-    c_x: -0.122482
-    c_y: 0.000499
-    dx_d: -0.1
-    dy_d: -0.056252
-    dz_d: 0.1
+    c_x: -0.070403
+    c_y: -0.037462
+    dx_d: -0.009704
+    dy_d: 0.00478
+    dz_d: 0.07093
     scale: 0.0
-  condition_number: 22.34
+  condition_number: 22.09
   degenerate: false
-  rms_pos_m: 0.242531
+  rms_pos_m: 0.230067
   test_pos_errors_m:
-  - 0.291599
-  - 0.247078
-  - 0.226525
-  - 0.232804
-  - 0.206198
-  mean_ang_err_deg: 0.4817
+  - 0.282036
+  - 0.233646
+  - 0.192729
+  - 0.227068
+  - 0.204489
+  mean_ang_err_deg: 0.4546
 - fold: 8
   train_pairs:
   - 1
@@ -146,15 +146,15 @@ folds:
   test_pairs:
   - 8
   fitted:
-    c_x: -0.026268
-    c_y: 0.050601
-    dx_d: -0.1
-    dy_d: -0.03599
+    c_x: 0.021727
+    c_y: 0.023259
+    dx_d: -0.041232
+    dy_d: 0.022118
     dz_d: 0.1
     scale: 0.0
-  condition_number: 18.46
+  condition_number: 18.53
   degenerate: false
-  rms_pos_m: 0.328066
+  rms_pos_m: 0.33918
   test_pos_errors_m:
-  - 0.328066
-  mean_ang_err_deg: 2.8803
+  - 0.33918
+  mean_ang_err_deg: 2.7739
