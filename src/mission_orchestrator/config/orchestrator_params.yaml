@@ -18,7 +18,7 @@ orchestrator:
   # ── IMU readiness ───────────────────────────────────────────────────────
   imu:
     topic: "/amr/imu/data_raw"
-    message_count: 200                  # Number of messages to wait for
+    message_count: 10                  # Number of messages to wait for
     timeout_sec: 60.0
 
   # ── OptiTrack ───────────────────────────────────────────────────────────
@@ -107,11 +107,6 @@ orchestrator:
     aruco_dict: "DICT_4X4_50"
     rviz: false
     # target_marker_id is taken from aruco.goal_marker_id
-
-  # ── map_fusion ──────────────────────────────────────────────────────────
-  map_fusion:
-    ready_topic: "/fusion/status"            # published immediately on node start
-    ready_timeout_sec: 30.0
 
   # ── oradar lidar ────────────────────────────────────────────────────────
   oradar:

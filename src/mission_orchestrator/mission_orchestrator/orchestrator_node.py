@@ -58,7 +58,8 @@ Major stages and substages
      09.c  Launch odom-based mapper (no SLAM)
  10  Map fusion
      Launch fusion.launch.py (overlays the drone map and the AMR-built map);
-     wait for /fusion/status before continuing.
+     fire-and-forget — no readiness wait (fusion only emits once /drone/map
+     exists, so there is nothing to block on).
  11  Trajectory planner bringup (astar_planner2 + spline_follower)
      map_topic = /drone/map on PASS, /fusion/map on FAIL (the dumped-map case)
      11.b (FAIL only) Launch the frontier-exploration fallback stack; it idles
@@ -1546,6 +1547,9 @@ class MissionOrchestratorNode(Node):
     # ════════════════════════════════════════════════════════════════════════
 
     def _stage_10_map_fusion(self) -> None:
+        # Fire-and-forget: launch the fusion node and move on. We do NOT wait on a
+        # readiness topic — the node only emits its fused grid once a /drone/map is
+        # available, so there is nothing meaningful to block on here.
         self._log.info("╔══ Stage 10: Launch map fusion")
         proc = subprocess.Popen(
             ['ros2', 'launch', 'fusion', 'fusion.launch.py'],
@@ -1553,9 +1557,6 @@ class MissionOrchestratorNode(Node):
         )
         self._processes['map_fusion'] = proc
         self._log.info(f"  fusion launched (pid={proc.pid})")
-        cfg_mf = self._cfg['map_fusion']
-        self._wait_for_publisher(
-            cfg_mf['ready_topic'], cfg_mf['ready_timeout_sec'], 'map_fusion')
         self._log.info("╚══ Stage 10 OK")
 
     # ════════════════════════════════════════════════════════════════════════
