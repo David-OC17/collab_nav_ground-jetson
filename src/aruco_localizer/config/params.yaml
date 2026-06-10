@@ -1,0 +1,51 @@
+aruco_localizer:
+  ros__parameters:
+
+    # ── Marcadores ─────────────────────────────────────────────────────────────
+    # Tamaño del lado del marcador en metros (el mismo para todos)
+    marker_size: 0.135
+
+    # Diccionario ArUco:
+    #   DICT_4X4_50  = 0   ← recomendado para arena pequeña (detectabilidad alta)
+    #   DICT_5X5_100 = 4
+    #   DICT_6X6_250 = 8
+    aruco_dict_id: 0
+
+    # IDs de marcadores cuyas poses en 'world' son conocidas
+    # Debe existir un TF estático  world → aruco_<id>  para cada uno
+    marker_ids: [15, 16, 17, 18]
+
+    # ── Frames ─────────────────────────────────────────────────────────────────
+    world_frame:  'world'
+    base_frame:   'base_footprint'
+    # Frame óptico de la cámara de color de la RealSense
+    camera_frame: 'camera_color_optical_frame'
+
+    # ── Publicación ────────────────────────────────────────────────────────────
+    pose_topic: '/aruco_pose'
+
+    # Publicar imagen anotada en /aruco_localizer/debug_image (útil en desarrollo)
+    debug_image: true
+
+    # Emitir TF world → aruco_base_footprint_est (SOLO para debug en RViz)
+    # No activar cuando se use junto al EKF de robot_localization
+    publish_tf: false
+
+    # ── Filtros de calidad ─────────────────────────────────────────────────────
+    # Descartar marcadores más lejos de este valor (metros)
+    max_marker_dist: 4.0
+
+    # Perímetro mínimo en píxeles.  Sube este valor si aparecen falsos positivos.
+    min_perimeter_px: 50.0
+
+    # ── Modelo de covarianza ───────────────────────────────────────────────────
+    # sigma_xy  = cov_base_xy  + cov_dist_xy  * distancia_al_marcador
+    # sigma_yaw = cov_base_yaw + cov_dist_yaw * distancia_al_marcador
+    #
+    # Ajusta según la precisión real medida contra ground-truth (OptiTrack).
+    # Valores conservadores (grandes) → el EKF confía más en la odometría.
+    # Valores pequeños → el EKF confía más en el ArUco.
+    cov_base_xy:   0.01   # m
+    cov_dist_xy:   0.02   # m / m
+    cov_base_yaw:  0.02   # rad
+    cov_dist_yaw:  0.03   # rad / m
