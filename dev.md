@@ -381,6 +381,7 @@ src/arena_marker_localizer/scripts/calibrate_bias_v3 \
 ```bash
   docker start isaac_ros_vslam
   docker exec -it isaac_ros_vslam bash
+  source install/setup.bash
   ros2 launch isaac_ros_visual_slam isaac_ros_visual_slam_realsense.launch.py
 ```
 

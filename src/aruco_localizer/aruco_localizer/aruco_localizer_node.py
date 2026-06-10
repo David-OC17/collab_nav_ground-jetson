@@ -58,10 +58,14 @@ class ArucoLocalizerNode(Node):
         # ── Parámetros ────────────────────────────────────────────────────────
         self.declare_parameter('marker_size',    0.135)        # metros
         self.declare_parameter('aruco_dict_id',  cv2.aruco.DICT_4X4_50)
-        self.declare_parameter('marker_ids',     [15, 16, 17, 18])
+        self.declare_parameter('marker_ids',     [15, 16, 17, 21])
         self.declare_parameter('world_frame',    'world')
         self.declare_parameter('base_frame',     'base_footprint')
         self.declare_parameter('camera_frame',   'camera_color_optical_frame')
+        self.declare_parameter('image_topic',
+            '/camera/realsense2_camera/color/image_raw')
+        self.declare_parameter('camera_info_topic',
+            '/camera/realsense2_camera/color/camera_info')
         self.declare_parameter('pose_topic',     '/aruco_pose')
         self.declare_parameter('debug_image',    True)
         self.declare_parameter('publish_tf',     False)   # TF directo (debug)
@@ -128,9 +132,9 @@ class ArucoLocalizerNode(Node):
 
         # ── Suscripciones ─────────────────────────────────────────────────────
         self.create_subscription(
-            CameraInfo, '/camera/realsense2_camera/color/camera_info', self._cb_info, 1)
+            CameraInfo, p('camera_info_topic').value, self._cb_info, 1)
         self.create_subscription(
-            Image, '/camera/realsense2_camera/color/image_raw', self._cb_image, 10)
+            Image, p('image_topic').value, self._cb_image, 10)
 
         # ── Publicadores ──────────────────────────────────────────────────────
         self.pose_pub = self.create_publisher(

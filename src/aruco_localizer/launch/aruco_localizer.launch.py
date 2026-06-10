@@ -35,7 +35,7 @@ MARKER_POSES = [
     (15,  0.1344, 0.1344, 0.19,  90.0,  0.0,   135.0),   # sur-oeste
     (16,  0.1344, 3.735, 0.19,  90.0,  0.0,   45.0),   # pared norte-oeste
     (17,  3.724, 3.735, 0.19,  90.0,  0.0, -45.0),   # pared norte-este
-    (18,  3.715, 0.1344, 0.19,  90.0,  0.0, -135.0),   # pared sur-este
+    (21,  3.715, 0.1344, 0.19,  90.0,  0.0, -135.0),   # pared sur-este
 ]
 
 # ─── Posición de la cámara en el robot ───────────────────────────────────────
@@ -58,12 +58,24 @@ def generate_launch_description():
 
     use_realsense = LaunchConfiguration('use_realsense')
     use_rviz      = LaunchConfiguration('use_rviz')
+    image_topic       = LaunchConfiguration('image_topic')
+    camera_info_topic = LaunchConfiguration('camera_info_topic')
+    camera_frame      = LaunchConfiguration('camera_frame')
 
     args = [
         DeclareLaunchArgument('use_realsense', default_value='true',
             description='Lanzar nodo realsense2_camera'),
         DeclareLaunchArgument('use_rviz', default_value='false',
             description='Lanzar RViz con config de debug'),
+        DeclareLaunchArgument('image_topic',
+            default_value='/camera/realsense2_camera/color/image_raw',
+            description='Topic de imagen de entrada para el localizer'),
+        DeclareLaunchArgument('camera_info_topic',
+            default_value='/camera/realsense2_camera/color/camera_info',
+            description='Topic de camera_info de entrada para el localizer'),
+        DeclareLaunchArgument('camera_frame',
+            default_value='camera_color_optical_frame',
+            description='Frame óptico de la cámara usada por el localizer'),
     ]
 
     nodes = []
@@ -134,7 +146,11 @@ def generate_launch_description():
         package='aruco_localizer',
         executable='aruco_localizer_node',
         name='aruco_localizer',
-        parameters=[config],
+        parameters=[config, {
+            'image_topic':       image_topic,
+            'camera_info_topic': camera_info_topic,
+            'camera_frame':      camera_frame,
+        }],
         output='screen',
         emulate_tty=True,
     )

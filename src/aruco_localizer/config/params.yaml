@@ -13,7 +13,7 @@ aruco_localizer:
 
     # IDs de marcadores cuyas poses en 'world' son conocidas
     # Debe existir un TF estático  world → aruco_<id>  para cada uno
-    marker_ids: [15, 16, 17, 18]
+    marker_ids: [15, 16, 17, 21]
 
     # ── Frames ─────────────────────────────────────────────────────────────────
     world_frame:  'world'
