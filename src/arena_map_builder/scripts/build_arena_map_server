@@ -199,7 +199,7 @@ class BuildArenaMapServer(Node):
         self.declare_parameter("stitch.reconstruct.grid_hsv_v_lo",              50)
 
         # Feature extractor / matcher (independent)
-        self.declare_parameter("stitch.reconstruct.feature_extractor", "superpoint")
+        self.declare_parameter("stitch.reconstruct.feature_extractor", "sift")
         self.declare_parameter("stitch.reconstruct.feature_matcher",   "ratio_test")
         self.declare_parameter("stitch.reconstruct.sp_ort_provider",   "cuda")
         self.declare_parameter("stitch.reconstruct.sp_onnx_path",      "")

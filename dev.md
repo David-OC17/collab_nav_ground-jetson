@@ -497,3 +497,19 @@ source install/setup.bash
 mamba install -c conda-forge 'cuda-version=12.*' cudnn
 pip install onnxruntime-gpu
 ```
+
+## Actually use these to test
+
+All but drone pipeline:
+```bash
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 21
+python3 src/mission_orchestrator/scripts/run_hw_test_full_nav.py --scan-id 21
+```
+
+Only mapping (run teleop manually):
+```bash
+python3 src/mission_orchestrator/scripts/run_hw_test_amr_mapping.py
+
+# or with recording:
+python3 src/mission_orchestrator/scripts/run_hw_test_amr_mapping.py --rosbag
+```

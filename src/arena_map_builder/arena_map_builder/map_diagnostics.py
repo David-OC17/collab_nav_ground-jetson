@@ -48,9 +48,10 @@ import cv2
 import numpy as np
 
 try:
-    from .transfer_obstacles import Blob, TransferConfig, build_clean_masks, extract_blobs
+    from .processing.transfer_obstacles import Blob, TransferConfig, build_clean_masks, extract_blobs
 except ImportError:
-    from transfer_obstacles import Blob, TransferConfig, build_clean_masks, extract_blobs
+    from arena_map_builder.processing.transfer_obstacles import (
+        Blob, TransferConfig, build_clean_masks, extract_blobs)
 
 # ObstacleConsistency is only used when the consistency pipeline was run;
 # import it lazily so the module works without it.

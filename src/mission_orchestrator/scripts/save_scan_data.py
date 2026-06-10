@@ -63,6 +63,7 @@ sys.path.insert(
 )
 
 from mission_orchestrator.orchestrator_node import (  # noqa: E402
+    MissionAbortError,
     MissionOrchestratorNode,
     _yaw_from_quat,
 )
@@ -146,6 +147,14 @@ class _SaveScanOrchestrator(MissionOrchestratorNode):
         # self._last_map_result. The map + goal pose are published/saved in the
         # 04.c override below.
         super()._stage_04b_publish_aruco_poses(markers)
+
+        # A data-capture run has nothing to save if the map build failed. The
+        # base _await_map_result returns None (instead of aborting) on failure,
+        # so abort cleanly here rather than dereferencing a missing result.
+        if self._last_map_result is None:
+            raise MissionAbortError(
+                "BuildArenaMap produced no map — nothing to save "
+                "(check the server log / transfer.background_path)")
 
         cfg_a = self._cfg['aruco']
         amr_id = cfg_a['amr_marker_id']
