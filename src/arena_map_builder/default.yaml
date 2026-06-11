@@ -72,8 +72,8 @@ build_arena_map_server:
 
     occupancy:
       resolution_m_per_cell: 0.05
-      arena_width_m: 4.0
-      arena_height_m: 4.0
+      arena_width_m: 3.9
+      arena_height_m: 3.9
       background_occ: 10
       obstacle_core_occ: 90
       wall_occ: 100

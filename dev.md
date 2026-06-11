@@ -326,17 +326,29 @@ src/arena_marker_localizer/scripts/calibrate_bias_v3 \
 ```
 ```bash
 src/arena_marker_localizer/scripts/calibrate_bias_v3 \
-    --test-video  src/arena_map_builder/data/drone_scans/scan18/scan.mp4 \
-    --test-csv    src/arena_map_builder/data/drone_scans/scan18/telemetry.csv \
-    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan18.yaml \
+    --test-video  src/arena_map_builder/data/drone_scans/scan24/scan.mp4 \
+    --test-csv    src/arena_map_builder/data/drone_scans/scan24/telemetry.csv \
+    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan24.yaml \
     \
-    --test-video  src/arena_map_builder/data/drone_scans/scan19/scan.mp4 \
-    --test-csv    src/arena_map_builder/data/drone_scans/scan19/telemetry.csv \
-    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan19.yaml \
+    --test-video  src/arena_map_builder/data/drone_scans/scan25/scan.mp4 \
+    --test-csv    src/arena_map_builder/data/drone_scans/scan25/telemetry.csv \
+    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan25.yaml \
     \
-    --test-video  src/arena_map_builder/data/drone_scans/scan20/scan.mp4 \
-    --test-csv    src/arena_map_builder/data/drone_scans/scan20/telemetry.csv \
-    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan20.yaml \
+    --test-video  src/arena_map_builder/data/drone_scans/scan26/scan.mp4 \
+    --test-csv    src/arena_map_builder/data/drone_scans/scan26/telemetry.csv \
+    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan26.yaml \
+    \
+    --test-video  src/arena_map_builder/data/drone_scans/scan27/scan.mp4 \
+    --test-csv    src/arena_map_builder/data/drone_scans/scan27/telemetry.csv \
+    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan27.yaml \
+    \
+    --test-video  src/arena_map_builder/data/drone_scans/scan28/scan.mp4 \
+    --test-csv    src/arena_map_builder/data/drone_scans/scan28/telemetry.csv \
+    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan28.yaml \
+    \
+    --test-video  src/arena_map_builder/data/drone_scans/scan29/scan.mp4 \
+    --test-csv    src/arena_map_builder/data/drone_scans/scan29/telemetry.csv \
+    --test-gt     src/arena_marker_localizer/config/aruco_pose_gt/scan29.yaml \
     \
     --video  src/arena_map_builder/data/manual_scans/scan2/scan.mp4 \
     --csv    src/arena_map_builder/data/manual_scans/scan2/telemetry.csv \
@@ -508,8 +520,16 @@ python3 src/mission_orchestrator/scripts/run_hw_test_full_nav.py --scan-id 21
 
 Only mapping (run teleop manually):
 ```bash
-python3 src/mission_orchestrator/scripts/run_hw_test_amr_mapping.py
+python3 src/mission_orchestrator/scripts/save_scan_data.py --scan-id 21
+python3 src/mission_orchestrator/scripts/run_hw_test_amr_mapping.py --scan-id 21
+```
 
-# or with recording:
-python3 src/mission_orchestrator/scripts/run_hw_test_amr_mapping.py --rosbag
+Drone only pipeline:
+```bash
+python3 src/mission_orchestrator/scripts/run_hw_test_drone.py
+```
+
+Drone and online stitching:
+```bash
+python3 src/mission_orchestrator/scripts/run_hw_test_drone_stitch.py
 ```

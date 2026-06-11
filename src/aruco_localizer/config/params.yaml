@@ -33,7 +33,7 @@ aruco_localizer:
 
     # ── Filtros de calidad ─────────────────────────────────────────────────────
     # Descartar marcadores más lejos de este valor (metros)
-    max_marker_dist: 4.0
+    max_marker_dist: 2.5
 
     # Perímetro mínimo en píxeles.  Sube este valor si aparecen falsos positivos.
     min_perimeter_px: 50.0

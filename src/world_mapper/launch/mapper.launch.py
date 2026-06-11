@@ -21,8 +21,8 @@ def generate_launch_description():
                 "origin_x": 0.0,               # set both to 0.0 if arena is in +x/+y quadrant
                 "origin_y": 0.0,
 
-                "l_occ": 0.85,
-                "l_free": -0.40,
+                "l_occ": 0.65,
+                "l_free": -0.60,
                 "l_min": -5.0,
                 "l_max": 5.0,
 

@@ -101,6 +101,10 @@ class SplineFollower(Node):
         self.s_decel_start = 0.0  # arc-length where deceleration begins
         self.peak_speed    = 0.0  # actual cruise speed (≤ max_speed)
 
+        self.last_x = 0.0
+        self.last_y = 0.0
+        self.last_yaw = 0.0
+
         # ------------------------------------------------------------------
         # QoS
         # ------------------------------------------------------------------
@@ -147,8 +151,23 @@ class SplineFollower(Node):
             self.get_logger().error('scipy unavailable — cannot build spline.')
             return
 
+        # Treat an empty Path as a cancellation command (frontier explore overriden by aruco in FOV)
         if len(msg.poses) < 2:
-            self.get_logger().warn('Path has < 2 poses — ignoring.')
+            self.get_logger().warn(
+                'Received empty/invalid path. Stopping trajectory execution.')
+
+            # Clear current spline
+            self.cs_x = None
+            self.cs_y = None
+            self.total_len = 0.0
+            self.s_current = 0.0
+
+            # Force idle mode
+            self.goal_reached = True
+
+            # Publish one immediate stop command
+            self._publish_zero()
+
             return
 
         xs = np.array([p.pose.position.x for p in msg.poses], dtype=float)
@@ -345,6 +364,10 @@ class SplineFollower(Node):
         msg.twist.twist.linear.z  = 0.0
         msg.twist.twist.angular.z = omega
 
+        self.last_x = x
+        self.last_y = y
+        self.last_yaw = yaw
+
         self.ref_pub.publish(msg)
 
     def _publish_zero(self):
@@ -363,7 +386,7 @@ class SplineFollower(Node):
             yaw  = math.atan2(dyds, dxds)
             self._publish_reference(x, y, yaw, 0.0, 0.0, 0.0)
         else:
-            self._publish_reference(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            self._publish_reference(self.last_x, self.last_y, self.last_yaw, 0.0, 0.0, 0.0)
 
 
 # ==============================================================================

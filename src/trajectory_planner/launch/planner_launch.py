@@ -53,7 +53,7 @@ def generate_launch_description():
         package='trajectory_planner',
         executable='astar_planner2',
         name='astar_planner2',
-        output='screen',
+        output='screen', 
         parameters=[{
             'map_topic':                LaunchConfiguration('map_topic'),
             'goal_topic':               LaunchConfiguration('goal_topic'),

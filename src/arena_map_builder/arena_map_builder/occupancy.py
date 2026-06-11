@@ -52,8 +52,8 @@ class OccupancyConfig:
     # ── World sizing (REQUIRED for nav2 compatibility) ──────────────────
     resolution_m_per_cell: float = 0.05
     """Resolution in metres per OccupancyGrid cell."""
-    arena_width_m:  float = 4.0
-    arena_height_m: float = 4.0
+    arena_width_m:  float = 3.9
+    arena_height_m: float = 3.9
     """Real-world arena dimensions (the bbox between the inner edges of
     the brown wall). The composited image's arena-bbox will be scaled to
     these dimensions before rasterization."""

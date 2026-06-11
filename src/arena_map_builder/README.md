@@ -109,7 +109,7 @@ All tuning lives in `config/default.yaml`. The most important ones:
 | `consistency`| `position_tol_cells`             | `0.5`        |
 | `consistency`| `perturb_stab_tol`               | `0.25`       |
 | `occupancy`  | `resolution_m_per_cell`          | `0.05`       |
-| `occupancy`  | `arena_width_m / arena_height_m` | `4.0 / 4.0`  |
+| `occupancy`  | `arena_width_m / arena_height_m` | `3.9 / 3.9`  |
 | `occupancy`  | `base_thickness_px`              | `8`          |
 | `occupancy`  | `decay_rate`                     | `3.0`        |
 

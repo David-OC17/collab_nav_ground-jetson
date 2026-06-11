@@ -44,7 +44,7 @@ class MapFusionNode(Node):
 
         # ── Parameters ────────────────────────────────────────────────────────
         self.declare_parameter('drone_map_topic', '/drone/map')
-        self.declare_parameter('amr_map_topic',   '/world_map')
+        self.declare_parameter('amr_map_topic',   '/amr/world_map')
         self.declare_parameter('fused_map_topic', '/fused_map')
 
         drone_topic = self.get_parameter('drone_map_topic').value

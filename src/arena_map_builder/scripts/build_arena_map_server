@@ -247,7 +247,7 @@ class BuildArenaMapServer(Node):
         self.declare_parameter(
             "stitch.reconstruct.marker_color_map",
             [
-                f"5:{CYAN_BGR[0]},{CYAN_BGR[1]},{CYAN_BGR[2]}",  # marker 5 → cyan
+                f"4:{CYAN_BGR[0]},{CYAN_BGR[1]},{CYAN_BGR[2]}",  # marker 4 → cyan
                 f"0:{RED_BGR[0]},{RED_BGR[1]},{RED_BGR[2]}",     # marker 0 → red
             ],
             ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY),
@@ -279,8 +279,8 @@ class BuildArenaMapServer(Node):
 
         # --- Occupancy (OccupancyConfig) ------------------------------------
         self.declare_parameter("occupancy.resolution_m_per_cell", 0.05)
-        self.declare_parameter("occupancy.arena_width_m",         4.0)
-        self.declare_parameter("occupancy.arena_height_m",        4.0)
+        self.declare_parameter("occupancy.arena_width_m",         3.9)
+        self.declare_parameter("occupancy.arena_height_m",        3.9)
         self.declare_parameter("occupancy.background_occ",   10)
         self.declare_parameter("occupancy.obstacle_core_occ", 90)
         self.declare_parameter("occupancy.wall_occ",         100)

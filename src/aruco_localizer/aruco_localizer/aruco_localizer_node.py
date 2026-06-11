@@ -75,7 +75,7 @@ class ArucoLocalizerNode(Node):
         self.declare_parameter('cov_base_yaw',   0.02)    # rad
         self.declare_parameter('cov_dist_yaw',   0.03)    # rad por metro
         # Umbral: descartar detecciones más lejos de este valor (m)
-        self.declare_parameter('max_marker_dist', 4.0)
+        self.declare_parameter('max_marker_dist', 1.5)
         # Mínimo de píxeles de perímetro del marcador (filtra detecciones ruidosas)
         self.declare_parameter('min_perimeter_px', 50.0)
 

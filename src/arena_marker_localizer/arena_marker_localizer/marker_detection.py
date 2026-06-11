@@ -118,6 +118,14 @@ class MultiDictDetector:
                 if not ok:
                     continue
 
+                # IPPE_SQUARE has a planar ambiguity: both solutions have
+                # identical reprojection error, so OpenCV may return the
+                # "wrong" one (marker behind the camera, tvec[2] <= 0).
+                # That solution preserves yaw but reflects the position,
+                # causing way-off positions while orientation looks correct.
+                if tvec.flat[2] <= 0:
+                    continue
+
                 R, _ = cv2.Rodrigues(rvec)
                 T = np.eye(4, dtype=np.float64)
                 T[:3, :3] = R

@@ -1,6 +1,6 @@
 from setuptools import setup
 
-package_name = 'map_fusion_node'
+package_name = 'fusion'
 
 setup(
     name=package_name,
@@ -20,7 +20,7 @@ setup(
     license='MIT',
     entry_points={
         'console_scripts': [
-            'map_fusion_node = map_fusion_node.fusion_node:main',
+            'map_fusion_node = fusion.fusion_node:main',
         ],
     },
 )
