@@ -58,6 +58,8 @@ from std_msgs.msg import ColorRGBA, Bool
 import tf2_ros
 import tf2_geometry_msgs
 
+from ros2_security import SecureNodeMixin
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -67,10 +69,12 @@ OCCUPIED = 100
 LETHAL_THRESHOLD = 50   # cells above this are treated as occupied
 
 
-class FrontierExplorer(Node):
+class FrontierExplorer(SecureNodeMixin, Node):
 
     def __init__(self):
         super().__init__('frontier_explorer')
+        self.declare_parameter('certs_dir', './certs')
+        self.security_init(certs_dir=self.get_parameter('certs_dir').value)
 
         # ------------------------------------------------------------------
         # Parameters
@@ -180,19 +184,13 @@ class FrontierExplorer(Node):
         # ------------------------------------------------------------------
         # Subscribers
         # ------------------------------------------------------------------
-        self.map_sub = self.create_subscription(
-            OccupancyGrid,
-            self.map_topic,
-            self._map_callback,
-            latched_qos
+        self.map_sub = self.create_secure_subscription(
+            self.map_topic, OccupancyGrid, self._map_callback, min_level=None, qos=latched_qos
         )
 
         # Drone map — for safe goal validation (same map A* uses)
-        self.create_subscription(
-            OccupancyGrid,
-            '/drone/map',
-            self._drone_map_callback,
-            latched_qos
+        self.create_secure_subscription(
+            '/drone/map', OccupancyGrid, self._drone_map_callback, min_level=None, qos=latched_qos
         )
         
         # Pose subscriber — two modes:
@@ -218,19 +216,13 @@ class FrontierExplorer(Node):
                 f'Pose source: {self.pose_topic} (direct)')
             
         # Planner failed to create a valid trajectory?
-        self.create_subscription(
-            PoseWithCovarianceStamped,
-            '/astar/goal_failed',
-            self._goal_failed_callback,
-            reliable_qos
+        self.create_secure_subscription(
+            '/astar/goal_failed', PoseWithCovarianceStamped, self._goal_failed_callback, min_level=None, qos=reliable_qos
         )
 
         # MissionController can silence/activate this node at runtime
-        self.active_sub = self.create_subscription(
-            Bool,
-            '/frontier_explorer/active',
-            self._active_callback,
-            reliable_qos
+        self.active_sub = self.create_secure_subscription(
+            '/frontier_explorer/active', Bool, self._active_callback, min_level=None, qos=reliable_qos
         )
 
         # Camera FOV mask — published by camera_fov_tracker
@@ -245,15 +237,8 @@ class FrontierExplorer(Node):
         # ------------------------------------------------------------------
         # Publishers
         # ------------------------------------------------------------------
-        self.goal_pub = self.create_publisher(
-            PoseWithCovarianceStamped,
-            self.goal_topic,
-            reliable_qos
-        )
-        self.marker_pub = self.create_publisher(
-            MarkerArray,
-            self.marker_topic,
-            reliable_qos
+        self.goal_pub = self.create_secure_publisher(self.goal_topic, PoseWithCovarianceStamped, reliable_qos)
+        self.marker_pub = self.create_secure_publisher(self.marker_topic, MarkerArray, reliable_qos
         )
 
         # ------------------------------------------------------------------
@@ -872,7 +857,7 @@ class FrontierExplorer(Node):
         msg.pose.pose.position.z    = 0.0
         msg.pose.pose.orientation.w = 1.0
         # Identity covariance — MissionController / AStarPlanner2 don't use it
-        self.goal_pub.publish(msg)
+        self.secure_publish(self.goal_pub, msg)
 
     def _publish_markers(self, clusters: list, best_centroid: tuple):
         """
@@ -938,7 +923,7 @@ class FrontierExplorer(Node):
 
             array.markers.append(m)
 
-        self.marker_pub.publish(array)
+        self.secure_publish(self.marker_pub, array)
 
     # ==========================================================================
     # Public helpers (used by MissionController)

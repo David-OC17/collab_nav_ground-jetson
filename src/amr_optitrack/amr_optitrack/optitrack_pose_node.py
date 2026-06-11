@@ -6,7 +6,10 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
-class OptiTrackPoseNode(Node):
+from ros2_security import SecureNodeMixin
+
+
+class OptiTrackPoseNode(SecureNodeMixin, Node):
     """
     Subscribes to /optitrack/rigid_body (PoseStamped at ~120 Hz).
     Computes body-frame velocity via finite difference + EMA smoothing.
@@ -15,6 +18,8 @@ class OptiTrackPoseNode(Node):
 
     def __init__(self):
         super().__init__('optitrack_pose_node')
+        self.declare_parameter('certs_dir', './certs')
+        self.security_init(certs_dir=self.get_parameter('certs_dir').value)
 
         self.declare_parameter('vel_alpha', 0.1)
         self._alpha = self.get_parameter('vel_alpha').value
@@ -34,10 +39,9 @@ class OptiTrackPoseNode(Node):
             depth=10
         )
 
-        self.create_subscription(
-            PoseStamped, '/optitrack/rigid_body', self._cb, qos)
+        self.create_secure_subscription('/optitrack/rigid_body', PoseStamped, self._cb, min_level=None, qos=qos)
 
-        self._pub = self.create_publisher(Odometry, '/amr/pose', 10)
+        self._pub = self.create_secure_publisher('/amr/pose', Odometry, 10)
 
         self.get_logger().info(
             f'optitrack_pose_node started | vel_alpha={self._alpha}')
@@ -119,7 +123,7 @@ class OptiTrackPoseNode(Node):
         odom.twist.twist.linear.y  = self._vy
         odom.twist.twist.angular.z = self._wz
 
-        self._pub.publish(odom)
+        self.secure_publish(self._pub, odom)
 
     @staticmethod
     def _rotate_z_neg90(x: float, y: float, q):

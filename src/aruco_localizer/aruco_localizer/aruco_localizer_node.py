@@ -48,12 +48,16 @@ from tf2_ros import Buffer, TransformListener, TransformBroadcaster
 
 from cv_bridge import CvBridge
 
+from ros2_security import SecureNodeMixin
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-class ArucoLocalizerNode(Node):
+class ArucoLocalizerNode(SecureNodeMixin, Node):
 
     def __init__(self):
         super().__init__('aruco_localizer')
+        self.declare_parameter('certs_dir', './certs')
+        self.security_init(certs_dir=self.get_parameter('certs_dir').value)
 
         # ── Parámetros ────────────────────────────────────────────────────────
         self.declare_parameter('marker_size',    0.135)        # metros
@@ -137,16 +141,13 @@ class ArucoLocalizerNode(Node):
             Image, p('image_topic').value, self._cb_image, 10)
 
         # ── Publicadores ──────────────────────────────────────────────────────
-        self.pose_pub = self.create_publisher(
-            PoseWithCovarianceStamped, p('pose_topic').value, 10)
+        self.pose_pub = self.create_secure_publisher(p('pose_topic').value, PoseWithCovarianceStamped, 10)
 
         if self.debug_image:
-            self.dbg_pub = self.create_publisher(
-                Image, '/aruco_localizer/debug_image', 10)
+            self.dbg_pub = self.create_secure_publisher('/aruco_localizer/debug_image', Image, 10)
 
         # Marcadores RViz para visualizar dónde se "ven" los ArUcos en el mundo
-        self.viz_pub = self.create_publisher(
-            MarkerArray, '/aruco_localizer/detections_viz', 10)
+        self.viz_pub = self.create_secure_publisher('/aruco_localizer/detections_viz', MarkerArray, 10)
 
         self.get_logger().info(
             f'ArUco localizer listo. IDs conocidos: {sorted(self.marker_ids)}, '
@@ -258,7 +259,7 @@ class ArucoLocalizerNode(Node):
             self._publish_debug(frame, msg.header.stamp)
 
         if viz_markers.markers:
-            self.viz_pub.publish(viz_markers)
+            self.secure_publish(self.viz_pub, viz_markers)
 
         if not estimates:
             return
@@ -354,7 +355,7 @@ class ArucoLocalizerNode(Node):
         ])
         out.pose.covariance = cov.flatten().tolist()
 
-        self.pose_pub.publish(out)
+        self.secure_publish(self.pose_pub, out)
 
     # ─── Broadcast TF directo (solo debug) ───────────────────────────────────
     def _broadcast_tf(self, T: np.ndarray, stamp):
@@ -408,7 +409,7 @@ class ArucoLocalizerNode(Node):
     def _publish_debug(self, frame: np.ndarray, stamp):
         img_msg = self.bridge.cv2_to_imgmsg(frame, 'bgr8')
         img_msg.header.stamp = stamp
-        self.dbg_pub.publish(img_msg)
+        self.secure_publish(self.dbg_pub, img_msg)
 
     # ─── RViz marker para la pose estimada ───────────────────────────────────
     def _make_viz_marker(self, T: np.ndarray, mid: int, stamp) -> Marker:

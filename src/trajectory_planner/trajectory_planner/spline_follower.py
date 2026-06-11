@@ -50,6 +50,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from nav_msgs.msg import Path, Odometry
 
+from ros2_security import SecureNodeMixin
+
 try:
     from scipy.interpolate import CubicSpline
     _SCIPY_OK = True
@@ -57,10 +59,12 @@ except ImportError:
     _SCIPY_OK = False
 
 
-class SplineFollower(Node):
+class SplineFollower(SecureNodeMixin, Node):
 
     def __init__(self):
         super().__init__('spline_follower')
+        self.declare_parameter('certs_dir', './certs')
+        self.security_init(certs_dir=self.get_parameter('certs_dir').value)
 
         if not _SCIPY_OK:
             self.get_logger().error(
@@ -117,11 +121,9 @@ class SplineFollower(Node):
         # ------------------------------------------------------------------
         # Subscriber / Publisher
         # ------------------------------------------------------------------
-        self.path_sub = self.create_subscription(
-            Path, self.path_topic, self._path_callback, reliable_qos)
+        self.path_sub = self.create_secure_subscription(self.path_topic, Path, self._path_callback, min_level=None, qos=reliable_qos)
 
-        self.ref_pub = self.create_publisher(
-            Odometry, '/amr/reference', reliable_qos)
+        self.ref_pub = self.create_secure_publisher('/amr/reference', Odometry, reliable_qos)
 
         # ------------------------------------------------------------------
         # Control timer
@@ -368,7 +370,7 @@ class SplineFollower(Node):
         self.last_y = y
         self.last_yaw = yaw
 
-        self.ref_pub.publish(msg)
+        self.secure_publish(self.ref_pub, msg)
 
     def _publish_zero(self):
         """

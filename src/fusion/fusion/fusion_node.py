@@ -33,14 +33,18 @@ from rclpy.qos import (
 )
 from nav_msgs.msg import OccupancyGrid
 
+from ros2_security import SecureNodeMixin
 
-class MapFusionNode(Node):
+
+class MapFusionNode(SecureNodeMixin, Node):
 
     DRONE_OCC_THRESH = 65   # cells >= this are treated as occupied (wall/obstacle)
     DRONE_FREE_VAL   = 25   # value used by arena_map_builder for free floor
 
     def __init__(self) -> None:
         super().__init__('map_fusion_node')
+        self.declare_parameter('certs_dir', './certs')
+        self.security_init(certs_dir=self.get_parameter('certs_dir').value)
 
         # ── Parameters ────────────────────────────────────────────────────────
         self.declare_parameter('drone_map_topic', '/drone/map')
@@ -64,15 +68,11 @@ class MapFusionNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
-        self.create_subscription(
-            OccupancyGrid, drone_topic, self._drone_cb, drone_qos
-        )
-        self.create_subscription(
-            OccupancyGrid, amr_topic, self._amr_cb, 10
-        )
+        self.create_secure_subscription(drone_topic, OccupancyGrid, self._drone_cb, min_level=None, qos=drone_qos)
+        self.create_secure_subscription(amr_topic, OccupancyGrid, self._amr_cb, min_level=None, qos=10)
 
         # ── Publisher ─────────────────────────────────────────────────────────
-        self._pub = self.create_publisher(OccupancyGrid, fused_topic, 10)
+        self._pub = self.create_secure_publisher(fused_topic, OccupancyGrid, 10)
 
         self.get_logger().info(
             f'map_fusion_node ready\n'
@@ -103,7 +103,7 @@ class MapFusionNode(Node):
             )
             return
 
-        self._pub.publish(self._fuse(msg))
+        self.secure_publish(self._pub, self._fuse(msg))
 
     # ──────────────────────────────────────────────────────────────────────────
     # Fusion

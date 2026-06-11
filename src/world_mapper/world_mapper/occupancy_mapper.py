@@ -30,6 +30,8 @@ from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import Pose
 
+from ros2_security import SecureNodeMixin
+
 
 def yaw_from_quaternion(x, y, z, w):
     """Extract the planar yaw angle from a quaternion (2D mapper only cares about yaw)."""
@@ -59,9 +61,11 @@ def bresenham(x0, y0, x1, y1):
             y += sy
 
 
-class OccupancyMapper(Node):
+class OccupancyMapper(SecureNodeMixin, Node):
     def __init__(self):
         super().__init__("occupancy_mapper")
+        self.declare_parameter('certs_dir', './certs')
+        self.security_init(certs_dir=self.get_parameter('certs_dir').value)
 
         # ---- Parameters -------------------------------------------------
         self.declare_parameter("world_frame", "world")
@@ -116,13 +120,13 @@ class OccupancyMapper(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # ---- I/O --------------------------------------------------------
-        self.scan_sub = self.create_subscription(
-            LaserScan, self.scan_topic, self.scan_cb, qos_profile_sensor_data
+        self.scan_sub = self.create_secure_subscription(
+            self.scan_topic, LaserScan, self.scan_cb, min_level=None, qos=qos_profile_sensor_data
         )
         # Transient-local so late-joining RViz/Nav2 still receive the last map.
         map_qos = QoSProfile(depth=1)
         map_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
-        self.map_pub = self.create_publisher(OccupancyGrid, self.map_topic, map_qos)
+        self.map_pub = self.create_secure_publisher(self.map_topic, OccupancyGrid, map_qos)
 
         period = 1.0 / float(gp("publish_rate").value)
         self.timer = self.create_timer(period, self.publish_map)
@@ -263,7 +267,7 @@ class OccupancyMapper(Node):
         origin.orientation.w = 1.0
         msg.info.origin = origin
         msg.data = data.tolist()
-        self.map_pub.publish(msg)
+        self.secure_publish(self.map_pub, msg)
 
 
 def main(args=None):

@@ -13,3 +13,6 @@
 [submodule "src/LightGlue-ONNX-Jetson"]
 	path = src/LightGlue-ONNX-Jetson
 	url = git@github.com:limshoonkit/LightGlue-ONNX-Jetson.git
+[submodule "security_middleware"]
+	path = security_middleware
+	url = https://github.com/FrediRomo/security_middleware.git

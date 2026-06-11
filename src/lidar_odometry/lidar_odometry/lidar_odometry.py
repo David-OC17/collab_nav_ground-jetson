@@ -59,11 +59,15 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TwistStamped, TransformStamped
 from tf2_ros import TransformBroadcaster
 
+from ros2_security import SecureNodeMixin
 
-class LidarOdometryNode(Node):
+
+class LidarOdometryNode(SecureNodeMixin, Node):
 
     def __init__(self) -> None:
         super().__init__('lidar_odometry_node')
+        self.declare_parameter('certs_dir', './certs')
+        self.security_init(certs_dir=self.get_parameter('certs_dir').value)
 
         # ── Parameters ────────────────────────────────────────────────
         self.declare_parameter('scan_topic',     '/scan')
@@ -109,11 +113,11 @@ class LidarOdometryNode(Node):
         self._prev_stamp:  Time | None       = None
 
         # ── ROS interfaces ────────────────────────────────────────────
-        self._odom_pub = self.create_publisher(Odometry,     self._odom_topic, 50)
-        self._vel_pub  = self.create_publisher(TwistStamped, self._vel_topic,  50)
+        self._odom_pub = self.create_secure_publisher(self._odom_topic, Odometry, 50)
+        self._vel_pub  = self.create_secure_publisher(self._vel_topic, TwistStamped, 50)
         self._tf_br    = TransformBroadcaster(self) if self._publish_tf else None
 
-        self.create_subscription(LaserScan, self._scan_topic, self._scan_cb, 10)
+        self.create_secure_subscription(self._scan_topic, LaserScan, self._scan_cb, min_level=None, qos=10)
 
         self.get_logger().info(
             f'LiDAR odometry ready | scan={self._scan_topic} | '
@@ -281,7 +285,7 @@ class LidarOdometryNode(Node):
         msg.twist.linear.x  = vx
         msg.twist.linear.y  = vy
         msg.twist.angular.z = wz
-        self._vel_pub.publish(msg)
+        self.secure_publish(self._vel_pub, msg)
 
     def _publish_pose(self, stamp, residual, dt) -> None:
         """Publish accumulated pose as nav_msgs/Odometry."""
@@ -311,7 +315,7 @@ class LidarOdometryNode(Node):
         # easiest to just leave zeros and rely on /amr/lidar_vel for fusion).
         # If you want twist filled, refactor to pass vx/vy/wz into this method.
 
-        self._odom_pub.publish(msg)
+        self.secure_publish(self._odom_pub, msg)
 
         if self._tf_br is not None:
             tf = TransformStamped()

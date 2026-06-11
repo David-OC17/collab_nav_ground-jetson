@@ -66,6 +66,8 @@ from tf2_ros import TransformException
 from nav_msgs.msg import OccupancyGrid, Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 
+from ros2_security import SecureNodeMixin
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -78,10 +80,12 @@ STRAIGHT_COST    = 1.0
 # Main node
 # ==============================================================================
 
-class AStarPlanner2(Node):
+class AStarPlanner2(SecureNodeMixin, Node):
 
     def __init__(self):
         super().__init__('astar_planner2')
+        self.declare_parameter('certs_dir', './certs')
+        self.security_init(certs_dir=self.get_parameter('certs_dir').value)
 
         # ------------------------------------------------------------------
         # Parameters
@@ -192,20 +196,16 @@ class AStarPlanner2(Node):
         # ------------------------------------------------------------------
         # Subscribers
         # ------------------------------------------------------------------
-        self.map_sub  = self.create_subscription(
-            OccupancyGrid,             self.map_topic,  self._map_callback,  map_qos)
-        self.goal_sub = self.create_subscription(
-            PoseWithCovarianceStamped, self.goal_topic, self._goal_callback, latched_qos)
+        self.map_sub  = self.create_secure_subscription(self.map_topic, OccupancyGrid, self._map_callback, min_level=None, qos=map_qos)
+        self.goal_sub = self.create_secure_subscription(self.goal_topic, PoseWithCovarianceStamped, self._goal_callback, min_level=None, qos=latched_qos)
 
         # ------------------------------------------------------------------
         # Publishers
         # ------------------------------------------------------------------
-        self.path_pub = self.create_publisher(
-            Path, '/trajectory_planner2/path', reliable_qos)
-        
+        self.path_pub = self.create_secure_publisher('/trajectory_planner2/path', Path, reliable_qos)
+
         # Notify when goal is lethal and planner failed (to replan in frontier explorer)
-        self.goal_failed_pub = self.create_publisher(
-            PoseWithCovarianceStamped, '/astar/goal_failed', reliable_qos)
+        self.goal_failed_pub = self.create_secure_publisher('/astar/goal_failed', PoseWithCovarianceStamped, reliable_qos)
 
         self.get_logger().info(
             'AStarPlanner2 ready\n'
@@ -433,7 +433,7 @@ class AStarPlanner2(Node):
             fail_msg.header.frame_id = self.world_frame
             fail_msg.pose.pose.position.x = self.goal_x
             fail_msg.pose.pose.position.y = self.goal_y
-            self.goal_failed_pub.publish(fail_msg)
+            self.secure_publish(self.goal_failed_pub, fail_msg)
 
             self.get_logger().error(
                 f'Goal cell ({gci},{gcj}) is lethal — cannot plan.')
@@ -629,7 +629,7 @@ class AStarPlanner2(Node):
             pose.pose.orientation.w = 1.0
             msg.poses.append(pose)
 
-        self.path_pub.publish(msg)
+        self.secure_publish(self.path_pub, msg)
 
     # ==========================================================================
     # Grid helpers

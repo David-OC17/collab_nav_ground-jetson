@@ -59,6 +59,8 @@ from std_msgs.msg import Bool, String
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
 
+from ros2_security import SecureNodeMixin
+
 
 # ---------------------------------------------------------------------------
 # States
@@ -70,10 +72,12 @@ class State:
     DONE      = 'DONE'
 
 
-class ExplorerController(Node):
+class ExplorerController(SecureNodeMixin, Node):
 
     def __init__(self):
         super().__init__('explorer_controller')
+        self.declare_parameter('certs_dir', './certs')
+        self.security_init(certs_dir=self.get_parameter('certs_dir').value)
 
         # ------------------------------------------------------------------
         # Parameters
@@ -139,9 +143,9 @@ class ExplorerController(Node):
             Bool, '/mission/start',
             self._start_callback, volatile_qos)
 
-        self.frontier_sub = self.create_subscription(
-            PoseWithCovarianceStamped, '/frontier/goal',
-            self._frontier_goal_callback, reliable_qos)
+        self.frontier_sub = self.create_secure_subscription(
+            '/frontier/goal', PoseWithCovarianceStamped,
+            self._frontier_goal_callback, min_level=None, qos=reliable_qos)
 
         self.aruco_sub = self.create_subscription(
             PoseWithCovarianceStamped, '/aruco/detection',
@@ -154,17 +158,13 @@ class ExplorerController(Node):
         # ------------------------------------------------------------------
         # Publishers
         # ------------------------------------------------------------------
-        self.goal_pub = self.create_publisher(
-            PoseWithCovarianceStamped, '/aruco/goal/pose', latched_qos)
+        self.goal_pub = self.create_secure_publisher('/aruco/goal/pose', PoseWithCovarianceStamped, latched_qos)
 
-        self.active_pub = self.create_publisher(
-            Bool, '/frontier_explorer/active', reliable_qos)
+        self.active_pub = self.create_secure_publisher('/frontier_explorer/active', Bool, reliable_qos)
 
-        self.status_marker_pub = self.create_publisher(
-            Marker, '/mission/status_marker', reliable_qos)
+        self.status_marker_pub = self.create_secure_publisher('/mission/status_marker', Marker, reliable_qos)
 
-        self.state_pub = self.create_publisher(
-            String, '/mission/state', reliable_qos)
+        self.state_pub = self.create_secure_publisher('/mission/state', String, reliable_qos)
 
         # ------------------------------------------------------------------
         # Startup — make sure frontier explorer starts silent
@@ -297,7 +297,7 @@ class ExplorerController(Node):
             return
 
         self._frontier_goal_dirty = False
-        self.goal_pub.publish(self.frontier_goal)
+        self.secure_publish(self.goal_pub, self.frontier_goal)
         self.get_logger().info(
             f'EXPLORING — forwarding frontier goal '
             f'({self.frontier_goal.pose.pose.position.x:.2f}, '
@@ -314,7 +314,7 @@ class ExplorerController(Node):
 
         # Forward last known ArUco goal
         if self.aruco_goal is not None:
-            self.goal_pub.publish(self.aruco_goal)
+            self.secure_publish(self.goal_pub, self.aruco_goal)
 
         # Check if robot reached the goal
         if self.pose_received and self.aruco_goal is not None:
@@ -366,14 +366,14 @@ class ExplorerController(Node):
     def _set_frontier_explorer_active(self, active: bool):
         msg      = Bool()
         msg.data = active
-        self.active_pub.publish(msg)
+        self.secure_publish(self.active_pub, msg)
         self.get_logger().info(
             f'FrontierExplorer {"ACTIVATED" if active else "DEACTIVATED"}')
 
     def _publish_state(self):
         msg      = String()
         msg.data = self.state
-        self.state_pub.publish(msg)
+        self.secure_publish(self.state_pub, msg)
 
     def _publish_status_marker(self):
         colors = {
@@ -403,7 +403,7 @@ class ExplorerController(Node):
         m.scale.z = 0.5
         m.color   = colors.get(self.state, ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0))
         m.text    = labels.get(self.state, self.state)
-        self.status_marker_pub.publish(m)
+        self.secure_publish(self.status_marker_pub, m)
 
 
 # ==============================================================================

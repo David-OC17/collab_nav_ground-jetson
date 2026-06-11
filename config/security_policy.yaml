@@ -1,0 +1,142 @@
+# config/security_policy.yaml
+# System-wide security posture for collab_nav_ground-jetson.
+#
+# All controlled Python nodes publish at "sign" level (RSA-PSS over CDR bytes).
+# C++ sensor drivers (optitrack_client, oradar_scan) are bridged into the
+# secured graph via legacy_relay processes that vouch for their data at "sign".
+# Subscriptions to uncontrolled sources (camera, IMU, SLAM stack, Tello drone)
+# accept "none" so they keep working regardless of security state.
+#
+# Priority chain (highest wins):
+#   ROS2_SECURITY_DISABLED=1   ← global kill switch
+#   security_init(level=...)   ← explicit code override
+#   this file                  ← policy (default path)
+#   global_min_level           ← floor
+
+global_min_level: none
+
+nodes:
+
+  # ── Legacy relays (bridge uncontrolled C++ drivers into the secured graph) ──
+
+  optitrack_relay:
+    publish_level: sign      # relay has a cert and re-signs optitrack data
+    subscriptions: {}        # native subscriber — not a secure sub
+
+  scan_relay:
+    publish_level: sign      # relay has a cert and re-signs /scan data
+    subscriptions: {}        # native subscriber — not a secure sub
+
+  # ── Localization ─────────────────────────────────────────────────────────────
+
+  optitrack_pose_node:
+    publish_level: sign
+    subscriptions:
+      /optitrack/rigid_body:
+        min_level: sign      # signed by optitrack_relay
+
+  aruco_localizer:
+    publish_level: sign
+    subscriptions:
+      /camera/realsense2_camera/color/image_raw:
+        min_level: none      # native RealSense driver (uncontrolled)
+      /camera/realsense2_camera/color/camera_info:
+        min_level: none      # native RealSense driver (uncontrolled)
+
+  # ── Safety ───────────────────────────────────────────────────────────────────
+
+  emergency_stop:
+    publish_level: sign
+    subscriptions:
+      /scan:
+        min_level: sign      # signed by scan_relay
+
+  # ── Mapping ──────────────────────────────────────────────────────────────────
+
+  lidar_odometry_node:
+    publish_level: sign
+    subscriptions:
+      /scan:
+        min_level: sign      # signed by scan_relay
+
+  occupancy_mapper:
+    publish_level: sign
+    subscriptions:
+      /scan:
+        min_level: sign      # signed by scan_relay
+
+  map_fusion_node:
+    publish_level: sign
+    subscriptions:
+      /drone/map:
+        min_level: sign      # signed by mission_orchestrator
+      /amr/world_map:
+        min_level: sign      # signed by occupancy_mapper
+
+  # ── Planning ─────────────────────────────────────────────────────────────────
+
+  astar_planner2:
+    publish_level: sign
+    subscriptions:
+      /drone/map:
+        min_level: sign      # signed by mission_orchestrator
+      /aruco/goal/pose:
+        min_level: sign      # signed by explorer_controller or mission_orchestrator
+
+  spline_follower:
+    publish_level: sign
+    subscriptions:
+      /trajectory_planner2/path:
+        min_level: sign      # signed by astar_planner2
+
+  # ── Frontier exploration ──────────────────────────────────────────────────────
+
+  frontier_explorer:
+    publish_level: sign
+    subscriptions:
+      /drone/map:
+        min_level: sign      # signed by mission_orchestrator (also map_topic param)
+      /astar/goal_failed:
+        min_level: sign      # signed by astar_planner2
+      /frontier_explorer/active:
+        min_level: sign      # signed by explorer_controller
+      /amr/ekf/odom:
+        min_level: none      # robot_localization (third-party, uncontrolled)
+      /follower/pose:
+        min_level: none      # navigation stack (uncontrolled)
+      /camera/fov_map:
+        min_level: none      # camera_fov_tracker (optional, uncontrolled)
+
+  explorer_controller:
+    publish_level: sign
+    subscriptions:
+      /frontier/goal:
+        min_level: sign      # signed by frontier_explorer
+      /mission/start:
+        min_level: none      # external trigger (manual or orchestrator)
+      /aruco/detection:
+        min_level: none      # aruco_goal_detector (not in secured scope)
+      /follower/pose:
+        min_level: none      # navigation stack (uncontrolled)
+
+  # ── Mission orchestration ─────────────────────────────────────────────────────
+
+  mission_orchestrator:
+    publish_level: sign
+    subscriptions:
+      /optitrack/rigid_body:
+        min_level: sign      # signed by optitrack_relay
+      /amr/emergency_stop:
+        min_level: sign      # signed by emergency_stop
+      /drone/map:
+        min_level: sign      # reads back its own published map
+      /amr/imu/data_raw:
+        min_level: none      # Raspberry Pi IMU (native, uncontrolled)
+      /drone/state:
+        min_level: none      # tello_driver (not in secured scope)
+      /camera/image_raw:
+        min_level: none      # tello_driver (not in secured scope)
+      /battery_state:
+        min_level: none      # tello_driver (not in secured scope)
+      /visual_slam/tracking/odometry:
+        min_level: none      # Isaac ROS binary (uncontrolled)

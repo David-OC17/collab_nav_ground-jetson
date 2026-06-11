@@ -121,6 +121,8 @@ from std_srvs.srv import Trigger
 from arena_map_builder_msgs.action import BuildArenaMap
 from arena_marker_localizer_interfaces.srv import LocalizeMarkers
 
+from ros2_security import SecureNodeMixin
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Custom exception
@@ -214,13 +216,15 @@ _OBSERVER_REGISTRY: Dict[str, tuple] = {
 # Orchestrator node
 # ─────────────────────────────────────────────────────────────────────────────
 
-class MissionOrchestratorNode(Node):
+class MissionOrchestratorNode(SecureNodeMixin, Node):
     """ROS 2 node that sequentially executes all mission stages."""
 
     # ── Construction ────────────────────────────────────────────────────────
 
     def __init__(self, config_path: str) -> None:
         super().__init__('mission_orchestrator')
+        self.declare_parameter('certs_dir', './certs')
+        self.security_init(certs_dir=self.get_parameter('certs_dir').value)
 
         self._cfg: dict = self._load_config(config_path)
         self._log: logging.Logger = self._setup_logging()
@@ -346,31 +350,30 @@ class MissionOrchestratorNode(Node):
             depth=10
         )
 
+        # Native subscriptions: uncontrolled hardware / third-party nodes
         self.create_subscription(Imu,
             cfg['imu']['topic'], self._imu_cb, 10)
-        self.create_subscription(PoseStamped,
-            cfg['optitrack']['topic'], self._optitrack_cb, qos)
         self.create_subscription(Int32,
             cfg['drone']['state_topic'], self._drone_state_cb, 10)
         self.create_subscription(Image,
             cfg['drone']['camera_topic'], self._camera_cb, best_effort)
         self.create_subscription(BatteryState,
             cfg['drone']['battery_topic'], self._battery_cb, 10)
-        self.create_subscription(Bool,
-            cfg.get('emergency_stop', {}).get('topic', '/amr/emergency_stop'),
-            self._emergency_stop_cb, 10)
-        self.create_subscription(OccupancyGrid,
-            cfg['map_builder']['drone_map_topic'], self._drone_map_cb, latched)
         self.create_subscription(Odometry,
             cfg.get('vslam', {}).get('odometry_topic', '/visual_slam/tracking/odometry'),
             self._vslam_odom_cb, best_effort)
+        # Secure subscriptions: messages from controlled nodes
+        self.create_secure_subscription(
+            cfg['optitrack']['topic'], PoseStamped, self._optitrack_cb, min_level=None, qos=qos)
+        self.create_secure_subscription(
+            cfg.get('emergency_stop', {}).get('topic', '/amr/emergency_stop'),
+            Bool, self._emergency_stop_cb, min_level=None, qos=10)
+        self.create_secure_subscription(
+            cfg['map_builder']['drone_map_topic'], OccupancyGrid, self._drone_map_cb, min_level=None, qos=latched)
 
-        self._pub_aruco_amr = self.create_publisher(
-            PoseWithCovarianceStamped, cfg['aruco']['amr_pose_topic'], latched)
-        self._pub_aruco_goal = self.create_publisher(
-            PoseWithCovarianceStamped, cfg['aruco']['goal_pose_topic'], latched)
-        self._pub_drone_map = self.create_publisher(
-            OccupancyGrid, cfg['map_builder']['drone_map_topic'], latched)
+        self._pub_aruco_amr = self.create_secure_publisher(cfg['aruco']['amr_pose_topic'], PoseWithCovarianceStamped, latched)
+        self._pub_aruco_goal = self.create_secure_publisher(cfg['aruco']['goal_pose_topic'], PoseWithCovarianceStamped, latched)
+        self._pub_drone_map = self.create_secure_publisher(cfg['map_builder']['drone_map_topic'], OccupancyGrid, latched)
 
         # Frontier-exploration fallback trigger (stage 10.a). Reliable + VOLATILE
         # to match explorer_controller's /map_fail_fallback/start subscription
@@ -381,10 +384,9 @@ class MissionOrchestratorNode(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
-        self._pub_map_fail_start = self.create_publisher(
-            Bool,
+        self._pub_map_fail_start = self.create_secure_publisher(
             cfg.get('frontier', {}).get('start_topic', '/map_fail_fallback/start'),
-            fallback_qos)
+            Bool, fallback_qos)
 
         self._loc_client = self.create_client(
             LocalizeMarkers, cfg['marker_localizer']['service_name'])
@@ -1113,7 +1115,7 @@ class MissionOrchestratorNode(Node):
         amr_position = map_result.amr_marker_position if map_result is not None else None
         amr_pose, amr_ok = self._build_amr_pose(
             by_id.get(amr_id), amr_position)
-        self._pub_aruco_amr.publish(amr_pose)
+        self.secure_publish(self._pub_aruco_amr, amr_pose)
         if amr_ok:
             self._log.info(
                 f"  AMR (marker {amr_id}): map pos="
@@ -1153,7 +1155,7 @@ class MissionOrchestratorNode(Node):
             goal_pose = self._build_goal_pose(
                 by_id.get(goal_id), map_result.goal_marker_position)
             if goal_pose is not None:
-                self._pub_aruco_goal.publish(goal_pose)
+                self.secure_publish(self._pub_aruco_goal, goal_pose)
                 self._log.info(
                     f"  goal (marker {goal_id}): map pos="
                     f"({goal_pose.pose.pose.position.x:.3f}, "
@@ -1271,7 +1273,7 @@ class MissionOrchestratorNode(Node):
         grid.header.frame_id = 'world'
         grid.header.stamp = self.get_clock().now().to_msg()
 
-        self._pub_drone_map.publish(grid)
+        self.secure_publish(self._pub_drone_map, grid)
         self._log.info(
             f"  Published {grid.info.width}×{grid.info.height} OccupancyGrid "
             f"to {cfg_mb['drone_map_topic']}")
@@ -1646,7 +1648,7 @@ class MissionOrchestratorNode(Node):
         msg = Bool()
         msg.data = True
         for _ in range(3):
-            self._pub_map_fail_start.publish(msg)
+            self.secure_publish(self._pub_map_fail_start, msg)
             time.sleep(0.2)
         self._log.info("╚══ Stage 12.a OK: frontier exploration triggered")
 

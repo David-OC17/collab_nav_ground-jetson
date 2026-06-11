@@ -5,11 +5,16 @@ from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 
-import math 
+import math
 
-class EmergencyStopNode(Node):
+from ros2_security import SecureNodeMixin
+
+
+class EmergencyStopNode(SecureNodeMixin, Node):
     def __init__(self):
         super().__init__('emergency_stop')
+        self.declare_parameter('certs_dir', './certs')
+        self.security_init(certs_dir=self.get_parameter('certs_dir').value)
 
         # Parameters
         self.declare_parameter('min_obstacle_distance_m', 0.4)
@@ -38,11 +43,11 @@ class EmergencyStopNode(Node):
         self._stop_reasons = set()
 
         # Subscriptions — add more triggers here as needed
-        self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
-        # self.create_subscription(Odometry, '/amr/ekf/odom', self._odom_cb, 10)
+        self.create_secure_subscription('/scan', LaserScan, self._scan_cb, min_level=None, qos=10)
+        # self.create_secure_subscription('/amr/ekf/odom', Odometry, self._odom_cb, min_level=None, qos=10)
 
         # Publishers
-        self._pub_stop   = self.create_publisher(Bool, '/amr/emergency_stop', 10)
+        self._pub_stop = self.create_secure_publisher('/amr/emergency_stop', Bool, 10)
 
         # Publish state at 10 Hz regardless of trigger changes
         self.create_timer(0.1, self._publish_state)
@@ -100,7 +105,7 @@ class EmergencyStopNode(Node):
 
     def _publish_state(self):
         msg = Bool(data=self._stop_active)
-        self._pub_stop.publish(msg)
+        self.secure_publish(self._pub_stop, msg)
 
 
 def main(args=None):
