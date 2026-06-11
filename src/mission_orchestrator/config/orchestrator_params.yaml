@@ -63,8 +63,8 @@ orchestrator:
 
   # ── ArUco pose publication ───────────────────────────────────────────────
   aruco:
-    amr_marker_id: 0                     # MarkerPose.id for the AMR
-    goal_marker_id: 2                    # MarkerPose.id for the goal
+    amr_marker_id: 4                     # MarkerPose.id for the AMR
+    goal_marker_id: 0                    # MarkerPose.id for the goal
     amr_pose_topic: "/aruco/amr/pose"
     goal_pose_topic: "/aruco/goal/pose"
 
@@ -108,6 +108,15 @@ orchestrator:
     rviz: false
     # target_marker_id is taken from aruco.goal_marker_id
 
+  # ── Emergency stop (stage 07) ────────────────────────────────────────────
+  # Opt-in: stage 07 only runs when enabled is true. When false (default) the
+  # orchestrator skips launching the emergency_stop node entirely.
+  emergency_stop:
+    enabled: false
+    topic: "/amr/emergency_stop"
+    check_count: 10                      # messages to sample before proceeding
+    startup_timeout_sec: 15.0            # max wait for the node to start publishing
+
   # ── oradar lidar ────────────────────────────────────────────────────────
   oradar:
     scan_topic: "/scan"
@@ -132,8 +141,8 @@ orchestrator:
     # Published to /drone/map when the stitched map fails classification, so
     # downstream consumers have a bordered empty arena to fall back on.
     template_grid:
-      arena_width_m: 4.0
-      arena_height_m: 4.0
+      arena_width_m: 3.9
+      arena_height_m: 3.9
       resolution_m_per_cell: 0.05
       wall_occ: 100
       free_occ: 0

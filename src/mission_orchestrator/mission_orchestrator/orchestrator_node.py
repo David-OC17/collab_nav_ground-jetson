@@ -1784,9 +1784,12 @@ class MissionOrchestratorNode(Node):
             self._stage_06c_launch_amr()
             self._stage_06d_wait_imu_ready()
 
-            # ── 07 Emergency stop bringup ──
-            self._log.info("━━━━━━  Stage 07: Emergency stop bringup  ━━━━━━")
-            self._stage_07a_emergency_stop()
+            # ── 07 Emergency stop bringup (opt-in via emergency_stop.enabled) ──
+            if self._cfg.get('emergency_stop', {}).get('enabled', False):
+                self._log.info("━━━━━━  Stage 07: Emergency stop bringup  ━━━━━━")
+                self._stage_07a_emergency_stop()
+            else:
+                self._log.info("Stage 07 emergency stop disabled — skipping")
 
             # ── 08 AMR Aruco localizer ──
             self._log.info("━━━━━━  Stage 08: AMR Aruco localizer  ━━━━━━")

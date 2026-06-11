@@ -337,18 +337,20 @@ def main() -> None:
 
     try:
         node.run()
-        node._log.info(
-            "══════════════════════════════════════════════════\n"
-            f"  Saved scan data to: {output_dir}\n"
-            "  aruco_amr_pose.yaml\n"
-            "  aruco_goal_pose.yaml\n"
-            "  drone_map.yaml\n"
-            "══════════════════════════════════════════════════")
+        # run() catches MissionAbortError internally; only print success when
+        # the mission actually completed (i.e. data was saved).
+        if node._mission_complete:
+            node._log.info(
+                "══════════════════════════════════════════════════\n"
+                f"  Saved scan data to: {output_dir}\n"
+                "  aruco_amr_pose.yaml\n"
+                "  aruco_goal_pose.yaml\n"
+                "  drone_map.yaml\n"
+                "══════════════════════════════════════════════════")
     except KeyboardInterrupt:
-        pass
+        # run() does not catch KeyboardInterrupt, so abort explicitly here.
+        node._abort()
     finally:
-        if not node._mission_complete:
-            node._abort()
         node._stop_rosbag()
         node._teardown_ssh()
         executor.shutdown(timeout_sec=5.0)
