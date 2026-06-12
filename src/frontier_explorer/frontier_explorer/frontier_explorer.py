@@ -64,7 +64,11 @@ import tf2_geometry_msgs
 FREE     =  0
 UNKNOWN  = -1
 OCCUPIED = 100
-LETHAL_THRESHOLD = 50   # cells above this are treated as occupied
+LETHAL_THRESHOLD = 90   # cells above this are treated as occupied
+
+# Your mapper outputs low positive values for free space (1-49)
+# and -1 for unknown. Redefine FREE_MAX to capture this.
+FREE_MAX          = 49   
 
 
 class FrontierExplorer(Node):
@@ -87,7 +91,7 @@ class FrontierExplorer(Node):
         self.declare_parameter('w_size',            0.3)
         self.declare_parameter('w_heading',         0.4)
         self.declare_parameter('active',            True)
-        self.declare_parameter('odom_topic', '')   # Switch between simulation and real robot
+        self.declare_parameter('odom_topic', '')           # Switch between simulation and real robot
         self.declare_parameter('safe_goal_radius', 0.30)   # m — must be >= astar inflation_radius
         self.declare_parameter('min_goal_dist',    0.20) 
         self.declare_parameter('goal_reached_dist', 0.12)   # just above spline tolerance of 0.1 m
@@ -125,9 +129,6 @@ class FrontierExplorer(Node):
         self.map_height     = None
         self.map_received   = False
 
-        # Drone map — used by _safe_goal to validate against A*'s actual map
-        self.drone_map_data    = None   # np.ndarray (height, width) int8
-        self.drone_map_received = False
 
         self.robot_x        = 0.0
         self.robot_y        = 0.0
@@ -138,7 +139,8 @@ class FrontierExplorer(Node):
         self.current_goal_y = None
 
         self.visited_goals         = []   # failure blacklist — A* said lethal
-        self.goal_blacklist_radius = 0.30
+        self.goal_blacklist_radius = 0.60   # widened: covers _safe_goal drift
+                                              # when A* fails near an obstacle
 
         self.reached_goals            = []   # list of (wx, wy, timestamp)
         self.reached_blacklist_radius = 0.20  # m
@@ -187,13 +189,6 @@ class FrontierExplorer(Node):
             latched_qos
         )
 
-        # Drone map — for safe goal validation (same map A* uses)
-        self.create_subscription(
-            OccupancyGrid,
-            '/drone/map',
-            self._drone_map_callback,
-            latched_qos
-        )
         
         # Pose subscriber — two modes:
         #   odom_topic set   → real robot, subscribe to EKF Odometry + TF transform
@@ -286,11 +281,6 @@ class FrontierExplorer(Node):
             (self.map_height, self.map_width))
         self.map_received   = True
 
-    def _drone_map_callback(self, msg: OccupancyGrid):
-        """Store the drone/full map for use in _safe_goal validation."""
-        self.drone_map_data    = np.array(msg.data, dtype=np.int8).reshape(
-            (msg.info.height, msg.info.width))
-        self.drone_map_received = True
 
     def _pose_callback(self, msg: PoseWithCovarianceStamped):
         self.robot_x       = msg.pose.pose.position.x
@@ -300,16 +290,20 @@ class FrontierExplorer(Node):
 
 
     def _odom_callback(self, msg: Odometry):
-        """Real robot mode — transforms EKF odom pose into world frame."""
+        """Real robot mode — transforms EKF odom pose into world frame.
+        Uses Time(0) (latest available transform) instead of the message
+        timestamp to avoid extrapolation errors when SLAM publishes
+        slam_map→odom at a lower rate than the EKF odometry."""
         pose_odom = PoseStamped()
-        pose_odom.header = msg.header    # frame_id = 'odom'
-        pose_odom.pose   = msg.pose.pose
+        pose_odom.header.frame_id = msg.header.frame_id   # 'odom'
+        pose_odom.header.stamp    = rclpy.time.Time().to_msg()  # latest available
+        pose_odom.pose            = msg.pose.pose
 
         try:
             pose_world = self._tf_buffer.transform(
                 pose_odom,
                 self.world_frame,
-                timeout=rclpy.duration.Duration(seconds=0.05)
+                timeout=rclpy.duration.Duration(seconds=0.1)
             )
         except Exception as e:
             self.get_logger().warn(
@@ -416,8 +410,8 @@ class FrontierExplorer(Node):
                 ni, nj = ci_slam + dci, cj_slam + dcj
                 if not (0 <= ni < self.map_width and 0 <= nj < self.map_height):
                     continue
-                if self.map_data[nj, ni] != -1:
-                    continue   # not unknown — skip
+                if int(self.map_data[nj, ni]) != UNKNOWN:
+                    continue
 
                 # This neighbour is unknown — has the camera seen it?
                 wx = self.map_origin_x + (ni + 0.5) * self.map_resolution
@@ -442,7 +436,7 @@ class FrontierExplorer(Node):
             self.get_logger().warn(
                 'Waiting for SLAM map…', throttle_duration_sec=5.0)
             return
-        # Has to receive an initial pose? Maybe override with default to 0,0
+        # Initial pose from the robot (has to be a lookup to transform odom->world)
         if not self.pose_received:
             self.get_logger().warn(
                 'Waiting for robot pose…', throttle_duration_sec=5.0)
@@ -529,47 +523,37 @@ class FrontierExplorer(Node):
     # ==========================================================================
     # Step 1 — Detect frontier cells
     # ==========================================================================
-
     def _detect_frontiers(self) -> list:
-        """
-        Returns a list of (ci, cj) cell indices where the cell is FREE (0)
-        and has at least one UNKNOWN (-1) 4-connected neighbour.
-
-        Using 4-connectivity for the unknown-neighbour check keeps frontiers
-        tight to the actual explored boundary and avoids diagonal artefacts.
-        """
         grid = self.map_data
-
-        # Vectorised approach using numpy boolean masks and shifts
-        # A cell is free if its value is exactly 0 (not unknown, not occupied)
-        free_mask = (grid == FREE)
-
-        # Shift the grid in each of the 4 cardinal directions and check for -1
-        # np.roll wraps around — mask the border explicitly
         h, w = grid.shape
+
+        # Free: value >= 0 AND < LETHAL_THRESHOLD (covers 0-49)
+        # Your mapper outputs 1-49 for ray-cast free cells, never exactly 0
+        free_mask = (grid >= 0) & (grid < LETHAL_THRESHOLD)
+
+        # Unknown: exactly -1
+        unknown_mask = (grid == UNKNOWN)
 
         has_unknown_neighbour = np.zeros((h, w), dtype=bool)
 
         for shift, axis in [(1, 0), (-1, 0), (1, 1), (-1, 1)]:
-            shifted = np.roll(grid, shift, axis=axis)
-            # Zero out the wrapped border row/col
+            shifted = np.roll(unknown_mask.astype(np.int8), shift, axis=axis)
             if axis == 0:
                 if shift == 1:
-                    shifted[0, :] = FREE   # row 0 has no real neighbour above
+                    shifted[0, :] = 0
                 else:
-                    shifted[-1, :] = FREE
+                    shifted[-1, :] = 0
             else:
                 if shift == 1:
-                    shifted[:, 0] = FREE
+                    shifted[:, 0] = 0
                 else:
-                    shifted[:, -1] = FREE
-            has_unknown_neighbour |= (shifted == UNKNOWN)
+                    shifted[:, -1] = 0
+            has_unknown_neighbour |= shifted.astype(bool)
 
         frontier_mask = free_mask & has_unknown_neighbour
 
-        # Convert mask to list of (ci, cj) = (col, row)
         rows, cols = np.where(frontier_mask)
-        return list(zip(cols.tolist(), rows.tolist()))   # (ci, cj)
+        return list(zip(cols.tolist(), rows.tolist()))
 
     # ==========================================================================
     # Step 2 — Cluster frontier cells (union-find)
@@ -651,7 +635,6 @@ class FrontierExplorer(Node):
 
         self.get_logger().warn(
             f'Scoring {len(clusters)} clusters | '
-            f'drone_map_ready={self.drone_map_received} | '
             f'fov_map_ready={self.fov_map_data is not None} | '
             f'require_coverage={self.require_camera_coverage}')
 
@@ -661,6 +644,16 @@ class FrontierExplorer(Node):
             ci_safe, cj_safe = self._safe_centroid(cells)
             wx = self.map_origin_x + (ci_safe + 0.5) * res
             wy = self.map_origin_y + (cj_safe + 0.5) * res
+
+            # Check blacklist on raw centroid BEFORE _safe_goal walk —
+            # _safe_goal can shift the point by up to safe_goal_radius,
+            # so checking only after the walk misses clusters whose
+            # centroid is blacklisted but whose walked point is not.
+            if self._is_blacklisted(wx, wy):
+                self.get_logger().warn(
+                    f'  Cluster centroid ({wx:.2f},{wy:.2f}) — '
+                    f'blacklisted (raw centroid check)')
+                continue
 
             safe = self._safe_goal(wx, wy)
             if safe is None:
@@ -677,9 +670,10 @@ class FrontierExplorer(Node):
                     f'dist {dist:.2f} > max {self.max_frontier_dist}')
                 continue
 
+            # Post-safe_goal blacklist check (walked point may differ from centroid)
             if self._is_blacklisted(wx, wy):
                 self.get_logger().warn(
-                    f'  Cluster ({wx:.2f},{wy:.2f}) — blacklisted')
+                    f'  Cluster ({wx:.2f},{wy:.2f}) — blacklisted (walked point check)')
                 continue
 
             if self._is_recently_reached(wx, wy):
@@ -710,14 +704,28 @@ class FrontierExplorer(Node):
                 math.cos(bearing - self.robot_yaw)
             ))  # in [0, π]
 
-            heading_score = (1.0 + math.cos(angle_diff)) / 2.0
+            # cos^3 + hard cutoff at 60°:
+#
+            #  Angle │ heading_score │ perceived dist (1 m frontier)
+            #  ──────┼───────────────┼───────────────────────────────
+            #    0°  │    1.000      │   1.0 m   (no penalty)
+            #   15°  │    0.950      │   1.1 m
+            #   30°  │    0.812      │   1.2 m
+            #   45°  │    0.622      │   1.6 m
+            #   60°  │    0.422      │   2.4 m   ← hard threshold here
+            #   61°  │    0.004      │ 100.0 m   (×0.01 applied)
+            #   90°  │    0.001      │ 100.0 m
+            #  120°  │    0.000      │ 100.0 m
+#
+            # Anything past 60° is effectively invisible to the scorer
+            # unless it is the ONLY candidate — the floor (0.01) ensures
+            # the robot can still escape if all frontiers are behind it.
+            heading_score = ((1.0 + math.cos(angle_diff)) / 2.0) ** 3
 
-            # Hard penalty for U-turns (>150°): multiplied before dividing distance
-            if angle_diff > math.radians(150):
-                heading_score *= 0.1
+            if angle_diff > math.radians(60):
+                heading_score *= 0.01
 
-            # Floor avoids division by zero for pure U-turns (heading_score ≈ 0)
-            _HEADING_FLOOR = 0.05
+            _HEADING_FLOOR = 0.01
             perceived_dist = dist / max(heading_score, _HEADING_FLOOR)
 
             candidates.append((dist, perceived_dist, area_m2, heading_score, wx, wy))
@@ -796,7 +804,7 @@ class FrontierExplorer(Node):
         clear_radius_cells = max(1, int(self.safe_goal_radius / self.map_resolution))
 
         # Use drone map for validation if available — matches what A* sees
-        check_map = self.drone_map_data if self.drone_map_received else self.map_data
+        check_map = self.map_data   # use SLAM map (no separate drone map)
 
         dx = robot_x - wx
         dy = robot_y - wy
@@ -818,7 +826,8 @@ class FrontierExplorer(Node):
                 continue
 
             # Must be free in SLAM map (known free space)
-            if int(self.map_data[cj, ci]) != FREE:
+            cell_val = int(self.map_data[cj, ci])
+            if not (0 <= cell_val < LETHAL_THRESHOLD):
                 continue
 
             # Must be clear in drone map (no lethal inflation)

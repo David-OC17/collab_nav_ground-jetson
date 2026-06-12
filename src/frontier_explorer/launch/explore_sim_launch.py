@@ -8,7 +8,7 @@ Usage:
   ros2 launch frontier_explorer frontier_exploration.launch.py rviz:=false
 
 To trigger fallback exploration (once running):
-  ros2 topic pub /mission/start std_msgs/msg/Bool "{data: true}" --once
+  ros2 topic pub /map_fail_fallback/start std_msgs/msg/Bool "{data: true}" --once
 """
 
 import os
@@ -44,7 +44,7 @@ def generate_launch_description():
         DeclareLaunchArgument('publish_rate',      default_value='2.0',
             description='SLAM map publish rate in Hz'),
 
-        DeclareLaunchArgument('target_marker_id',  default_value='0',
+        DeclareLaunchArgument('target_marker_id',  default_value='5',
             description='ArUco marker ID that triggers HOMING'),
         DeclareLaunchArgument('goal_reached_dist', default_value='0.35',
             description='Distance to ArUco goal that triggers DONE (m)'),
@@ -62,7 +62,7 @@ def generate_launch_description():
         DeclareLaunchArgument('update_rate',       default_value='1.0',
             description='Frontier explorer update rate in Hz'),
 
-        DeclareLaunchArgument('min_goal_dist',    default_value='0.40',
+        DeclareLaunchArgument('min_goal_dist',    default_value='0.30',
             description='Ignore frontier goals closer than this (m)'),
         DeclareLaunchArgument('goal_reached_dist', default_value='0.12',
             description='Distance at which robot is considered to have reached frontier (m)'),
@@ -82,8 +82,8 @@ def generate_launch_description():
         DeclareLaunchArgument('odom_topic', default_value='',
             description='EKF odometry topic for real robot (empty = simulation mode)'),
 
-        DeclareLaunchArgument('robot_start_x', default_value='1.7'),
-        DeclareLaunchArgument('robot_start_y', default_value='1.7'),
+        DeclareLaunchArgument('robot_start_x', default_value='1.5'),
+        DeclareLaunchArgument('robot_start_y', default_value='1.5'),
 
         DeclareLaunchArgument('aruco_marker_x', default_value='-1.7',
             description='Simulated ArUco marker world X position (m)'),

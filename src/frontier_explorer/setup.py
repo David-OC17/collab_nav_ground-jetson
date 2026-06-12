@@ -35,6 +35,9 @@ setup(
             'frontier_explorer   = frontier_explorer.frontier_explorer:main',
             'explorer_controller = frontier_explorer.explorer_controller:main',
             'aruco_goal_detector = frontier_explorer.aruco_goal_detector:main',
+            'aruco_world_bridge  = frontier_explorer.aruco_world_bridge:main',
+            'camera_fov_tracker  = frontier_explorer.camera_fov_tracker:main',
+             'aruco_visual_servo  = frontier_explorer.aruco_visual_servo:main',
             # Simulation helpers — now in simulation_helpers subpackage
             'fake_aruco_detector = frontier_explorer.simulation_helpers.fake_aruco_detector:main',
             'fake_map_publisher  = frontier_explorer.simulation_helpers.fake_map_publisher:main',

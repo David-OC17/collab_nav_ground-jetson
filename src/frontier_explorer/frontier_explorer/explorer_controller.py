@@ -23,11 +23,11 @@ States:
                Terminal state until node is restarted.
 
 Operator triggers:
-  Start exploration : ros2 topic pub /mission/start std_msgs/Bool "{data: true}" --once
-  Stop / reset      : ros2 topic pub /mission/start std_msgs/Bool "{data: false}" --once
+  Start exploration : ros2 topic pub /map_fail_fallback/start std_msgs/Bool "{data: true}" --once
+  Stop / reset      : ros2 topic pub /map_fail_fallback/start std_msgs/Bool "{data: false}" --once
 
 Subscribes:
-  - /mission/start    (std_msgs/Bool)                              — operator trigger
+  - /map_fail_fallback/start    (std_msgs/Bool)                   — operator trigger
   - /frontier/goal    (geometry_msgs/PoseWithCovarianceStamped)   — from FrontierExplorer
   - /aruco/detection  (geometry_msgs/PoseWithCovarianceStamped)   — from ArUcoDetector
   - /follower/pose    (geometry_msgs/PoseWithCovarianceStamped)   — robot pose
@@ -55,6 +55,7 @@ from rclpy.qos import (QoSProfile, ReliabilityPolicy,
                         DurabilityPolicy, HistoryPolicy)
 
 from geometry_msgs.msg import PoseWithCovarianceStamped
+from nav_msgs.msg import Path
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
@@ -136,26 +137,51 @@ class ExplorerController(Node):
         # Subscribers
         # ------------------------------------------------------------------
         self.start_sub = self.create_subscription(
-            Bool, '/mission/start',
+            Bool, '/map_fail_fallback/start',
             self._start_callback, volatile_qos)
 
         self.frontier_sub = self.create_subscription(
             PoseWithCovarianceStamped, '/frontier/goal',
             self._frontier_goal_callback, reliable_qos)
 
+        # aruco_goal_detector → /aruco/{id}/pose → aruco_visual_servo directly.
+        # explorer_controller only needs to know WHEN a detection occurs.
         self.aruco_sub = self.create_subscription(
             PoseWithCovarianceStamped, '/aruco/detection',
             self._aruco_detection_callback, reliable_qos)
+
+        # aruco_visual_servo reports done/lost here
+        self.servo_active_sub = self.create_subscription(
+            Bool, '/aruco_servo/active',
+            self._servo_active_callback, reliable_qos)
 
         self.pose_sub = self.create_subscription(
             PoseWithCovarianceStamped, '/follower/pose',
             self._pose_callback, reliable_qos)
 
+        # A* tells us when a goal cell is lethal/unreachable
+        self.create_subscription(
+            PoseWithCovarianceStamped, '/astar/goal_failed',
+            self._astar_fail_callback, reliable_qos)
+
         # ------------------------------------------------------------------
         # Publishers
         # ------------------------------------------------------------------
+        # Enable/disable the visual servo node
+        self.servo_enable_pub = self.create_publisher(
+            Bool, '/aruco_servo/enable', reliable_qos)
+
+        # Cancels the spline follower by sending an empty path
+        self.path_cancel_pub = self.create_publisher(
+            Path, '/trajectory_planner2/path', reliable_qos)
+
+        # Kept for compatibility with A* (frontier homing still uses it)
         self.goal_pub = self.create_publisher(
             PoseWithCovarianceStamped, '/aruco/goal/pose', latched_qos)
+
+        # Relays A* failures back to frontier_explorer with guaranteed delivery
+        self.goal_failed_relay_pub = self.create_publisher(
+            PoseWithCovarianceStamped, '/astar/goal_failed', reliable_qos)
 
         self.active_pub = self.create_publisher(
             Bool, '/frontier_explorer/active', reliable_qos)
@@ -183,7 +209,7 @@ class ExplorerController(Node):
             f'  detection_timeout_sec = {self.detection_timeout_sec} s\n'
             f'  update_rate           = {self.update_rate} Hz\n'
             f'  State                 → {self.state}\n'
-            f'  To start: ros2 topic pub /mission/start std_msgs/msg/Bool '
+            f'  To start: ros2 topic pub /map_fail_fallback/start std_msgs/msg/Bool '
             f'"{{data: true}}" --once\'')
 
     # ==========================================================================
@@ -208,8 +234,10 @@ class ExplorerController(Node):
 
     def _frontier_goal_callback(self, msg: PoseWithCovarianceStamped):
         self.frontier_goal        = msg
-        self._frontier_goal_dirty = True
-        self._last_progress_pos   = None   # reset watchdog for new goal
+        self._frontier_goal_dirty  = True
+        self._last_progress_pos    = None   # reset watchdog for new goal
+        self._astar_fail_count     = 0      # new goal — reset failure counter
+        self._no_progress_retries  = 0      # new goal — reset retry counter
 
     def _aruco_detection_callback(self, msg: PoseWithCovarianceStamped):
         # Marker ID is stored as float in covariance[0] by aruco_goal_detector.
@@ -257,9 +285,40 @@ class ExplorerController(Node):
     def _tick_idle(self):
         self.get_logger().info(
             'IDLE — waiting for operator start signal.\n'
-            '  Run: ros2 topic pub /mission/start '
+            '  Run: ros2 topic pub /map_fail_fallback/start '
             'std_msgs/msg/Bool "{data: true}" --once',
             throttle_duration_sec=10.0)
+
+    def _astar_fail_callback(self, msg: PoseWithCovarianceStamped):
+        """A* could not plan to the current frontier goal.
+        Force frontier_explorer to drop this goal and pick a new one
+        by clearing the dirty flag and incrementing the fail counter.
+        After MAX_ASTAR_FAILS consecutive failures on the same goal,
+        we explicitly tell frontier_explorer to blacklist it."""
+        if self.state != State.EXPLORING:
+            return
+        self._astar_fail_count = getattr(self, '_astar_fail_count', 0) + 1
+        gx = msg.pose.pose.position.x
+        gy = msg.pose.pose.position.y
+        self.get_logger().warn(
+            f'A* failed for goal ({gx:.2f},{gy:.2f}) '
+            f'(fail #{self._astar_fail_count}) — forcing frontier reselection.')
+
+        _MAX_ASTAR_FAILS = 2   # blacklist after this many consecutive failures
+        if self._astar_fail_count >= _MAX_ASTAR_FAILS:
+            self.get_logger().warn(
+                f'Goal ({gx:.2f},{gy:.2f}) failed {_MAX_ASTAR_FAILS}× '
+                f'— publishing blacklist signal.')
+            # Re-publish goal_failed so frontier_explorer blacklists it,
+            # even if it missed the original message from A*.
+            self.goal_failed_relay_pub.publish(msg)
+            self._astar_fail_count = 0
+
+        # Force frontier_explorer to re-score by clearing current goal
+        self.frontier_goal = None
+        self._frontier_goal_dirty = False
+        self._last_progress_pos   = None
+        self._last_progress_time  = self.get_clock().now().nanoseconds * 1e-9
 
     def _tick_exploring(self):
         if self.frontier_goal is None:
@@ -286,17 +345,37 @@ class ExplorerController(Node):
                     self._last_progress_pos  = pos
                     self._last_progress_time = now
                 elif now - self._last_progress_time > self._progress_timeout_sec:
+                    self._no_progress_retries = getattr(self, '_no_progress_retries', 0) + 1
                     self.get_logger().warn(
-                        f'No progress for {self._progress_timeout_sec}s — '
-                        f're-sending goal to A*')
+                        f'No progress for {self._progress_timeout_sec}s '
+                        f'(retry {self._no_progress_retries}) — re-sending goal to A*')
                     self._frontier_goal_dirty = True
-                    self._last_progress_time  = now   # reset to avoid spam
+                    self._last_progress_time  = now
+
+                    # After 2 retries with no movement, the goal is unreachable.
+                    # Publish a synthetic goal_failed so frontier_explorer blacklists it.
+                    _MAX_RETRIES = 2
+                    if (self._no_progress_retries >= _MAX_RETRIES
+                            and self.frontier_goal is not None):
+                        self.get_logger().warn(
+                            f'Goal stuck after {_MAX_RETRIES} retries — '
+                            f'forcing blacklist on frontier_explorer.')
+                        self.goal_failed_relay_pub.publish(self.frontier_goal)
+                        self.frontier_goal         = None
+                        self._frontier_goal_dirty  = False
+                        self._no_progress_retries  = 0
+                        self._last_progress_pos    = None
 
         # ── Forward goal to A* (only when dirty) ────────────────────────
         if not getattr(self, '_frontier_goal_dirty', True):
             return
 
         self._frontier_goal_dirty = False
+        if self.frontier_goal is None:
+            self.get_logger().info(
+                'EXPLORING — waiting for frontier_explorer to pick a new goal '
+                '(previous goal was dropped after A* failure).')
+            return
         self.goal_pub.publish(self.frontier_goal)
         self.get_logger().info(
             f'EXPLORING — forwarding frontier goal '
@@ -304,28 +383,28 @@ class ExplorerController(Node):
             f'{self.frontier_goal.pose.pose.position.y:.2f})')
 
     def _tick_homing(self):
-        # Detection lost → resume exploring immediately
         elapsed = time.time() - self.last_detection_time
+
+        # Detection lost → resume exploring
         if elapsed > self.detection_timeout_sec:
             self.get_logger().warn(
                 f'ArUco detection lost ({elapsed:.1f}s) — resuming exploration.')
             self._transition_to(State.EXPLORING)
             return
 
-        # Forward last known ArUco goal
+        # Forward last known world-frame ArUco pose to A* every tick
         if self.aruco_goal is not None:
             self.goal_pub.publish(self.aruco_goal)
 
         # Check if robot reached the goal
         if self.pose_received and self.aruco_goal is not None:
-            gx   = self.aruco_goal.pose.pose.position.x
-            gy   = self.aruco_goal.pose.pose.position.y
+            gx = self.aruco_goal.pose.pose.position.x
+            gy = self.aruco_goal.pose.pose.position.y
             dist = math.hypot(self.robot_x - gx, self.robot_y - gy)
-
             self.get_logger().info(
-                f'HOMING — dist to ArUco goal: {dist:.3f} m',
+                f'HOMING — dist to ArUco: {dist:.3f} m '
+                f'| last detection {elapsed:.1f}s ago',
                 throttle_duration_sec=1.0)
-
             if dist <= self.goal_reached_dist:
                 self._transition_to(State.DONE)
 
@@ -346,13 +425,19 @@ class ExplorerController(Node):
 
         if new_state == State.IDLE:
             self._set_frontier_explorer_active(False)
-            self.frontier_goal = None   # discard stale goal on reset
+            self._cancel_spline()          # stop any in-progress trajectory
+            self.frontier_goal  = None     # discard stale goal on reset
+            self.aruco_goal     = None
+            self._last_progress_pos  = None
+            self._astar_fail_count   = 0
+            self._no_progress_retries = 0
 
         elif new_state == State.EXPLORING:
             self._set_frontier_explorer_active(True)
 
         elif new_state == State.HOMING:
             self._set_frontier_explorer_active(False)
+            # A* + spline handle homing — aruco_goal forwarded on every tick
 
         elif new_state == State.DONE:
             self._set_frontier_explorer_active(False)
@@ -362,6 +447,29 @@ class ExplorerController(Node):
     # ==========================================================================
     # Helpers
     # ==========================================================================
+
+    def _cancel_spline(self):
+        """Stops the spline follower immediately by publishing an empty path.
+        spline_follower._path_callback rejects len < 2 and sets goal_reached=True,
+        causing it to publish zero velocity and stop competing on /amr/reference."""
+        empty = Path()
+        empty.header.stamp    = self.get_clock().now().to_msg()
+        empty.header.frame_id = self.world_frame
+        self.path_cancel_pub.publish(empty)
+        self.get_logger().info('Spline cancelled — empty path sent.')
+
+    def _set_servo_enabled(self, enabled: bool):
+        msg      = Bool()
+        msg.data = enabled
+        self.servo_enable_pub.publish(msg)
+        self.get_logger().info(
+            f'VisualServo {"ENABLED" if enabled else "DISABLED"}')
+
+    def _servo_active_callback(self, msg: Bool):
+        """Called when aruco_visual_servo reports done (active=False after reaching goal)."""
+        if not msg.data and self.state == State.HOMING:
+            self.get_logger().info('Visual servo reports done/lost — transitioning to DONE.')
+            self._transition_to(State.DONE)
 
     def _set_frontier_explorer_active(self, active: bool):
         msg      = Bool()

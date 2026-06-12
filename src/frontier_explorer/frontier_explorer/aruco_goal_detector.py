@@ -19,7 +19,7 @@ Subscribes:
 Publishes:
   - /aruco/detections  (geometry_msgs/PoseArray)              — all markers this frame
   - /aruco/markers     (visualization_msgs/MarkerArray)       — RViz cubes
-  - /aruco/{id}/pose   (geometry_msgs/PoseWithCovarianceStamped) — per-ID topic
+  - /aruco/id_{id}/pose   (geometry_msgs/PoseWithCovarianceStamped) — per-ID topic
 
 Parameters:
   marker_size_m       0.13     m  — physical side length of the ArUco marker
@@ -152,7 +152,7 @@ class ArucoDetector(Node):
         self.pose_array_pub = self.create_publisher(
             PoseArray, '/aruco/detections', reliable_qos)
 
-        # Per-marker-ID pose topic: /aruco/{id}/pose
+        # Per-marker-ID pose topic: /aruco/id_{id}/pose
         # Built dynamically as new IDs are seen
         self._id_publishers: dict = {}
 
@@ -173,7 +173,7 @@ class ArucoDetector(Node):
             f'  marker_size  = {self.marker_size_m} m\n'
             f'  aruco_dict   = {aruco_dict_name}\n'
             f'  detections   → /aruco/detections\n'
-            f'  per-ID       → /aruco/{{id}}/pose'
+            f'  per-ID       → /aruco/id_{{id}}/pose'
         )
 
     # ==========================================================================
@@ -296,7 +296,7 @@ class ArucoDetector(Node):
             pose.orientation.w = qw
             pose_array.poses.append(pose)
 
-            # ── PoseWithCovarianceStamped on /aruco/{id}/pose ─────────────
+            # ── PoseWithCovarianceStamped on /aruco/id_{id}/pose ─────────────
             pwcs = PoseWithCovarianceStamped()
             pwcs.header.stamp    = now
             pwcs.header.frame_id = self.camera_frame   # ← camera frame
@@ -334,9 +334,9 @@ class ArucoDetector(Node):
     # ==========================================================================
 
     def _get_id_publisher(self, marker_id: int):
-        """Lazily create a publisher for /aruco/{id}/pose."""
+        """Lazily create a publisher for /aruco/id_{id}/pose."""
         if marker_id not in self._id_publishers:
-            topic = f'/aruco/{marker_id}/pose'
+            topic = f'/aruco/id_{marker_id}/pose'
             reliable_qos = QoSProfile(
                 reliability=ReliabilityPolicy.RELIABLE,
                 history=HistoryPolicy.KEEP_LAST,
