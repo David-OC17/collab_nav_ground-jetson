@@ -12,6 +12,8 @@ src/arena_map_builder/sweep/stitching/new-results-scan18
 video/
 vo/
 
+report/report.aux
+
 # Created by https://www.toptal.com/developers/gitignore/api/c++,ros2,cmake,python,visualstudiocode
 # Edit at https://www.toptal.com/developers/gitignore?templates=c++,ros2,cmake,python,visualstudiocode
 
