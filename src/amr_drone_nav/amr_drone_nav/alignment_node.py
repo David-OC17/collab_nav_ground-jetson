@@ -32,6 +32,12 @@ from scipy.spatial.transform import Rotation
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
+from rclpy.qos import (
+    QoSProfile,
+    QoSHistoryPolicy,
+    QoSReliabilityPolicy,
+    QoSDurabilityPolicy,
+)
 
 from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
 from tf2_ros import Buffer, TransformListener, TransformBroadcaster
@@ -68,12 +74,19 @@ class AlignmentNode(Node):
         self.tf_listener    = TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = TransformBroadcaster(self)
 
+        latched_qos = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
         # ── Suscripciones ─────────────────────────────────────────────────────
         init_topic       = self.get_parameter('init_topic').value
         correction_topic = self.get_parameter('correction_topic').value
 
         self.create_subscription(
-            PoseWithCovarianceStamped, init_topic, self._cb_init, 10)
+            PoseWithCovarianceStamped, init_topic, self._cb_init, latched_qos)
         self.create_subscription(
             PoseWithCovarianceStamped, correction_topic, self._cb_correction, 10)
 
