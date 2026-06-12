@@ -183,35 +183,51 @@ def load_bag(bag_path: Path, typestore) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def optitrack_velocity(
-    df_ot: pd.DataFrame,
-    sg_window: int = 15,
-    sg_poly:   int = 3,
+    df_ot:     pd.DataFrame,
+    target_fs: float = 60.0,
+    smooth_s:  float = 0.30,
+    sg_poly:   int   = 3,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Body-frame forward velocity from OptiTrack via finite difference +
-    Savitzky-Golay smoothing.  Returns (t_vel, vx_body).
+    Body-frame forward velocity from OptiTrack ground truth.
+
+    OptiTrack message header stamps are clustered/non-uniform (bursts with
+    near-zero inter-sample dt), so per-sample finite differencing of position
+    over those raw timestamps explodes the velocity.  Instead the trajectory is
+    resampled onto a uniform ``target_fs`` grid by interpolation, then
+    differentiated with a constant step and Savitzky-Golay smoothed over a
+    ``smooth_s``-second window.  Returns (t_vel, vx_body).
     """
     t   = df_ot["t"].values
     px  = df_ot["px"].values
     py  = df_ot["py"].values
     yaw = df_ot["yaw"].values
 
-    dt = np.diff(t)
-    dt = np.where(dt < 1e-9, np.nan, dt)
+    # Strictly increasing time base (drop duplicate/back-stepping stamps).
+    order = np.argsort(t, kind="stable")
+    t, px, py, yaw = t[order], px[order], py[order], yaw[order]
+    keep = np.concatenate([[True], np.diff(t) > 1e-6])
+    t, px, py, yaw = t[keep], px[keep], py[keep], yaw[keep]
+    if len(t) < 5:
+        return np.array([]), np.array([])
 
-    with np.errstate(invalid="ignore"):
-        vx_w = np.diff(px) / dt
-        vy_w = np.diff(py) / dt
+    # Uniform resample (unwrap yaw so the interpolation does not jump at ±π).
+    dt   = 1.0 / target_fs
+    t_u  = np.arange(t[0], t[-1], dt)
+    px_u = np.interp(t_u, t, px)
+    py_u = np.interp(t_u, t, py)
+    yaw_u = np.interp(t_u, t, np.unwrap(yaw))
 
-    yaw_mid  = 0.5 * (yaw[:-1] + yaw[1:])
-    vx_body  = vx_w * np.cos(yaw_mid) + vy_w * np.sin(yaw_mid)
-    t_vel    = 0.5 * (t[:-1] + t[1:])
+    vx_w = np.gradient(px_u, dt)
+    vy_w = np.gradient(py_u, dt)
+    vx_body = vx_w * np.cos(yaw_u) + vy_w * np.sin(yaw_u)
 
-    valid = np.isfinite(vx_body)
-    if valid.sum() >= sg_window:
-        vx_body[valid] = savgol_filter(vx_body[valid], sg_window, sg_poly)
+    win = int(smooth_s * target_fs)
+    win = win if win % 2 == 1 else win + 1          # must be odd
+    if len(vx_body) > win and win > sg_poly:
+        vx_body = savgol_filter(vx_body, win, sg_poly)
 
-    return t_vel, vx_body
+    return t_u, vx_body
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -576,11 +592,121 @@ def plot_bag(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# REPORT FIGURES  (clean, single-column, publication-ready)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# These are NOT the diagnostic multi-panel comparison (plot_bag). They emit the
+# two figures the report's EKF section needs:
+#
+#   IX_D-vio_raw_vs_gated   — raw cuSLAM vx vs the DEPLOYED gated output (C: P0→P1
+#                             ema_gate), with the position finite-difference (FD)
+#                             self-consistency reference as an independent check
+#                             and the replaced samples marked. No OptiTrack GT is
+#                             used (not reliable on the presentable runs), so the
+#                             FD track is the only cross-reference shown.
+#
+#   IX_D-vio_gate_ablation  — zoom on the worst burst comparing the rejected
+#                             Butterworth LPF baseline against the deployed gate,
+#                             evidencing the "LPF transient propagates" claim.
+#
+# Sized for an IEEE single column (~3.4 in wide) and rendered to PNG so they drop
+# straight into report/assets/.
+
+REPORT_FIGSIZE = (3.4, 2.2)          # inches — single IEEE column
+REPORT_DPI     = 300
+
+
+def _worst_burst_window(t: np.ndarray, mask: np.ndarray,
+                        half_width_s: float = 3.0) -> tuple[float, float]:
+    """Centre a time window on the densest cluster of replaced samples."""
+    if not mask.any():
+        mid = 0.5 * (t[0] + t[-1])
+        return mid - half_width_s, mid + half_width_s
+    # Density via a short box convolution over the spike mask.
+    k       = max(5, int(0.5 / np.median(np.diff(t))) if len(t) > 1 else 5)
+    dens    = np.convolve(mask.astype(float), np.ones(k), mode="same")
+    centre  = t[int(np.argmax(dens))]
+    return centre - half_width_s, centre + half_width_s
+
+
+def plot_report_figures(
+    bag_name: str,
+    df_vio:   pd.DataFrame,
+    vx_C:     np.ndarray,      # deployed gated output (P0→P1)
+    mask_C:   np.ndarray,      # replaced-sample mask for the deployed gate
+    vx_base:  np.ndarray,      # Butterworth LPF baseline (for ablation)
+    vx_fd:    np.ndarray,      # position FD self-consistency reference
+    out_dir:  Path,
+    fmt:      str = "png",
+    df_ot:    pd.DataFrame | None = None,   # OptiTrack ground truth (optional)
+) -> list[Path]:
+    t      = df_vio["t"].values
+    vx_raw = df_vio["vx"].values
+    paths  = []
+
+    # Ground-truth body-frame velocity from OptiTrack, when available. This is
+    # the strongest reference; the FD track is a secondary VIO-internal check.
+    t_gt = vx_gt = None
+    if df_ot is not None and not df_ot.empty:
+        t_gt, vx_gt = optitrack_velocity(df_ot)
+
+    # ── Figure 1: raw vs deployed gate vs ground truth ────────────────────────
+    fig, ax = plt.subplots(figsize=REPORT_FIGSIZE)
+    ax.plot(t, vx_raw, color="0.65", lw=0.6, alpha=0.9, label="cuSLAM raw")
+    if t_gt is not None:
+        ax.plot(t_gt, vx_gt, color="tab:green", lw=0.9, alpha=0.85,
+                label="OptiTrack truth")
+    else:
+        ax.plot(t, vx_fd, color="tab:cyan", lw=0.7, ls="--", alpha=0.8,
+                label="position FD (consistency ref.)")
+    ax.plot(t, vx_C,   color="tab:blue", lw=1.0, label="gated (deployed)")
+    if mask_C.any():
+        ax.scatter(t[mask_C], vx_raw[mask_C], color="tab:red", s=6, marker="x",
+                   linewidths=0.6, zorder=6,
+                   label=f"replaced ({int(mask_C.sum())})")
+    ax.axhline( AMR_VX_MAX, color="red", lw=0.6, ls=":", alpha=0.5)
+    ax.axhline(-AMR_VX_MAX, color="red", lw=0.6, ls=":", alpha=0.5)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel(r"$v_x$ [m/s]")
+    ax.set_ylim(*_tight_ylim(vx_C, vx_gt if vx_gt is not None else vx_fd, pad=0.25))
+    ax.legend(fontsize=5.5, loc="upper right", framealpha=0.9)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout(pad=0.3)
+    p1 = out_dir / f"IX_D-vio_raw_vs_gated.{fmt}"
+    fig.savefig(p1, dpi=REPORT_DPI, bbox_inches="tight")
+    plt.close(fig)
+    paths.append(p1)
+
+    # ── Figure 2: ablation zoom on worst burst (LPF baseline vs deployed) ─────
+    t0, t1 = _worst_burst_window(t, mask_C)
+    w      = (t >= t0) & (t <= t1)
+    fig, ax = plt.subplots(figsize=REPORT_FIGSIZE)
+    ax.plot(t[w], vx_raw[w],  color="0.65", lw=0.7, alpha=0.9, label="cuSLAM raw")
+    ax.plot(t[w], vx_base[w], color="tab:orange", lw=1.0, alpha=0.9,
+            label="Butterworth LPF")
+    ax.plot(t[w], vx_C[w],    color="tab:blue", lw=1.2, label="ema_gate (deployed)")
+    ax.axhline( AMR_VX_MAX, color="red", lw=0.6, ls=":", alpha=0.5)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel(r"$v_x$ [m/s]")
+    ax.set_ylim(*_tight_ylim(vx_base[w], vx_C[w], pad=0.30))
+    ax.legend(fontsize=5.5, loc="upper right", framealpha=0.9)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout(pad=0.3)
+    p2 = out_dir / f"IX_D-vio_gate_ablation.{fmt}"
+    fig.savefig(p2, dpi=REPORT_DPI, bbox_inches="tight")
+    plt.close(fig)
+    paths.append(p2)
+
+    return paths
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PER-BAG PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def analyze_bag(bag_path: Path, typestore, out_dir: Path,
-                fmt: str = "pdf", pdf_pages=None) -> dict | None:
+                fmt: str = "pdf", pdf_pages=None,
+                report: bool = False, report_dir: Path | None = None) -> dict | None:
     name = bag_path.name
     sep  = "─" * 60
     print(f"\n{sep}\n  {name}\n{sep}")
@@ -650,6 +776,16 @@ def analyze_bag(bag_path: Path, typestore, out_dir: Path,
                         fmt=fmt, pdf_pages=pdf_pages)
     print(f"\n  → {out_path}")
 
+    # ── Report figures (clean, single-column) ─────────────────────────────────
+    if report:
+        rdir = report_dir or out_dir
+        rdir.mkdir(parents=True, exist_ok=True)
+        rpaths = plot_report_figures(name, df_vio, vx_C, mask_C, vx_base, vx_fd,
+                                     rdir, fmt="png",
+                                     df_ot=df_ot if has_ot else None)
+        for rp in rpaths:
+            print(f"  report → {rp}")
+
     return {
         "bag":           name,
         "n_vio":         len(df_vio),
@@ -674,6 +810,12 @@ def main():
     parser.add_argument("--format", dest="fmt", default="pdf",
                         choices=["pdf", "svg", "png"],
                         help="Output format for plots (default: pdf)")
+    parser.add_argument("--report", action="store_true",
+                        help="Also emit clean single-column report figures "
+                             "(IX_D-vio_raw_vs_gated, IX_D-vio_gate_ablation) as PNG")
+    parser.add_argument("--report-dir", type=Path, default=None,
+                        help="Directory for report figures "
+                             "(default: ../report/assets if it exists, else the analysis dir)")
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -686,6 +828,12 @@ def main():
 
     out_dir = vo_dir / "analysis"
     out_dir.mkdir(exist_ok=True)
+
+    # Report figures default to the report's assets dir when present.
+    report_dir = args.report_dir
+    if args.report and report_dir is None:
+        assets = script_dir.parent / "report" / "assets"
+        report_dir = assets if assets.is_dir() else out_dir
 
     typestore = get_typestore(Stores.ROS2_HUMBLE)
 
@@ -719,7 +867,8 @@ def main():
                 print(f"  Skip {bp.name}: missing metadata.yaml")
                 continue
             result = analyze_bag(bp, typestore, out_dir,
-                                 fmt=args.fmt, pdf_pages=pdf_pages)
+                                 fmt=args.fmt, pdf_pages=pdf_pages,
+                                 report=args.report, report_dir=report_dir)
             if result:
                 summary.append(result)
 
