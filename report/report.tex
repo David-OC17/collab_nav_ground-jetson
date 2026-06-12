@@ -34,9 +34,7 @@
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,positioning,shapes.geometric}
 
-\newcommand{\checked}{\textcolor{green!60!black}{\ding{51}}}
-
-\graphicspath{{figures/}}
+\graphicspath{{assets/}}
 
 % IEEEtran-recommended fix for \BibTeX / \LaTeX spacing
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
@@ -111,7 +109,16 @@ emergency braking, robot cybersecurity.
 \section{Introduction}
 \label{sec:intro}
 
-\subsection{Motivation and Problem Context \checked}
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{system_graph.png}
+\caption{Full ROS~2 computation graph of the deployed system: nodes and the
+topics, services, and actions connecting them across the UAV, Jetson, and RDK~X3
+hosts. \TODO{Replace with updated vector (SVG) diagram.}}
+\label{fig:sysgraph}
+\end{figure*}
+
+\subsection{Motivation and Problem Context }
 Modern logistics increasingly relies on autonomous ground vehicles for material
 transport. In structured indoor warehouses this is well understood, but a large
 class of industrially relevant environments---maritime ports, container yards,
@@ -126,7 +133,7 @@ This project targets exactly that regime: autonomous navigation toward a goal
 whose global position is not known a~priori to the ground vehicle, in an
 environment for which no map exists in advance.
 
-\subsection{Problem Statement \checked}
+\subsection{Problem Statement }
 We consider a $4\times4$~m arena populated with static obstacles and several
 ArUco fiducial markers that denote goal/zone locations and visual landmarks. An AMR must navigate from
 a start pose to a marked goal without colliding with obstacles. Two constraints
@@ -208,7 +215,7 @@ invertible for all $\theta$, yielding linear, decoupled error dynamics
 (Sec.~\ref{sec:drive}).
 
 \subsection{The Extended Kalman Filter}
-The EKF estimates the state of a nonlinear system by alternating a
+The EKF~\cite{kalman,thrun} estimates the state of a nonlinear system by alternating a
 \emph{prediction} step, which propagates the state mean through the nonlinear
 process model $f$ and the covariance through its Jacobian $F=\partial f/\partial
 \state$, with \emph{update} steps that correct the prediction using measurements
@@ -220,8 +227,8 @@ preserves symmetry and positive semi-definiteness regardless of gain magnitude
 (Sec.~\ref{sec:ekf}).
 
 \subsection{Bayesian Occupancy Grids}
-An occupancy grid discretizes the world into cells, each holding the probability
-that it is occupied. Maintaining this in \emph{log-odds} form,
+An occupancy grid~\cite{thrun} discretizes the world into cells, each holding the
+probability that it is occupied. Maintaining this in \emph{log-odds} form,
 $l=\log\frac{p}{1-p}$, turns Bayesian measurement integration into simple
 addition: each sensor reading adds an occupied or free increment to the cells it
 observes, with the cells along a range beam updated by ray casting (Bresenham).
@@ -229,9 +236,9 @@ Asymmetric increments encode that a single occupied return is more informative
 than a single free return (Sec.~\ref{sec:mapping}).
 
 \subsection{Feature-Based Image Stitching}
-Stitching aligns overlapping images by detecting keypoints (e.g.\ SIFT),
+Stitching aligns overlapping images by detecting keypoints (e.g.\ SIFT~\cite{sift}),
 matching their descriptors, and estimating a geometric transform between frames.
-Spurious matches are filtered by Lowe's ratio test and by RANSAC, which fits the
+Spurious matches are filtered by Lowe's ratio test and by RANSAC~\cite{ransac}, which fits the
 transform to the largest consistent inlier set. The transform family matters: a
 full projective homography has 8 degrees of freedom, whereas a \emph{similarity}
 transform (translation, rotation, uniform scale) has only 4. For a nadir camera
@@ -240,15 +247,15 @@ estimate to that family prevents the extra projective degrees of freedom from
 fitting noise---critical over repetitive texture (Sec.~\ref{sec:stitching}).
 
 \subsection{Marker-Based Pose Estimation}
-ArUco markers are square fiducials whose four corners, detected in the image,
+ArUco markers~\cite{aruco} are square fiducials whose four corners, detected in the image,
 provide 2D--3D correspondences for a Perspective-$n$-Point (PnP) pose solve. For
 a planar target the problem reduces to a homography from which the pose is
 recovered in closed form; the Infinitesimal Plane-based Pose Estimation
-(IPPE\_SQUARE) method returns the two candidate poses of the planar ambiguity,
+(IPPE\_SQUARE) method~\cite{ippe} returns the two candidate poses of the planar ambiguity,
 disambiguated by reprojection error (Sec.~\ref{sec:aruco}).
 
 \subsection{Graph Search and Trajectory Generation}
-A$^\star$ searches a grid graph for a minimum-cost path using an admissible
+A$^\star$~\cite{astar} searches a grid graph for a minimum-cost path using an admissible
 heuristic; on an 8-connected grid the octile distance is the tight admissible
 heuristic. The resulting waypoint sequence is converted to a smooth, time
 -parameterized trajectory by fitting an arc-length-parameterized cubic spline
@@ -259,7 +266,7 @@ and velocity for the tracking controller (Sec.~\ref{sec:planner}).
 Message authentication and confidentiality rest on three primitives. A
 public-key infrastructure (PKI) binds identities to public keys through
 certificates signed by a trusted certificate authority (CA). RSA-PSS produces
-asymmetric signatures giving integrity and sender authenticity. AES-256-GCM is a
+asymmetric signatures giving integrity and sender authenticity. AES-256-GCM~\cite{nist} is a
 symmetric authenticated cipher giving confidentiality. Combining them---sign
 then encrypt at the sender, verify before decrypt at the receiver---yields a
 channel that is both authenticated and confidential (Sec.~\ref{sec:security}).
@@ -354,7 +361,14 @@ forward cameras; a $45^\circ$ mirror redirects its forward camera to a nadir
 view. Absolute positioning of the UAV is provided by an OptiTrack motion-capture
 system (sub-millimetre, streamed over VRPN), standing in for the GNSS a field
 drone would use. Table~\ref{tab:hw} summarizes the platform.
-\FIG{Labeled photo/diagram of AMR and UAV hardware}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\columnwidth]{IV_A-AMR_and_cube.png}
+\caption{The AMR with its 3D-printed top-mounted ArUco cube, which serves as the
+fiducial the UAV uses to localize the ground robot from above.}
+\label{fig:amr}
+\end{figure}
 
 \begin{table}[t]
 \caption{Hardware Platform Summary}
@@ -380,16 +394,18 @@ RDK~X3 runs low-level motor control and the EKF, while the Jetson Orin Nano runs
 the perception- and planning-heavy workloads (stitching, fusion, planning,
 orchestration). The LiDAR is mounted so
 its scan plane lies above floor irregularities yet intersects the
-\SI{30}{\centi\meter}-tall obstacle boxes (ER-1, ER-3). \TODO{Insert image of car with all sensors} Additionally, and providing a fiducial for locating the AMR from the drone view, we equip the vehicle with a 3D printed top mounted base with an Aruco marker.
+\SI{30}{\centi\meter}-tall obstacle boxes (ER-1, ER-3). Additionally, providing a
+fiducial for locating the AMR from the drone view, we equip the vehicle with a
+3D-printed top-mounted base carrying an ArUco marker (Fig.~\ref{fig:amr}).
 
 \subsection{Software Decomposition}
-The software spans three main repositories: the Jetson stack
+The software is built on ROS~2 Humble~\cite{ros2}. It spans three main repositories: the Jetson stack
 (\subsys{collab\_nav\_ground-jetson}), the RDK~X3 stack
 (\subsys{collab\_nav\_ground-rasp}), and the security middleware
-(\subsys{security\_middleware}). Functionality is decomposed into the subsystems
+(\subsys{security\_middleware})~\cite{repo}. Functionality is decomposed into the subsystems
 of Table~\ref{tab:subsystems}, each realized as one or more ROS~2 packages and
-detailed in Sections~\ref{sec:uav-control}--\ref{sec:security}.
-\FIG{Subsystem block diagram}
+detailed in Sections~\ref{sec:uav-control}--\ref{sec:security}. The complete ROS~2
+node-and-topic graph of the deployed system is shown in Fig.~\ref{fig:sysgraph}.
 
 \begin{table}[t]
 \caption{Subsystem-to-Package Mapping}
@@ -416,8 +432,44 @@ The \emph{data plane} is ROS~2 DDS over Wi-Fi, sharing all sensor and navigation
 topics across machines within a common \texttt{ROS\_DOMAIN\_ID}. The UAV is
 bridged over its proprietary Tello UDP SDK, and OptiTrack poses arrive over VRPN
 on a secondary Wi-Fi network. Latched (\texttt{TRANSIENT\_LOCAL}) QoS is used for the map and
-goal topics so that late-joining nodes still receive them (NFR-9).
-\FIG{Network topology diagram}
+goal topics so that late-joining nodes still receive them (NFR-9). The resulting
+topology is shown in Fig.~\ref{fig:net}.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\scriptsize, node distance=4mm and 7mm,
+  box/.style={draw, rounded corners, fill=blue!5, align=center,
+              inner sep=2.5pt, minimum height=6mm, text width=1.7cm},
+  host/.style={draw, rounded corners, fill=green!6, align=center,
+               inner sep=2.5pt, minimum height=6mm, text width=1.6cm},
+  lnk/.style={-, semithick}, ap/.style={draw, fill=orange!12, rounded corners,
+              align=center, inner sep=2.5pt, text width=1.2cm}
+]
+\node[box] (opti) {OptiTrack server};
+\node[host, below=of opti] (rospc) {ROS host PC};
+\node[ap, below=of rospc] (apn) {Wi-Fi AP};
+\node[host, below left=7mm and 0mm of apn, xshift=-6mm] (jetson) {Jetson Orin Nano};
+\node[host, below=12mm of apn] (rdk) {RDK X3 (AMR)};
+\node[box, below right=7mm and 0mm of apn, xshift=6mm] (tello) {DJI Tello (UAV)};
+\draw[lnk] (opti) -- node[right,font=\tiny]{Ethernet} (rospc);
+\draw[lnk] (rospc) -- node[right,font=\tiny]{Ethernet} (apn);
+\draw[lnk] (apn) -- node[above left,font=\tiny]{Wi-Fi} (jetson);
+\draw[lnk] (apn) -- node[right,font=\tiny]{Wi-Fi} (rdk);
+\draw[lnk] (apn) -- node[above right,font=\tiny]{Wi-Fi} (tello);
+% planes
+\draw[{Latex[length=1.2mm]}-{Latex[length=1.2mm]}, dashed, red!60!black]
+   (jetson) to[bend right=18] node[below,font=\tiny,align=center]
+   {SSH (control)\\+ DDS (data)} (rdk);
+\draw[{Latex[length=1.2mm]}-{Latex[length=1.2mm]}, dashed, blue!60!black]
+   (jetson) to[bend left=22] node[above,font=\tiny]{Tello UDP} (tello);
+\end{tikzpicture}
+\caption{Network topology. OptiTrack reaches the robot LAN over Ethernet via the
+ROS host and Wi-Fi access point; VRPN poses ride a secondary Wi-Fi link. The
+Jetson manages the RDK~X3 over SSH (control plane) and exchanges topics over DDS
+(data plane), and bridges the Tello over its proprietary UDP SDK.}
+\label{fig:net}
+\end{figure}
 
 \subsection{Development Methodology}
 Development followed four incremental stages: (1) basic AMR kinematics, odometry,
@@ -558,7 +610,52 @@ transitions to the ABORT sink, which lands the drone before tearing down.}
 \label{fig:fsm}
 \end{figure}
 
-\FIG{Pipeline data-flow with message types at stage boundaries}
+The data products exchanged between the major nodes, with their message types,
+are summarized in Fig.~\ref{fig:dataflow}.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\scriptsize, node distance=10mm and 16mm,
+  n/.style={draw, rounded corners, fill=blue!5, align=center,
+            inner sep=2.5pt, minimum height=5.5mm, text width=1.7cm},
+  amr/.style={draw, rounded corners, fill=green!7, align=center,
+              inner sep=2.5pt, minimum height=5.5mm, text width=1.7cm},
+  sec/.style={draw, dashed, rounded corners, fill=red!8, align=center,
+              font=\tiny, inner sep=2pt, text width=1.9cm},
+  e/.style={-{Latex[length=1.4mm]}, semithick},
+  lbl/.style={font=\tiny, fill=white, inner sep=0.8pt}
+]
+% aerial nodes (blue, left spine); ground nodes (green, right)
+\node[n] (scan) {UAV scan};
+\node[n, below=of scan] (build) {map builder};
+\node[n, right=of build] (mark) {marker loc.};
+\node[n, below=of build] (fuse) {fusion};
+\node[amr, below=of mark] (align) {alignment node};
+\node[amr, below=of fuse] (plan) {trajectory planner};
+\node[amr, below=of align] (wmap) {world\_mapper};
+\node[sec, below=7mm of plan] (sec) {\subsys{ros2\_security}\\SecureEnvelope};
+\node[amr, below=7mm of sec] (ctrl) {controller};
+\draw[e] (scan) -- node[lbl]{\texttt{scan.mp4}} (build);
+\draw[e] (scan.east) -| node[lbl,pos=0.25]{video+csv} (mark.north);
+\draw[e] (build) -- node[lbl]{\texttt{/drone/map}} (fuse);
+\draw[e] (mark) -- node[lbl]{\texttt{/aruco/amr/pose}} (align);
+\draw[e] (mark.east) -- ++(7mm,0) |- node[lbl,pos=0.28]{\texttt{/aruco/goal/pose}} (plan.east);
+\draw[e] (align) -- node[lbl]{\texttt{world}$\to$\texttt{odom}} (wmap);
+\draw[e] (wmap) -- node[lbl]{AMR map} (fuse);
+\draw[e] (fuse) -- node[lbl]{\texttt{/fusion/map}} (plan);
+\draw[e] (plan) -- node[lbl]{\texttt{/amr/reference}} (sec);
+\draw[e] (sec) -- (ctrl);
+\draw[e] (ctrl.east) to[bend right=22] node[lbl,pos=0.5]{\texttt{/amr/cmd\_vel}} (wmap.south);
+\end{tikzpicture}
+\caption{Principal data flow with ROS message types. Aerial products (blue) feed
+the planner; ground nodes (green) close the navigation loop. The classifier gate
+selects \texttt{/drone/map} or \texttt{/fusion/map} as the planner input
+(Sec.~\ref{sec:pipeline}). Inter-host topics are wrapped by \subsys{ros2\_security}
+(SecureEnvelope, Sec.~\ref{sec:security}); the planner$\to$controller link is shown
+passing through it as a representative case.}
+\label{fig:dataflow}
+\end{figure}
 
 %==============================================================================
 %  VI. UAV FLIGHT CONTROL
@@ -573,7 +670,7 @@ world-frame scan trajectory using OptiTrack pose feedback, despite the Tello
 exposing only a \emph{body-frame} velocity interface for its control, and must abort safely on
 loss of tracking (FR-6) or direct orchestrator's command.
 
-\subsection{Theory and Design Rationale \checked}
+\subsection{Theory and Design Rationale }
 \subsubsection{Flight state machine}
 Flight proceeds through six states: pre-flight, takeoff/home, stabilize at home,
 trajectory, return home, and normal land, with a seventh fault-land state
@@ -620,14 +717,65 @@ length, and interpolated by a clamped cubic spline with zero endpoint
 velocities. The analytic spline derivative supplies the feedforward velocity.
 
 \subsection{Implementation}
-The node subscribes to OptiTrack pose and publishes body-frame velocity commands
-to \subsys{tello\_driver}, advancing the state machine on a fixed timer.
-\TODO{Topic/parameter table.}
+The \subsys{pos\_controller\_node} subscribes to the OptiTrack pose
+(\texttt{optitrack/rigid\_body}) and a reference \texttt{Odometry}, and publishes
+body-frame velocity (\texttt{cmd\_vel}), takeoff/land, and the integer flight
+state to \subsys{tello\_driver}, advancing the state machine on a fixed timer
+(Table~\ref{tab:uav-io}). Trajectory playback is gated by a
+\texttt{start\_trajectory} service issued to the \subsys{reference\_node}, which
+streams the spline reference. Deployed control gains are listed in
+Table~\ref{tab:uav-params}.
+
+\begin{table}[t]
+\caption{UAV Controller Interface}
+\label{tab:uav-io}
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Direction} & \textbf{Topic / Service} & \textbf{Type} \\
+\midrule
+sub & \texttt{optitrack/rigid\_body} & \texttt{PoseStamped} \\
+sub & \texttt{reference} & \texttt{Odometry} \\
+sub & \texttt{camera/image\_raw} & \texttt{Image} \\
+pub & \texttt{cmd\_vel} & \texttt{Twist} \\
+pub & \texttt{drone/state} & \texttt{Int32} \\
+pub & \texttt{takeoff} / \texttt{land} & \texttt{Empty} \\
+cli & \texttt{start\_trajectory} & \texttt{Empty} (srv) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\caption{UAV Controller Deployed Parameters}
+\label{tab:uav-params}
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Meaning} \\
+\midrule
+$k_{p,x},k_{p,y},k_{p,z}$ & $2.0,2.0,3.0$ & position P gains \\
+$k_{d,x},k_{d,y},k_{d,z}$ & $0.1,0.1,0.3$ & derivative gains \\
+$k_{i,x},k_{i,y},k_{i,z}$ & $0,0,0.1$ & integral gains \\
+\texttt{max\_speed} & \SI{0.6}{\meter\per\second} & speed saturation \\
+$k_{p,\psi}$ & $0.15$ & yaw-hold gain \\
+\texttt{alpha} & $0.35$ & derivative EMA coeff. \\
+\texttt{stab\_threshold} & \SI{0.10}{\meter} & home-stabilization band \\
+\texttt{required\_stab\_counts} & $30$ & samples to declare stable \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Traceability and Tests}
 Satisfies FR-2, FR-6, FR-8. \TODO{Flight tests: trajectory tracking error under
 nominal tracking; fault-injection test forcing the alternating-ghost mode.}
-\FIG{Commanded vs.\ OptiTrack trajectory}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{VI_D-drone_trajectory_following.png}
+\caption{UAV tracking the commanded boustrophedon survey trajectory under
+OptiTrack feedback. \TODO{Add quantitative tracking-error annotation.}}
+\label{fig:drone-track}
+\end{figure}
 
 %==============================================================================
 %  VII. AERIAL MAPPING AND IMAGE STITCHING
@@ -654,13 +802,13 @@ via \texttt{estimateAffinePartial2D} with RANSAC, promoted to $3\times3$ for
 composition onto the global canvas.
 
 \subsubsection{Feature extraction with exclusion masking}
-The production front-end is SIFT (5000 keypoints/frame, 128-D descriptors). The
+The production front-end can be configured to work with SIFT (5000 keypoints/frame, 128-D descriptors). The
 arena's blue adhesive grid is masked out by an HSV threshold (dilated
 \SI{5}{px}) before detection: without this mask, RANSAC latches onto
 visually identical inter-cell tape junctions and converges on the wrong cell. A
-GPU alternative front-end uses SuperPoint (256-D) with LightGlue matching,
-exported to ONNX and run on the Jetson GPU---the embedded deep-learning component
-of the system.
+GPU alternative front-end uses SuperPoint~\cite{superpoint} (256-D) with LightGlue
+matching~\cite{lightglue}, exported to ONNX and run on the Jetson GPU---the
+embedded deep-learning component of the system.
 
 \subsubsection{Matching pipeline}
 Frame pairs are matched by (i)~$k$-nearest-neighbour ($k{=}2$) L2 matching,
@@ -678,28 +826,44 @@ with $\kappa=4.0$. Survivors feed a similarity RANSAC (threshold \SI{3}{px},
 \subsubsection{Canvas and blending}
 A fixed $8000\times8000$ canvas is pre-allocated; each frame is warped only over
 its region of interest (${\sim}\SI{6}{\mega\byte}$ vs.\ ${\sim}\SI{140}{\mega\byte}$
-for the full canvas). Frames are merged with a 4-level Laplacian pyramid blend
+for the full canvas). Frames are merged with a 4-level Laplacian pyramid blend~\cite{burt}
 whose weight $\alpha(p)=d_\text{new}/(d_\text{new}+d_\text{old})$ comes from a
 dual distance transform, placing the seam along the iso-depth contour.
 
 \subsubsection{Obstacle transfer and consistency scoring}
-Obstacles (pink) and walls (green/brown) are transferred by two independent
-projections (bounding-box and grid), whose centroid and area agreement form
-confidence proxies $s_A,s_B$; a perturbation-stability proxy $s_C$ completes a
-weighted score
+Obstacles (pink) and walls (green/brown) are transferred from the source frames
+onto the canvas by two independent projection methods---a bounding-box projection
+and a per-cell grid projection. Because the two methods are derived differently,
+their agreement is a proxy for how reliably an obstacle was reconstructed. Three
+proxies are combined into a per-obstacle confidence $c\in[0,1]$:
+\begin{itemize}
+  \item $s_A$ (\emph{centroid agreement}): how closely the obstacle centroids
+        from the two projection methods coincide---small displacement $\to$
+        $s_A\to1$.
+  \item $s_B$ (\emph{area ratio}): the ratio of the smaller to the larger of the
+        two projected obstacle areas---consistent extent $\to$ $s_B\to1$.
+  \item $s_C$ (\emph{perturbation stability}): how stable the obstacle is under
+        small perturbations of the projection, penalizing detections that move
+        or disappear under slight changes.
+\end{itemize}
+These are merged into the weighted score
 \begin{equation}
 c=\frac{w_A s_A+w_B s_B+w_C s_C}{w_A+w_B+w_C},
 \end{equation}
-with $(w_A,w_B,w_C)=(0.45,0.25,0.30)$. Occupancy is rasterized with confidence
--weighted halos of width $t(c)=t_\text{base}e^{-3c}$ interpolating from free
-to occupied around each obstacle core.
+with $(w_A,w_B,w_C)=(0.45,0.25,0.30)$: centroid agreement is weighted highest as
+the most direct evidence of a correct reconstruction. Occupancy is then
+rasterized with confidence-weighted halos of width $t(c)=t_\text{base}e^{-3c}$,
+interpolating from free to occupied around each obstacle core, so that
+low-confidence obstacles are surrounded by a wider cautionary margin.
 
 \subsubsection{Learned map-quality gate}
-A RandomForest classifier consumes a 45-feature diagnostic vector and outputs a
+A RandomForest classifier~\cite{breiman} consumes a 46-feature diagnostic vector and outputs a
 binary ``map acceptable'' decision $P(\text{pass}\mid\mathbf{f})\geq\tau$.
 Inference is pure NumPy (a serialized \texttt{forest.npz}, no scikit-learn at
 runtime); missing features map to a $-1$ sentinel for safe-fail. A rejected map
-triggers the frontier-exploration fallback of the mission FSM.
+triggers the frontier-exploration fallback of the mission FSM. The training and
+explainability of this classifier are detailed in
+Sec.~\ref{sec:stitching-tests}.
 
 \subsection{Implementation}
 The builder runs online (incrementally during flight, hiding stitching latency
@@ -711,10 +875,63 @@ deployed baseline (SIFT, $r{=}0.65$, $\kappa{=}4.0$, lookback~8, keyframe
 interval~10, processing scale~0.5, blue-tape exclusion).
 
 \subsection{Traceability and Tests}
+\label{sec:stitching-tests}
 Satisfies FR-2, FR-5, FR-11, NFR-5. \TODO{Coverage and obstacle TP/FP metrics;
 ablations: mask on/off, SIFT vs.\ SuperPoint.}
-\FIG{Stitched map with/without exclusion mask}
-\FIG{Occupancy grid with confidence halos}
+
+Figure~\ref{fig:stitch-mask} shows the feature-exclusion mask derived from the
+blue-tape grid, the resulting masked stitch, the final occupancy product, and the
+obstacle transfer projected onto the grid.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.48\columnwidth]{VII_D-contour_background_mask.png}
+\hfill
+\includegraphics[width=0.48\columnwidth]{VII_D-masked_stitching_final.png}\\[3pt]
+\includegraphics[width=0.48\columnwidth]{VII_D-final_stitching_map.png}
+\hfill
+\includegraphics[width=0.48\columnwidth]{VII_D-transfer_on_grid.png}
+\caption{Stitching pipeline products. Top: the blue-tape exclusion mask (left) and
+the masked incremental stitch (right). Bottom: the final stitched arena map (left)
+and the obstacle transfer projected onto the grid (right). The mask prevents
+RANSAC from matching visually identical inter-cell tape junctions; the transfer
+projection feeds the centroid- and area-agreement consistency proxies.}
+\label{fig:stitch-mask}
+\end{figure}
+
+\subsubsection{Map-quality classifier training and explainability}
+The 46 diagnostic features (Groups~1--6, prefixes \texttt{stitch\_},
+\texttt{dewarp\_}, \texttt{green\_}, \texttt{blob\_}, \texttt{marker\_},
+\texttt{stitcher\_}, \texttt{pg\_}) are extracted by \texttt{extract\_features.py}
+from each \texttt{BuildArenaMap} run; the configuration columns (\texttt{cfg\_*})
+are deliberately excluded because they are unavailable at inference time, when the
+model sees only live pipeline output. Runs flagged \texttt{diag\_error} or labelled
+\texttt{unsure}/\texttt{unlabeled} are dropped. A \SI{20}{\percent} stratified
+hold-out is reserved for evaluation, and a Random Forest (and an XGBoost baseline)
+is tuned by \num{50}-iteration randomized search over a \num{5}-fold stratified
+cross-validation, optimizing average precision (area under the precision--recall
+curve). Class imbalance is handled with \texttt{class\_weight='balanced\_subsample'},
+which recomputes weights on each bootstrap sample.
+
+The operating threshold is \emph{not} the default \num{0.5}. Because a false
+positive (accepting a bad map) is more costly than a false negative (triggering
+frontier exploration unnecessarily), the deployed threshold is the lowest value at
+which the precision of the \texttt{pass} class reaches a target precision on the
+hold-out set; it is stored in \texttt{threshold.json} and applied at inference.
+Feature importance is examined through both impurity-based importance and SHAP
+values (Fig.~\ref{fig:rf-importance}), which confirm the model keys on sensible
+diagnostics---stitching residuals, green-mask wall coverage, and blob statistics
+---rather than spurious correlations.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.95\columnwidth]{VII_D-random_forest_feature_importance.png}
+\caption{Random-forest impurity-based feature importance over the 46 diagnostic
+features. The highest-ranked features correspond to stitching-residual and
+wall/blob diagnostics, indicating the classifier has learned physically
+meaningful predictors of map quality.}
+\label{fig:rf-importance}
+\end{figure}
 
 %==============================================================================
 %  VIII. AERIAL MARKER LOCALIZATION
@@ -725,9 +942,18 @@ ablations: mask on/off, SIFT vs.\ SuperPoint.}
 \subsection{Role and Requirements}
 \subsys{arena\_marker\_localizer} estimates the world-frame pose of each ArUco
 goal marker from the UAV's aerial video and synchronized OptiTrack log,
-satisfying FR-3. Position is taken from the stitcher (whose metric pixel
-projection is more accurate) and \emph{orientation} from PnP, which depends only
-on relative image geometry and is unaffected by map-origin shifts.
+satisfying FR-3 (Fig.~\ref{fig:tello-aruco}). Position is taken from the stitcher
+(whose metric pixel projection is more accurate) and \emph{orientation} from PnP,
+which depends only on relative image geometry and is unaffected by map-origin
+shifts.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\columnwidth]{VIII_A-tello_drone_detecting_aruco.png}
+\caption{The UAV detecting ArUco markers in its nadir (mirror-redirected) view
+during the survey flight.}
+\label{fig:tello-aruco}
+\end{figure}
 
 \subsection{Theory and Design Rationale}
 \subsubsection{Mirror rig and camera transform}
@@ -758,7 +984,7 @@ row-by-row to video frames.
 \subsubsection{Robust aggregation}
 Each marker accrues 120--180 observations. These pass a per-axis and circular
 MAD gate ($k=3.5$), after which position is aggregated by the Weiszfeld
-geometric median (breakdown point ${\sim}50\%$),
+geometric median~\cite{weiszfeld} (breakdown point ${\sim}50\%$),
 $\mathbf{x}^{(k+1)}=\sum_i w_i\mathbf{p}_i/\sum_i w_i$ with $w_i=1/\lVert
 \mathbf{p}_i-\mathbf{x}^{(k)}\rVert$, and yaw by the circular median
 $\hat\theta=\mathrm{atan2}(\operatorname{median}\sin\theta_i,
@@ -772,15 +998,75 @@ cross-validation. An SVD condition-number check detects attitude degeneracy and
 falls back to a reduced model.
 
 \subsection{Implementation}
-The subsystem exposes a \texttt{/localize\_markers} service invoked in mission
-Stage~04 as the orientation source, joined with the map-builder position to
-publish \texttt{/aruco/amr/pose} and (on classifier pass)
-\texttt{/aruco/goal/pose}. \TODO{Service/message interface details.}
+The subsystem exposes a \texttt{LocalizeMarkers} service (\texttt{/localize\_markers})
+invoked in mission Stage~04 as the orientation source, joined with the map-builder
+position to publish \texttt{/aruco/amr/pose} and (on classifier pass)
+\texttt{/aruco/goal/pose}. The request carries the absolute paths to the drone
+video and the per-frame OptiTrack CSV; the response returns a success flag, a
+status message, and an array of \texttt{MarkerPose} entries---one per accepted
+marker, with rejected markers absent (Table~\ref{tab:marker-srv}). Each
+\texttt{MarkerPose} reports the marker ID, full 3D pose and floor-plane 2D pose
+in the map frame, a \texttt{PoseWithCovarianceStamped} (diagonal covariance
+$\sigma^2_{xx}=\sigma^2_{yy}=\text{base\_var}_\text{pos}/n_\text{obs}$,
+$\sigma^2_{\psi}=\text{base\_var}_\text{yaw}/n_\text{obs}$), the occupancy-grid
+cell indices, and the number of contributing observations $n_\text{obs}$.
+
+\begin{table}[t]
+\caption{\texttt{LocalizeMarkers} Service Interface}
+\label{tab:marker-srv}
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{Field} & \textbf{Type} \\
+\midrule
+\multirow{2}{*}{Request}
+ & \texttt{video\_path}    & \texttt{string} \\
+ & \texttt{optitrack\_csv} & \texttt{string} \\
+\midrule
+\multirow{3}{*}{Response}
+ & \texttt{success} & \texttt{bool} \\
+ & \texttt{message} & \texttt{string} \\
+ & \texttt{markers} & \texttt{MarkerPose[]} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Traceability and Tests}
 Satisfies FR-3, FR-9. \TODO{Position and yaw error after calibration;
 cross-validation residuals.}
-\FIG{Transform-chain and mirror-rig geometry diagram}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\scriptsize, node distance=10mm,
+  frm/.style={draw, circle, fill=blue!6, inner sep=1.2pt, minimum size=8mm},
+  tf/.style={-{Latex[length=1.6mm]}, semithick}
+]
+\node[frm] (map) {map};
+\node[frm, right=of map] (opti) {opti};
+\node[frm, right=of opti] (drone) {drone};
+\node[frm, right=of drone] (cam) {cam};
+\node[frm, right=of cam] (mk) {mk};
+\draw[tf] (map) -- node[above,font=\tiny]{$\Tmat_{m\leftarrow o}$} (opti);
+\draw[tf] (opti) -- node[above,font=\tiny]{$\Tmat_{o\leftarrow d}(t)$} (drone);
+\draw[tf] (drone) -- node[above,font=\tiny]{$\Tmat_{d\leftarrow c}$} (cam);
+\draw[tf] (cam) -- node[above,font=\tiny]{$\Tmat_{c\leftarrow mk}(t)$} (mk);
+\node[below=1mm of opti, font=\tiny, text width=1.6cm, align=center]
+      {static (map cal.)};
+\node[below=1mm of drone, font=\tiny, text width=1.6cm, align=center]
+      {OptiTrack};
+\node[below=1mm of cam, font=\tiny, text width=1.7cm, align=center]
+      {mirror: roll $=\pi$};
+\node[below=1mm of mk, font=\tiny, text width=1.5cm, align=center]
+      {IPPE PnP};
+\end{tikzpicture}
+\caption{Four-link transform chain composing each marker pose into the map frame,
+$\Tmat_{\text{map}\leftarrow\text{marker}}=\Tmat_{m\leftarrow o}\,
+\Tmat_{o\leftarrow d}(t)\,\Tmat_{d\leftarrow c}\,\Tmat_{c\leftarrow mk}(t)$. The
+time-varying links come from OptiTrack and from PnP; the camera-to-drone link
+encodes the $45^\circ$ mirror (roll $=\pi$).}
+\label{fig:tfchain}
+\end{figure}
 
 %==============================================================================
 %  IX. AMR STATE ESTIMATION (EKF)
@@ -973,6 +1259,15 @@ all three nodes run \SI{100}{\hertz} loops.
 Satisfies FR-1, FR-4 (emergency-stop actuation), NFR-7. \TODO{Step-response and
 tracking-error tests.}
 
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{X_D-AMR_trajectory_following.png}
+\caption{AMR tracking a planned reference trajectory under the
+feedback-linearizing controller. \TODO{Add quantitative tracking-error
+annotation.}}
+\label{fig:amr-track}
+\end{figure}
+
 %==============================================================================
 %  XI. LIDAR SENSING AND OCCUPANCY MAPPING
 %==============================================================================
@@ -1027,7 +1322,14 @@ trivial identity transform.
 \subsection{Traceability and Tests}
 Satisfies FR-4, FR-9, FR-13, NFR-2. \TODO{Mapping fidelity vs.\ ground-truth
 obstacle layout.}
-\FIG{Live occupancy map during a run}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{XI_D-mapping_progress.png}
+\caption{Occupancy map under construction as the AMR drives: log-odds cells
+accumulate occupied (dark) and free (light) evidence from successive LiDAR scans.}
+\label{fig:mapping}
+\end{figure}
 
 %==============================================================================
 %  XII. MAP FUSION
@@ -1171,8 +1473,18 @@ wrong-sender rejection; SIGN\_ENCRYPT round-trip; per-message overhead.}
 \label{sec:results}
 
 \subsection{Experimental Setup}
-\TODO{Arena, obstacle configurations, marker placement, ground-truth source
-(OptiTrack), number of runs.}
+Experiments were run in the $4\times4$~m arena of Fig.~\ref{fig:arena}, with
+cardboard-box obstacles and floor-mounted ArUco markers; OptiTrack provides
+millimetre-accurate ground truth for both robots. \TODO{Obstacle configurations,
+marker placement, number of runs.}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{XVI_A-arena_overview_with_robots.png}
+\caption{Overview of the test arena with both robots: the AMR on the floor and
+the UAV surveying from above, amid cardboard-box obstacles and ArUco markers.}
+\label{fig:arena}
+\end{figure}
 
 \subsection{Aerial Mapping Accuracy}
 \TODO{Coverage, obstacle TP/FP, marker localization error after calibration.}
@@ -1220,16 +1532,47 @@ multi-robot teams.
 %  REFERENCES
 %==============================================================================
 \begin{thebibliography}{00}
-\bibitem{ros2} \TODO{ROS~2 / DDS reference.}
-\bibitem{ekf} \TODO{Thrun, Burgard, Fox --- Probabilistic Robotics (EKF, occupancy grids).}
-\bibitem{sift} \TODO{Lowe --- Distinctive image features (SIFT).}
-\bibitem{ransac} \TODO{Fischler \& Bolles --- RANSAC.}
-\bibitem{ippe} \TODO{Collins \& Bartoli --- IPPE planar pose.}
-\bibitem{superpoint} \TODO{DeTone et al.\ --- SuperPoint.}
-\bibitem{lightglue} \TODO{Lindenberger et al.\ --- LightGlue.}
-\bibitem{astar} \TODO{Hart, Nilsson, Raphael --- A*.}
-\bibitem{weiszfeld} \TODO{Weiszfeld --- geometric median.}
-\bibitem{repo} \TODO{Project repositories (jetson / rasp / security\_middleware).}
+\bibitem{ros2} S. Macenski, T. Foote, B. Gerkey, C. Lalancette, and W. Woodall,
+``Robot Operating System 2: Design, architecture, and uses in the wild,''
+\emph{Science Robotics}, vol.~7, no.~66, eabm6074, 2022.
+\bibitem{thrun} S. Thrun, W. Burgard, and D. Fox, \emph{Probabilistic Robotics}.
+Cambridge, MA, USA: MIT Press, 2005.
+\bibitem{kalman} R. E. Kalman, ``A new approach to linear filtering and prediction
+problems,'' \emph{Trans.\ ASME J.\ Basic Eng.}, vol.~82, no.~1, pp.~35--45, 1960.
+\bibitem{sift} D. G. Lowe, ``Distinctive image features from scale-invariant
+keypoints,'' \emph{Int.\ J.\ Comput.\ Vis.}, vol.~60, no.~2, pp.~91--110, 2004.
+\bibitem{ransac} M. A. Fischler and R. C. Bolles, ``Random sample consensus: A
+paradigm for model fitting with applications to image analysis and automated
+cartography,'' \emph{Commun.\ ACM}, vol.~24, no.~6, pp.~381--395, 1981.
+\bibitem{burt} P. J. Burt and E. H. Adelson, ``A multiresolution spline with
+application to image mosaics,'' \emph{ACM Trans.\ Graph.}, vol.~2, no.~4,
+pp.~217--236, 1983.
+\bibitem{aruco} S. Garrido-Jurado, R. Mu\~noz-Salinas, F. J. Madrid-Cuevas, and
+M. J. Mar\'in-Jim\'enez, ``Automatic generation and detection of highly reliable
+fiducial markers under occlusion,'' \emph{Pattern Recognit.}, vol.~47, no.~6,
+pp.~2280--2292, 2014.
+\bibitem{ippe} T. Collins and A. Bartoli, ``Infinitesimal plane-based pose
+estimation,'' \emph{Int.\ J.\ Comput.\ Vis.}, vol.~109, no.~3, pp.~252--286, 2014.
+\bibitem{breiman} L. Breiman, ``Random forests,'' \emph{Mach.\ Learn.}, vol.~45,
+no.~1, pp.~5--32, 2001.
+\bibitem{superpoint} D. DeTone, T. Malisiewicz, and A. Rabinovich, ``SuperPoint:
+Self-supervised interest point detection and description,'' in \emph{Proc.\
+IEEE/CVF CVPR Workshops}, 2018, pp.~224--236.
+\bibitem{lightglue} P. Lindenberger, P.-E. Sarlin, and M. Pollefeys, ``LightGlue:
+Local feature matching at light speed,'' in \emph{Proc.\ IEEE/CVF ICCV}, 2023,
+pp.~17581--17592.
+\bibitem{astar} P. E. Hart, N. J. Nilsson, and B. Raphael, ``A formal basis for
+the heuristic determination of minimum cost paths,'' \emph{IEEE Trans.\ Syst.\
+Sci.\ Cybern.}, vol.~4, no.~2, pp.~100--107, 1968.
+\bibitem{weiszfeld} E. Weiszfeld, ``Sur le point pour lequel la somme des
+distances de $n$ points donn\'es est minimum,'' \emph{T\^ohoku Math.\ J.},
+vol.~43, pp.~355--386, 1937.
+\bibitem{nist} M. J. Dworkin, ``Recommendation for block cipher modes of
+operation: Galois/Counter Mode (GCM) and GMAC,'' NIST Special Publication
+800-38D, 2007.
+\bibitem{repo} ``Cooperative UAV--AMR navigation project repositories
+(\subsys{collab\_nav\_ground-jetson}, \subsys{collab\_nav\_ground-rasp},
+\subsys{security\_middleware}),'' 2026. \TODO{Insert public repository URLs.}
 \end{thebibliography}
 
 \end{document}
