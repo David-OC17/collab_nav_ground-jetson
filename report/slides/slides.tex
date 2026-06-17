@@ -135,7 +135,6 @@
 {\color{mAccent}\rule{0.14\paperwidth}{2pt}}\par\vspace{1.1em}
 {\usebeamerfont{title}\color{white}\bfseries #1\par}%
 \vspace{0.6em}{\large\color{white!75}#2\par}%
-\vspace{1.0em}{\color{mAccent}\large\textsc{#3}\par}%
 \vfill
 \end{frame}%
 }}
@@ -206,7 +205,7 @@
 \textbf{Headline result.} A GPS-denied ground robot reaches its goal in an
 \emph{initially unmapped} arena by fusing an aerial prior from a cooperating drone
 with onboard sensing --- \alert{$\sim$88\,\% lower position error} than wheel
-odometry, \alert{93\,\% mission success}, and a fully ROS\,2 implementation across
+odometry, \alert{85\,\% mission success}, and a fully ROS\,2 implementation across
 three networked compute platforms.
 \end{frame}
 
@@ -677,7 +676,7 @@ $P(\text{pass}\mid\mathbf{f})\ge\tau$. Inference is pure NumPy (serialized
 \centering\alert{A rejected map triggers the frontier-exploration fallback.}
 \column{0.44\textwidth}
 \centering
-\includegraphics[height=0.74\textheight]{VII_D-random_forest_feature_importance.png}\\[0.2em]
+\includegraphics[height=0.66\textheight]{VII_D-random_forest_feature_importance.png}\\[0.2em]
 {\footnotesize Impurity-based feature importance (46 features).}
 \end{columns}
 \end{frame}
@@ -766,7 +765,7 @@ The deployed \texttt{ema\_gate}:
 \end{itemize}
 \vspace{-0.2em}
 \centering
-\includegraphics[width=0.96\linewidth]{IX_D-vio_gate_ablation.png}\\
+\includegraphics[width=0.7\linewidth]{IX_D-vio_gate_ablation.png}\\
 {\footnotesize Ablation: Butterworth rings; \texttt{ema\_gate} stays flat.}
 \column{0.52\textwidth}
 \scriptsize
@@ -810,7 +809,7 @@ an \alert{$\sim$88\,\% reduction}. The gate replaced 211 loop-closure spike samp
 \end{block}
 \column{0.48\textwidth}
 \centering
-\includegraphics[width=0.92\linewidth]{IX_D-amr_trajectory_tracking-new.png}\\[0.2em]
+\includegraphics[width=0.8\linewidth]{IX_D-amr_trajectory_tracking-new.png}\\[0.2em]
 {\footnotesize Origin-aligned $xy$ trajectory: OptiTrack truth, EKF, and drifting
 wheel odometry.}
 \end{columns}
@@ -845,7 +844,7 @@ G_A & G_D=-1\\
 Drone free space $\to 25$, not $0$: the AMR may only \emph{raise} occupancy.
 \column{0.48\textwidth}
 \centering
-\includegraphics[width=0.82\linewidth]{XI_D-mapping_progress.png}\\[0.2em]
+\includegraphics[width=0.68\linewidth]{XI_D-mapping_progress.png}\\[0.2em]
 {\footnotesize Occupancy map under construction: cells accumulate occupied (dark)
 and free (light) evidence from successive LiDAR scans.}
 \end{columns}
@@ -909,10 +908,8 @@ proximity uses a \emph{perceived} distance penalizing off-heading frontiers:
 ($>60^\circ$ off-heading $\times0.01$) --- suppresses oscillating U-turns.
 \vspace{0.3em}
 
-\textbf{Visual-servo homing.} The final approach drives purely from the detection
-(independent of world-model error):
-\[ \omega=-K_\omega e_x,\quad v=K_v(t_z-d_\text{stop})f_\text{centre}, \]
-centering on the marker before advancing. Reuses the deployed A$^\star$+spline planner.
+\textbf{Aruco based Homing} The final approach detects arucos in the goal cube and uses OpenCV PnP solver to translate their poses into the global map.
+Then A* is used to navigate to the goal position. 
 \end{columns}
 \end{frame}
 
@@ -1016,12 +1013,11 @@ Kill-switch fallback        & 20 & 20 \\
 Measured on the AArch64 platform (30 timed iters, crypto-only \& end-to-end ROS\,2):
 \begin{itemize}\footnotesize
   \item RSA-PSS signing adds \alert{$\sim$\SI{10.4}{\milli\second}/msg},
-        nearly payload-independent (works on a fixed digest) --- $\sim$93\% of the
-        secured round-trip.
+        nearly payload-independent --- $\sim$93\% of the secured round-trip.
   \item Verification is $\sim$\textbf{13$\times$} cheaper than signing.
   \item AES-256-GCM on top is marginal: $+6$--$7\%$ ($\le$\SI{256}{\byte}),
-        $+38\%$ only at \SI{64}{\kilo\byte} --- so \texttt{sign+encrypt} is preferred
-        over \texttt{sign} when confidentiality is needed.
+        $+38\%$ at \SI{64}{\kilo\byte} --- so \texttt{sign+encrypt} when
+        confidentiality is needed.
   \item DDS adds a fixed $\sim$\SIrange{2.3}{2.8}{\milli\second}.
 \end{itemize}
 \renewcommand{\arraystretch}{1.15}
@@ -1038,8 +1034,8 @@ Measured on the AArch64 platform (30 timed iters, crypto-only \& end-to-end ROS\
 {\scriptsize Throughput (msg/s) by level and payload.}
 \column{0.48\textwidth}
 \centering
-\includegraphics[width=\linewidth]{XV_D-round_trip_latency.png}\\[0.3em]
-\includegraphics[width=\linewidth]{XV_D-crypto_latency_breakdown.png}
+\includegraphics[width=0.86\linewidth]{XV_D-round_trip_latency.png}\\[0.3em]
+\includegraphics[width=0.86\linewidth]{XV_D-crypto_latency_breakdown.png}
 \end{columns}
 \end{frame}
 
@@ -1083,10 +1079,10 @@ EKF mean abs.\ error \textbf{\SI{4.6}{}/\SI{6.3}{\centi\meter}} ($x$/$y$) vs.\
 \SI{52.3}{}/\SI{41.6}{\centi\meter} odometry --- \alert{$\sim$88\,\% reduction}.
 UAV survey tracking $\le\SI{3.8}{\centi\meter}$/axis.
 \end{block}
-\begin{block}{Navigation ($N=30$)}
-Goal reached in \textbf{28/30 (93\,\%)} with \emph{no collisions}; mean cross-track
-\SI{6.1}{\centi\meter}, mean mission \SI{74}{\second}. The 2 failures (early-mission
-map sparsity) recovered by replanning --- no operator intervention.
+\begin{block}{Navigation ($N=20$)}
+Goal reached in \textbf{17/20 (85\,\%)} with \emph{no collisions}; mean cross-track
+\SI{6.1}{\centi\meter}, mean mission \SI{74}{\second}. The 3 failures stalled on
+early-mission map sparsity; autonomous replanning handled all other blockages.
 \end{block}
 \column{0.5\textwidth}
 \begin{block}{Physical safety}
@@ -1144,7 +1140,7 @@ a frontier-exploration fallback, independent emergency braking, and an
 application-layer security middleware --- all in ROS\,2 across three networked platforms.
 
 \begin{block}{Headline numbers}
-$\sim$88\,\% lower position error \;\textbar\; 93\,\% mission success, no collisions
+$\sim$88\,\% lower position error \;\textbar\; 85\,\% mission success, no collisions
 \;\textbar\; \SI{0.34}{\second} emergency braking \;\textbar\; security benchmarked
 and selectively deployed.
 \end{block}
@@ -1165,7 +1161,6 @@ gyro-bias estimation; dynamic-obstacle prediction; faster signatures
 {\color{mAccent}\rule{0.14\paperwidth}{2pt}}\\[1.0em]
 {\usebeamerfont{title}\color{white}\bfseries Thank you}\\[0.6em]
 {\large\color{white!80} Questions \& discussion}\\[1.4em]
-{
 {\color{white!55}\scriptsize
 \texttt{collab\_nav\_ground-jetson} \;\textperiodcentered\;
 \texttt{collab\_nav\_ground-rasp} \;\textperiodcentered\;

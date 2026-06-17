@@ -1466,13 +1466,63 @@ acquisition start, bounding positional uncertainty to ${\leq}\SI{10}{\milli\mete
 at operating speed.
 
 \subsubsection{Bayesian occupancy update}
-Each cell holds a log-odds value updated additively,
-$l_t=l_{t-1}+l_\text{sensor}-l_0$ with $l_0=0$, using $l_\text{occ}=+0.85$ and
-$l_\text{free}=-0.40$. The $2.1{:}1$ asymmetry encodes that an occupied return is
-more informative than a free one. Beams are integrated by Bresenham ray casting:
-cells along the beam receive the free increment and the terminal cell (if in
-range) the occupied increment. Values saturate, so cells require several
-consistent observations to commit (${\sim}6$ hits or $13$ misses).
+A natural first instinct is to store $P(m_{ij} = 1)$ directly and update it with Bayes' rule after each observation $z$:
+ 
+\[
+  P(m \mid z_{1:t}) = \frac{P(z_t \mid m)\, P(m \mid z_{1:t-1})}{P(z_t \mid z_{1:t-1})}
+\]
+ 
+This formulation has two critical numerical problems:
+ 
+\begin{enumerate}
+  \item \textbf{Probability underflow.} After many ``free'' observations, $P(m=1)$ approaches 0. Multiplying many small numbers leads to floating-point underflow ($0.1^{100} \approx 10^{-100}$), resulting in exact zeros that can never recover from a single occupied observation.
+ 
+  \item \textbf{Cell freezing.} Conversely, a cell that reaches $P=1$ can never be set to free again because $\eta \cdot P(z_\text{free} \mid m=1) \cdot 1 = 0$ (there is no numerical room left).
+\end{enumerate}
+ 
+The log-odds (or \emph{logit}) transform solves both problems by mapping $[0,1]$ to $(-\infty, +\infty)$:
+ 
+\begin{equation}
+  \ell(m) = \log \frac{P(m=1)}{P(m=0)} = \log \frac{P(m=1)}{1 - P(m=1)}
+  \label{eq:logodds}
+\end{equation}
+ 
+Under this representation, the recursive Bayesian update becomes a simple \textbf{addition}:
+ 
+\begin{equation}
+  \ell_t(m) = \ell_{t-1}(m) + \underbrace{\log \frac{P(z_t \mid m=1)}{P(z_t \mid m=0)}}_{\text{log-odds of sensor model}}
+               - \underbrace{\log \frac{P(m=1)}{P(m=0)}}_{\text{log-odds prior}}
+  \label{eq:update}
+\end{equation}
+ 
+\noindent
+\textbf{Derivation sketch.} Starting from the binary Bayes filter, applying the log-odds transform to both sides of the posterior, and using the Markov assumption (each scan is conditionally independent), the recursive product of likelihoods becomes a sum:
+ 
+\[
+  \ell_t = \ell_{t-1} + \ell_\text{sensor}(z_t)
+\]
+ 
+This is numerically stable over thousands of updates because we are adding and subtracting bounded increments, not multiplying probabilities.
+ 
+In practice, the full inverse-sensor-model integral is approximated by two scalar constants:
+ 
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+Parameter & Symbol & Typical value \\
+\midrule
+Log-odds increment — occupied & $\ell_\text{occ}$  & $+0.85$  \\
+Log-odds increment — free     & $\ell_\text{free}$ & $-0.40$  \\
+Prior (unknown)               & $\ell_0$           & $0.0$    \\
+Clamp minimum                 & $\ell_\text{min}$  & $-5.0$   \\
+Clamp maximum                 & $\ell_\text{max}$  & $+5.0$   \\
+\bottomrule
+\end{tabular}
+\caption{Log-odds constants used by node{world\_mapper}. The asymmetry ($|\ell_\text{occ}| > |\ell_\text{free}|$) means it takes more evidence to mark a cell occupied than to clear it, which reduces false positives from noisy scans.}
+\end{table}
+ 
+Clamping at $[\ell_\text{min}, \ell_\text{max}]$ bounds how many consecutive observations are needed to change a cell's state in either direction, preventing hysteresis and keeping cells responsive to environmental changes.
 
 \subsubsection{Handling of dynamic obstacles}
 The arena contains only static obstacles, so no motion model or prediction is
