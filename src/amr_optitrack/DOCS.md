@@ -1,5 +1,10 @@
 # `amr_optitrack` — OptiTrack Pose Bridge
 
+> **Standalone tool, not part of the automated pipeline.** `mission_orchestrator`
+> never launches this package. It is run manually for teleop / ground-truth
+> testing via `scripts/amr_teleop_optitrack.sh` and `scripts/custom_trajectory.sh`
+> (`ros2 run amr_optitrack optitrack_pose_node`).
+
 ## 1. Role in the System
 
 The OptiTrack motion-capture system tracks rigid bodies in the arena at ~120 Hz and publishes their 6-DoF poses via the `optitrack_client` VRPN bridge. Those poses carry position and orientation but **no velocity** — velocity must be derived.

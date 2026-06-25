@@ -66,7 +66,6 @@ TARGETS=(
     "cartographer_occupancy_grid_node"
 
     # ── Perception / Localization ──────────────────────────────────────────────
-    "lidar_odometry_node"
     "optitrack_pose_node"
     "ms200_lidar"
 
@@ -76,7 +75,6 @@ TARGETS=(
 
     # ── Map / Costmap ──────────────────────────────────────────────────────────
     "map_fusion_node"
-    "local_costmap_node"
     "fake_map_publisher"
 
     # ── Arena services ─────────────────────────────────────────────────────────

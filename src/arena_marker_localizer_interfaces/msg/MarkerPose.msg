@@ -5,7 +5,7 @@
 #   id                    : ArUco marker integer ID (unique inside the dictionary used)
 #   pose_3d               : Full 3D pose in the map frame (metres + quaternion)
 #   pose_2d               : Same pose flattened onto the floor plane (x,y in metres, theta=yaw)
-#   pose_with_covariance  : PoseWithCovarianceStamped ready for slam_toolbox / map_fusion.
+#   pose_with_covariance  : PoseWithCovarianceStamped ready for slam_toolbox / fusion.
 #                           Diagonal covariance: xx=yy=base_var_pos/n_obs, yaw=base_var_yaw/n_obs.
 #                           Stamp is the service-call time; frame_id matches the map frame.
 #   cell_x, cell_y        : Index into the OccupancyGrid this map was built for

@@ -1,7 +1,7 @@
 ## LiDAR mapping - apt packages only
 
 ```bash
-colcon build --symlink-install --packages-select amr_optitrack arena_map_builder_msgs  arena_marker_localizer_interfaces local_costmap trajectory_planner arena_map_builder  arena_marker_localizer map_fusion oradar_lidar optitrack_client tello_driver tello_pos_control tello_msgs emergency_stop
+colcon build --symlink-install --packages-select amr_optitrack arena_map_builder_msgs  arena_marker_localizer_interfaces world_mapper trajectory_planner arena_map_builder  arena_marker_localizer fusion oradar_lidar optitrack_client tello_driver tello_pos_control tello_msgs emergency_stop
 ```
 
 In Jetson:

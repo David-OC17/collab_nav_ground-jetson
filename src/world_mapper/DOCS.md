@@ -4,7 +4,7 @@
 
 `world_mapper` maintains a running 2D occupancy grid of the arena in the `world` frame, built incrementally from OraDAR MS200 LiDAR scans as the AMR moves. It is the ground-level counterpart to the aerial map produced by `arena_map_builder`: where the aerial map provides a bird's-eye view of the arena floor (obstacles, lane markings, ArUco markers), this node provides a continuously-updated obstacle map reflecting what the AMR's own sensor currently sees.
 
-The output `/amr/world_map` (`nav_msgs/OccupancyGrid`) feeds into `map_fusion`, which registers and combines it with the aerial occupancy grid to produce `/fusion/map` — the map consumed by `trajectory_planner`.
+The output `/amr/world_map` (`nav_msgs/OccupancyGrid`) feeds into `fusion`, which registers and combines it with the aerial occupancy grid to produce `/fusion/map` — the map consumed by `trajectory_planner`.
 
 The node is a pure listener: it reads `/scan` and the TF tree (world → laser_frame, resolved through the SLAM toolbox's drift-corrected chain) and produces the map. It modifies no state outside its own log-odds array.
 
