@@ -230,7 +230,7 @@ Each package has (or will have) its own `DOCS.md` at `src/<package>/DOCS.md`:
 | Package | Domain | DOCS.md |
 |---|---|---|
 | `tello_pos_control` | UAV flight control | [link](src/collab_nav_uav/src/tello_pos_control/DOCS.md) |
-| `tello_driver` | UAV ROS bridge | [link](src/collab_nav_uav/src/tello_driver/DOCS.md) |
+| `tello_driver` | UAV ROS bridge | `src/collab_nav_uav/src/tello_driver/` (submodule; no DOCS.md yet) |
 | `arena_map_builder` | Aerial stitching | [link](src/arena_map_builder/DOCS.md) |
 | `arena_marker_localizer` | ArUco PnP localization | [link](src/arena_marker_localizer/DOCS.md) |
 | `aruco_localizer` | AMR-camera ArUco detection | [link](src/aruco_localizer/DOCS.md) |
